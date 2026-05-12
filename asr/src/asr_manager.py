@@ -11,20 +11,20 @@ logger = logging.getLogger(__name__)
 class ASRManager:
 
     def __init__(self):
-        # Load the Whisper model. The model was pre-downloaded during
-        # Docker build and cached in /workspace/models/whisper.
+        # Load the Whisper model. The model was pre-downloaded and cached
+        # during Docker build. Using model name 'small' will find it from cache.
         logger.info("Loading Whisper model...")
         try:
             self.model = WhisperModel(
-                "/workspace/whisper_model",
+                "small",
                 device="cuda",
                 compute_type="float16",
             )
             logger.info("Whisper model loaded on GPU.")
-        except Exception:
-            logger.warning("GPU not available, falling back to CPU.")
+        except Exception as e:
+            logger.warning(f"GPU not available ({e}), falling back to CPU.")
             self.model = WhisperModel(
-                "/workspace/whisper_model",
+                "small",
                 device="cpu",
                 compute_type="int8",
             )
@@ -39,15 +39,18 @@ class ASRManager:
         Returns:
             A string containing the transcription of the audio.
         """
+        try:
+            audio_stream = io.BytesIO(audio_bytes)
 
-        audio_stream = io.BytesIO(audio_bytes)
+            segments, info = self.model.transcribe(
+                audio_stream,
+                beam_size=5,
+                language=None,  # Auto-detect language
+                vad_filter=True,
+            )
 
-        segments, info = self.model.transcribe(
-            audio_stream,
-            beam_size=5,
-            language=None,  # Auto-detect language
-            vad_filter=True,
-        )
-
-        transcription = " ".join(segment.text.strip() for segment in segments)
-        return transcription
+            transcription = " ".join(segment.text.strip() for segment in segments)
+            return transcription
+        except Exception as e:
+            logger.error(f"ASR transcription failed: {e}")
+            return ""

@@ -15,8 +15,9 @@ RUN pip install -U pip
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Pre-download the Whisper model during build (no internet at runtime).
-RUN python -c "from faster_whisper.utils import download_model; download_model('small', output_dir='/workspace/whisper_model')"
+# Pre-download the Whisper model during build so it's cached in the image.
+# This avoids needing internet at runtime.
+RUN python -c "from faster_whisper import WhisperModel; WhisperModel('small', device='cpu', compute_type='int8')"
 
 # Copies your source files.
 COPY src .
