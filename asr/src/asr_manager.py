@@ -47,11 +47,17 @@ class ASRManager:
                 f.write(audio_bytes)
                 temp_path = f.name
 
+            # Novice track is English-only. Setting language="en" avoids
+            # misdetection (which caused WER=1.0 when auto-detect picked
+            # the wrong language).
             segments, info = self.model.transcribe(
                 temp_path,
                 beam_size=5,
-                language=None,
+                language="en",
                 vad_filter=True,
+                vad_parameters=dict(
+                    min_silence_duration_ms=500,
+                ),
             )
 
             transcription = " ".join(segment.text.strip() for segment in segments)

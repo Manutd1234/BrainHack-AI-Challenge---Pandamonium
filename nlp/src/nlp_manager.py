@@ -18,21 +18,38 @@ class NLPManager:
         self.chunks: list[str] = []
         self.vectorizer: TfidfVectorizer | None = None
         self.tfidf_matrix = None
-        self.chunk_size = 500  # characters per chunk
-        self.chunk_overlap = 100
-        self.top_k = 5  # number of chunks to retrieve
+        self.chunk_size = 400  # characters per chunk
+        self.chunk_overlap = 150  # more overlap for better context
+        self.top_k = 8  # retrieve more chunks for better coverage
 
     def _chunk_text(self, text: str) -> list[str]:
-        """Splits text into overlapping chunks."""
+        """Splits text into overlapping chunks, respecting sentence boundaries."""
+        sentences = re.split(r'(?<=[.!?])\s+', text)
         chunks = []
-        start = 0
-        while start < len(text):
-            end = start + self.chunk_size
-            chunk = text[start:end]
-            if chunk.strip():
-                chunks.append(chunk.strip())
-            start += self.chunk_size - self.chunk_overlap
-        return chunks
+        current_chunk = []
+        current_len = 0
+
+        for sentence in sentences:
+            sentence = sentence.strip()
+            if not sentence:
+                continue
+
+            if current_len + len(sentence) > self.chunk_size and current_chunk:
+                chunks.append(" ".join(current_chunk))
+                # Keep some sentences for overlap
+                overlap_text = " ".join(current_chunk)
+                overlap_start = max(0, len(overlap_text) - self.chunk_overlap)
+                overlap = overlap_text[overlap_start:]
+                current_chunk = [overlap] if overlap.strip() else []
+                current_len = len(overlap)
+
+            current_chunk.append(sentence)
+            current_len += len(sentence) + 1
+
+        if current_chunk:
+            chunks.append(" ".join(current_chunk))
+
+        return [c for c in chunks if c.strip()]
 
     def load_corpus(self, documents: list[str]) -> None:
         """Loads and indexes the corpus of documents for RAG QA."""
@@ -47,9 +64,10 @@ class NLPManager:
 
         # Build TF-IDF index for retrieval
         self.vectorizer = TfidfVectorizer(
-            max_features=50000,
+            max_features=80000,
             stop_words="english",
             ngram_range=(1, 2),
+            sublinear_tf=True,
         )
         self.tfidf_matrix = self.vectorizer.fit_transform(self.chunks)
 
@@ -66,7 +84,7 @@ class NLPManager:
 
         # Get top-k most similar chunks
         top_indices = np.argsort(similarities)[-self.top_k:][::-1]
-        return [self.chunks[i] for i in top_indices if similarities[i] > 0]
+        return [self.chunks[i] for i in top_indices if similarities[i] > 0.01]
 
     def qa(self, question: str) -> str:
         """Performs question answering using retrieved context.
@@ -86,25 +104,41 @@ class NLPManager:
         if not context_chunks:
             return ""
 
-        # Simple extractive QA: find the most relevant sentence
-        # from the retrieved chunks that best answers the question
+        # Build a combined context from retrieved chunks
         context = " ".join(context_chunks)
-        sentences = re.split(r'[.!?]+', context)
-        sentences = [s.strip() for s in sentences if s.strip()]
+
+        # Split into sentences for ranking
+        sentences = re.split(r'(?<=[.!?])\s+', context)
+        sentences = [s.strip() for s in sentences if len(s.strip()) > 10]
 
         if not sentences:
-            return ""
+            return context_chunks[0][:200] if context_chunks else ""
 
-        # Score each sentence against the question using word overlap
-        question_words = set(question.lower().split())
-        best_sentence = ""
-        best_score = -1
+        # Use TF-IDF similarity to rank sentences against the question
+        try:
+            sent_vectorizer = TfidfVectorizer(
+                stop_words="english",
+                ngram_range=(1, 2),
+            )
+            all_texts = [question] + sentences
+            sent_matrix = sent_vectorizer.fit_transform(all_texts)
+            q_vec = sent_matrix[0:1]
+            s_matrix = sent_matrix[1:]
+            sims = cosine_similarity(q_vec, s_matrix).flatten()
 
-        for sentence in sentences:
-            sentence_words = set(sentence.lower().split())
-            overlap = len(question_words & sentence_words)
-            if overlap > best_score:
-                best_score = overlap
-                best_sentence = sentence
+            # Get the top-3 most relevant sentences
+            top_indices = np.argsort(sims)[-3:][::-1]
+            best_sentences = [sentences[i] for i in top_indices if sims[i] > 0]
 
-        return best_sentence
+            if best_sentences:
+                # Return the best matching sentence (or combine top 2 if short)
+                answer = best_sentences[0]
+                if len(answer) < 50 and len(best_sentences) > 1:
+                    answer = " ".join(best_sentences[:2])
+                return answer
+
+        except Exception as e:
+            logger.warning(f"Sentence ranking failed: {e}")
+
+        # Fallback: return the first chunk
+        return context_chunks[0][:200]
