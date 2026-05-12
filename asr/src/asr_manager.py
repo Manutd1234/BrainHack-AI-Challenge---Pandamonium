@@ -11,16 +11,24 @@ logger = logging.getLogger(__name__)
 class ASRManager:
 
     def __init__(self):
-        # Load the Whisper model. Using "small" as a good balance of speed
-        # and accuracy. Change to "medium" or "large-v3" for better results,
-        # or "tiny"/"base" for faster inference.
+        # Load the Whisper model. The model was pre-downloaded during
+        # Docker build and cached in /workspace/models/whisper.
         logger.info("Loading Whisper model...")
-        self.model = WhisperModel(
-            "small",
-            device="cuda",
-            compute_type="float16",
-        )
-        logger.info("Whisper model loaded.")
+        try:
+            self.model = WhisperModel(
+                "/workspace/whisper_model",
+                device="cuda",
+                compute_type="float16",
+            )
+            logger.info("Whisper model loaded on GPU.")
+        except Exception:
+            logger.warning("GPU not available, falling back to CPU.")
+            self.model = WhisperModel(
+                "/workspace/whisper_model",
+                device="cpu",
+                compute_type="int8",
+            )
+            logger.info("Whisper model loaded on CPU.")
 
     def asr(self, audio_bytes: bytes) -> str:
         """Performs ASR transcription on an audio file.

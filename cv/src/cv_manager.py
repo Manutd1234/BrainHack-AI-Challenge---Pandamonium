@@ -13,9 +13,7 @@ logger = logging.getLogger(__name__)
 class CVManager:
 
     def __init__(self):
-        # Load YOLO model. Using yolo11n as baseline (fast, small).
-        # Replace with a fine-tuned model path for better accuracy:
-        #   self.model = YOLO("best.pt")
+        # Load YOLO model. yolo11n.pt was pre-downloaded during Docker build.
         logger.info("Loading YOLO model...")
         self.model = YOLO("yolo11n.pt")
         logger.info("YOLO model loaded.")
@@ -34,7 +32,12 @@ class CVManager:
 
         img = Image.open(io.BytesIO(image))
 
-        results = self.model.predict(img, verbose=False)
+        try:
+            results = self.model.predict(img, verbose=False)
+        except Exception:
+            # Fallback to CPU if GPU fails
+            self.model = YOLO("yolo11n.pt")
+            results = self.model.predict(img, verbose=False, device="cpu")
 
         detections = []
         for result in results:

@@ -2,8 +2,6 @@
 
 
 # The base image, an example deep learning VM.
-# For a full list, see https://us-docker.pkg.dev/deeplearning-platform-release/gcr.io/
-# For info, see https://cloud.google.com/deep-learning-vm/docs/images#supported-frameworks
 FROM nvcr.io/nvidia/pytorch:25.11-py3
 
 # Configures settings for the image.
@@ -16,6 +14,9 @@ WORKDIR /workspace
 RUN pip install -U pip
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
+
+# Pre-download the Whisper model during build (no internet at runtime).
+RUN python -c "from faster_whisper.utils import download_model; download_model('small', output_dir='/workspace/whisper_model')"
 
 # Copies your source files.
 COPY src .

@@ -15,6 +15,9 @@ RUN pip install -U pip
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Pre-download the YOLO model during build (no internet at runtime).
+RUN python -c "from ultralytics import YOLO; YOLO('yolo11n.pt')"
+
 # Copies your source files.
 COPY src .
 
