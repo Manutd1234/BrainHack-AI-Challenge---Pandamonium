@@ -1,7 +1,8 @@
 """Manages the ASR model."""
 
-import io
 import logging
+import os
+import tempfile
 
 from faster_whisper import WhisperModel
 
@@ -39,18 +40,26 @@ class ASRManager:
         Returns:
             A string containing the transcription of the audio.
         """
+        temp_path = None
         try:
-            audio_stream = io.BytesIO(audio_bytes)
+            # Write audio bytes to a temp file (faster-whisper needs a file path)
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+                f.write(audio_bytes)
+                temp_path = f.name
 
             segments, info = self.model.transcribe(
-                audio_stream,
+                temp_path,
                 beam_size=5,
-                language=None,  # Auto-detect language
+                language=None,
                 vad_filter=True,
             )
 
             transcription = " ".join(segment.text.strip() for segment in segments)
             return transcription
+
         except Exception as e:
             logger.error(f"ASR transcription failed: {e}")
             return ""
+        finally:
+            if temp_path and os.path.exists(temp_path):
+                os.unlink(temp_path)
