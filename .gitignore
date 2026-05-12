@@ -1,0 +1,11 @@
+models/
+__pycache__/
+til26_dataset/
+*.pt
+*.pth
+*.zip
+*.bin
+temp_til26/
+.venv/
+env/
+runs/

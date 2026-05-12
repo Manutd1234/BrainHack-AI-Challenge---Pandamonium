@@ -1,0 +1,29 @@
+# til26.yaml — put this in cv/ and edit paths to match your training data layout
+# Run: yolo train model=models/cv/yolo11x.pt data=til26.yaml epochs=50 imgsz=1280 batch=8 device=0
+
+path: /home/jupyter/til-26/cv/data   # root of dataset
+
+train: images/train
+val:   images/val
+
+# 18 TIL-AI classes (index matches category_id in spec)
+nc: 18
+names:
+  0: cargo aircraft
+  1: commercial aircraft
+  2: drone
+  3: fighter jet
+  4: fighter plane
+  5: helicopter
+  6: light aircraft
+  7: missile
+  8: truck
+  9: car
+  10: tank
+  11: bus
+  12: van
+  13: cargo ship
+  14: yacht
+  15: cruise ship
+  16: warship
+  17: sailboat
