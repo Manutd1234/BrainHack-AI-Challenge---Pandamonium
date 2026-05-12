@@ -1,5 +1,6 @@
-fastapi==0.110.0
-uvicorn==0.28.0
-pydantic==2.6.4
-noisereduce==3.0.2
-scipy==1.13.0
+# Dependencies for the noise container.
+
+fastapi==0.115.12
+uvicorn[standard]==0.34.2
+pillow
+numpy

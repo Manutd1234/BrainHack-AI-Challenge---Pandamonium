@@ -1,5 +1,6 @@
-fastapi==0.110.0
-uvicorn==0.28.0
-pydantic==2.6.4
-ultralytics==8.1.24
-Pillow==10.2.0
+# Dependencies for the CV container.
+
+fastapi==0.115.12
+uvicorn[standard]==0.34.2
+ultralytics
+pillow

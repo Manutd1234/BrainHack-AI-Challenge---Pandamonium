@@ -1,4 +1,7 @@
-fastapi==0.110.0
-uvicorn==0.28.0
-pydantic==2.6.4
-openai==1.14.0
+# Dependencies for the NLP container.
+
+fastapi==0.115.12
+uvicorn[standard]==0.34.2
+asyncio
+scikit-learn
+numpy

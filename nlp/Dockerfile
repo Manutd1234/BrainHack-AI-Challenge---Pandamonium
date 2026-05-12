@@ -1,16 +1,22 @@
-FROM python:3.11-slim
+# Dockerfile for building the NLP image.
 
-WORKDIR /app
 
+# The base image, an example deep learning VM.
+FROM nvcr.io/nvidia/pytorch:25.11-py3
+
+# Configures settings for the image.
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+ENV PIP_ROOT_USER_ACTION=ignore
+WORKDIR /workspace
+
+# Installs your dependencies.
+RUN pip install -U pip
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy source code
-COPY src/ ./src/
+# Copies your source files.
+COPY src .
 
-# Pass through OpenAI API Key if needed
-# ENV OPENAI_API_KEY=your_key_here
-
-EXPOSE 5004
-
-CMD ["uvicorn", "src.server:app", "--host", "0.0.0.0", "--port", "5004"]
+# Starts your model server.
+CMD uvicorn nlp_server:app --port 5004 --host 0.0.0.0
