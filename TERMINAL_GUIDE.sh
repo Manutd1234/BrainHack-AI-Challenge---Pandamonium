@@ -1,111 +1,59 @@
 #!/bin/bash
-# ════════════════════════════════════════════════════════════════
-# TIL-AI 2026 — COMPLETE BUILD + SUBMIT GUIDE (v3)
-# ════════════════════════════════════════════════════════════════
-# Run each section in order on your GCP Workbench terminal.
-# ════════════════════════════════════════════════════════════════
+# TIL-AI 2026 Pandamonium build/test/submit guide.
+# Run commands from a GCP Workbench Bash terminal.
 
+set -e
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# STEP 0: VERIFY GCP + DOCKER AUTHENTICATION
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-# Check active GCP account
-gcloud auth list
-
-# Set your team's service account
+# 0. Authentication
 gcloud config set account svc-pandamonium@til-ai-2026.iam.gserviceaccount.com
-
-# Set project
 gcloud config set project til-ai-2026
-
-# Authenticate Docker with Artifact Registry
 gcloud auth configure-docker asia-southeast1-docker.pkg.dev
 
-# Verify Docker + GPU
-docker info > /dev/null 2>&1 && echo "✓ Docker OK" || echo "✗ Docker NOT running"
-nvidia-smi > /dev/null 2>&1 && echo "✓ GPU OK" || echo "⚠ No GPU"
-
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# STEP 1: PULL LATEST CODE + INSTALL HOST TEST DEPENDENCIES
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
+# 1. Pull latest pushed solution files
 cd ~/BrainHack-AI-Challenge---Pandamonium
-git pull origin main
-mkdir -p asr/models cv/models noise/models nlp/models ae/models
+git pull --ff-only origin main
+git submodule update --init --recursive
 
-# Install ALL host-side test dependencies in one shot
-pip install python-dotenv jiwer pycocotools scikit-image transformers
+export TEAM_ID=pandamonium
+export TAG="${TAG:-v3}"
 
-# Install til_environment (from the official TIL-26-AE repo)
+# 2. Host dependencies for downloads and til test
+pip install -U pip
+pip install faster-whisper ultralytics sahi sentence-transformers rank-bm25 openai huggingface-hub
+pip install python-dotenv jiwer pycocotools scikit-image transformers stable-baselines3 gymnasium
 pip install git+https://github.com/til-ai/til-26-ae.git
 
+# 3. Dataset and model assets
+python download_drive_data.py
+python asr/download_models.py
+python cv/download_models.py --model yolo26l.pt
+python noise/download_models.py --model yolo26l.pt
+python nlp/download_models.py
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# STEP 2: REBUILD ALL DOCKER IMAGES (--no-cache for fresh models)
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# CRITICAL: --no-cache forces Docker to download the NEW models
-# (large-v3, yolo11l, Qwen2.5, MobileNetV2) instead of using
-# the old cached layers (small, yolo11n).
+# Optional but recommended after training/fine-tuning:
+#   cp runs/cv/.../weights/best.pt cv/models/best.pt
+#   cp runs/noise/.../weights/best.pt noise/models/best.pt
+#   python ae/train.py --mode advanced --envs 8 --total-steps 5000000
 
-cd ~/BrainHack-AI-Challenge---Pandamonium
+# 4. Build latest Docker images
+docker build --no-cache -t "${TEAM_ID}-asr:${TAG}" ./asr
+docker build --no-cache -t "${TEAM_ID}-cv:${TAG}" ./cv
+docker build --no-cache -t "${TEAM_ID}-noise:${TAG}" ./noise
+docker build --no-cache -t "${TEAM_ID}-ae:${TAG}" ./ae
+docker build --no-cache --build-arg DOWNLOAD_QWEN=1 -t "${TEAM_ID}-nlp:${TAG}" ./nlp
 
-docker build --no-cache -t pandamonium-asr:v2 ./asr
-docker build --no-cache -t pandamonium-cv:v2 ./cv
-docker build --no-cache -t pandamonium-noise:v2 ./noise
-docker build --no-cache -t pandamonium-nlp:v2 ./nlp
-docker build --no-cache -t pandamonium-ae:v2 ./ae
+docker image ls | grep "${TEAM_ID}"
 
-# Verify all images exist
-docker image ls | grep pandamonium
+# 5. Local evaluation scores
+mkdir -p score_logs
+for task in ae asr cv noise nlp; do
+  til test "${task}" "${TAG}" 2>&1 | tee "score_logs/${task}_${TAG}.log"
+done
+grep -E "score:|1 - MER|mAP@|QA Accuracy|Noise Score|Image-level fairness|total rewards|equiv_rate" score_logs/*_"${TAG}".log || true
 
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# STEP 3: TEST ALL IMAGES LOCALLY
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-til test asr v2
-til test cv v2
-til test noise v2
-til test nlp v2
-til test ae v2
-
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# STEP 4: SUBMIT ALL IMAGES FOR EVALUATION
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-til submit asr v2
-til submit cv v2
-til submit noise v2
-til submit nlp v2
-til submit ae v2
-
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# DONE! Check results:
-#   → Discord team channel for evaluation notifications
-#   → Leaderboard: https://tribegroup.notion.site/33a5263ef45a80c3bad7d6006752cba4
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-
-# ════════════════════════════════════════════════════════════════
-# TROUBLESHOOTING
-# ════════════════════════════════════════════════════════════════
-#
-# "til" command not found:
-#   → You must be on the GCP Workbench instance
-#
-# Docker authentication fails:
-#   gcloud auth print-access-token | docker login -u oauth2accesstoken --password-stdin https://asia-southeast1-docker.pkg.dev
-#
-# til_environment install fails:
-#   git clone https://github.com/til-ai/til-26-ae.git /tmp/til-26-ae
-#   cd /tmp/til-26-ae
-#   pip install .
-#
-# Retry a single task:
-#   docker build --no-cache -t pandamonium-TASK:v2 ./TASK
-#   til test TASK v2
-#   til submit TASK v2
+# 6. Submit
+til submit ae "${TAG}"
+til submit asr "${TAG}"
+til submit cv "${TAG}"
+til submit noise "${TAG}"
+til submit nlp "${TAG}"

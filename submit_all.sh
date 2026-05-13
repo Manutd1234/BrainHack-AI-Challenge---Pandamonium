@@ -17,7 +17,7 @@
 set -e
 
 REPO_ROOT="$(cd "$(dirname "$0")" && pwd)"
-TAG="v2"  # Change this for each submission iteration
+TAG="${TAG:-v3}"  # Override with: TAG=v4 bash submit_all.sh
 
 echo ""
 echo "╔══════════════════════════════════════════════════════════╗"
@@ -39,8 +39,8 @@ if [ -f "${REPO_ROOT}/cv/models/best.pt" ]; then
     echo "  ✓ Fine-tuned CV model (best.pt) found"
 else
     echo "  ⚠ WARNING: No fine-tuned CV model found at cv/models/best.pt"
-    echo "    CV will use pretrained yolo11l.pt (COCO classes — mAP will be ~0)"
-    echo "    To fix: yolo train model=yolo11l.pt data=til26.yaml epochs=50 imgsz=1280"
+    echo "    CV will use pretrained YOLO26 fallback with COCO-to-TIL class mapping."
+    echo "    To improve: train a YOLO26 checkpoint and copy best.pt to cv/models/best.pt"
     echo ""
 fi
 

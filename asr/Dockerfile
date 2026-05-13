@@ -8,6 +8,7 @@ FROM nvcr.io/nvidia/pytorch:25.11-py3
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 ENV PIP_ROOT_USER_ACTION=ignore
+ENV WHISPER_MODEL=models/whisper-large-v3
 ENV WHISPER_FALLBACK_MODEL=large-v3
 ENV WHISPER_DEVICE_INDEX=0
 WORKDIR /workspace
@@ -21,9 +22,9 @@ RUN pip install -U pip
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Pre-download the Whisper large-v3 model during build so it's cached in the image.
-# No internet is available at runtime, so all weights must be bundled in.
-RUN python -c "from faster_whisper import WhisperModel; WhisperModel('large-v3', device='cpu', compute_type='int8')"
+# Pre-download Whisper large-v3 into a runtime path copied into the image.
+COPY download_models.py .
+RUN python download_models.py
 
 # Copies your source files.
 COPY models/ ./models/

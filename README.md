@@ -26,7 +26,7 @@ til-26/
 │   ├── Dockerfile
 │   ├── requirements.txt
 │   ├── download_models.py
-│   ├── models/              ← BGE + Mistral weights (gitignored)
+│   ├── models/              ← BGE-M3 + Qwen3.6 weights (gitignored)
 │   └── src/server.py
 └── ae/
     ├── Dockerfile
@@ -109,7 +109,7 @@ Edit `til26.yaml` to point to your training data path. Then:
 ```bash
 cd /home/jupyter/til-26/cv
 yolo train \
-    model=models/cv/yolo11x.pt \
+    model=yolo26l.pt \
     data=til26.yaml \
     epochs=50 \
     imgsz=1280 \

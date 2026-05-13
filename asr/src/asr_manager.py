@@ -25,10 +25,7 @@ class ASRManager:
     def __init__(self):
         logger.info("Loading Whisper model...")
 
-        # Prefer a fine-tuned CTranslate2 model if bundled, else large-v3.
-        model_name = os.getenv("WHISPER_MODEL", "models/whisper-large-v3-finetuned")
-        if not os.path.exists(model_name):
-            model_name = os.getenv("WHISPER_FALLBACK_MODEL", "large-v3")
+        model_name = self._resolve_model_name()
         device_index = int(os.getenv("WHISPER_DEVICE_INDEX", "0"))
         cpu_threads = int(os.getenv("WHISPER_CPU_THREADS", "4"))
         num_workers = int(os.getenv("WHISPER_NUM_WORKERS", "1"))
@@ -67,6 +64,23 @@ class ASRManager:
             self.device = "cpu"
             logger.info("Whisper model loaded on CPU (int8).")
 
+    @staticmethod
+    def _resolve_model_name() -> str:
+        """Prefer bundled/fine-tuned CTranslate2 weights before remote IDs."""
+        candidates = [
+            os.getenv("WHISPER_MODEL"),
+            "models/whisper-large-v3-finetuned",
+            "models/whisper-large-v3",
+            os.getenv("WHISPER_FALLBACK_MODEL", "large-v3"),
+        ]
+        for candidate in candidates:
+            if not candidate:
+                continue
+            if candidate.startswith("models/") and not os.path.exists(candidate):
+                continue
+            return candidate
+        return "large-v3"
+
     def asr(self, audio_bytes: bytes) -> str:
         """Performs ASR transcription on an audio file.
 
@@ -90,11 +104,18 @@ class ASRManager:
             # still works fine since it will detect English.
             segments, info = self.model.transcribe(
                 temp_path,
-                beam_size=5,
+                beam_size=int(os.getenv("WHISPER_BEAM_SIZE", "7")),
                 language=None,  # auto-detect for multilingual support
                 initial_prompt=INITIAL_PROMPT,
+                task="transcribe",
+                temperature=0.0,
                 vad_filter=True,  # Enable VAD with default safe parameters
+                vad_parameters={
+                    "min_silence_duration_ms": 350,
+                    "speech_pad_ms": 250,
+                },
                 condition_on_previous_text=False,  # prevent hallucination cascading
+                word_timestamps=False,
             )
 
             transcription = " ".join(

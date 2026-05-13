@@ -4,8 +4,8 @@ This repository is wired for the high-capacity 2026 stack:
 
 | Track | Runtime strategy | Primary files |
 | --- | --- | --- |
-| NLP | BGE-M3 dense retrieval + BM25 reciprocal-rank fusion + Qwen3.6 via vLLM tensor parallelism | `nlp/src/nlp_manager.py`, `nlp/start_server.sh` |
-| CV | YOLO26 with SAHI-style sliced inference, 30% overlap, TIL-26 class mapping fallback | `cv/src/cv_manager.py` |
+| NLP | BGE-M3 dense retrieval + BM25 reciprocal-rank fusion + BGE reranking + Qwen3.6 via vLLM tensor parallelism | `nlp/src/nlp_manager.py`, `nlp/start_server.sh` |
+| CV | YOLO26 with SAHI-style sliced inference, 30% overlap, 1536px inference, TIL-26 class mapping fallback | `cv/src/cv_manager.py` |
 | Noise | PGD against the same YOLO26 family used by CV, with bounded texture/color perturbations | `noise/src/noise_manager.py` |
 | AE | Discrete SAC with ResNet bottleneck encoders for `agent_viewcone` and `base_viewcone` | `ae/train.py`, `ae/src/ae_model.py` |
 | ASR | faster-whisper large-v3 FP16, optional bundled fine-tuned CTranslate2 model | `asr/src/asr_manager.py` |
@@ -57,10 +57,10 @@ If no fine-tuned checkpoint exists, both tracks fall back to `yolo26l.pt`.
 CV knobs:
 
 ```bash
-YOLO_IMGSZ=1280
+YOLO_IMGSZ=1536
 SAHI_SLICE_SIZE=1024
 SAHI_OVERLAP=0.30
-YOLO_CONF=0.12
+YOLO_CONF=0.10
 ```
 
 Noise knobs:
@@ -91,8 +91,8 @@ checkpoint is present, so submissions remain functional during iteration.
 
 ## ASR
 
-By default ASR uses `large-v3` in faster-whisper. To ship a fine-tuned model,
-place the CTranslate2 export at:
+By default ASR uses bundled `models/whisper-large-v3` in faster-whisper. To ship
+a fine-tuned model, place the CTranslate2 export at:
 
 ```text
 asr/models/whisper-large-v3-finetuned

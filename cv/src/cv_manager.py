@@ -48,9 +48,9 @@ COCO_TO_TIL26_MAP = {
     8: 13,  # boat -> cargo ship
 }
 
-INFER_IMGSZ = int(os.getenv("YOLO_IMGSZ", "1280"))
-CONF_THRESHOLD = float(os.getenv("YOLO_CONF", "0.12"))
-MAX_DETECTIONS = int(os.getenv("YOLO_MAX_DET", "120"))
+INFER_IMGSZ = int(os.getenv("YOLO_IMGSZ", "1536"))
+CONF_THRESHOLD = float(os.getenv("YOLO_CONF", "0.10"))
+MAX_DETECTIONS = int(os.getenv("YOLO_MAX_DET", "200"))
 SAHI_SLICE_SIZE = int(os.getenv("SAHI_SLICE_SIZE", "1024"))
 SAHI_OVERLAP = float(os.getenv("SAHI_OVERLAP", "0.30"))
 
@@ -85,7 +85,7 @@ def _predict_yolo(model: YOLO, image: Image.Image, imgsz: int):
         "imgsz": imgsz,
         "conf": CONF_THRESHOLD,
         "max_det": MAX_DETECTIONS,
-        "augment": False,
+        "augment": _env_bool("CV_AUGMENT", False),
         "half": True,
         "end2end": True,
     }
@@ -165,6 +165,7 @@ class CVManager:
         xyxy: tuple[float, float, float, float],
         category_id: int,
         image_size: tuple[int, int],
+        score: float | None = None,
     ) -> dict[str, Any] | None:
         mapped_cls = self._map_category(category_id)
         if mapped_cls is None:
@@ -181,10 +182,13 @@ class CVManager:
         if box_w <= 1.0 or box_h <= 1.0:
             return None
 
-        return {
+        detection = {
             "bbox": [x1, y1, box_w, box_h],
             "category_id": mapped_cls,
         }
+        if score is not None:
+            detection["score"] = float(score)
+        return detection
 
     def _cv_sahi(self, img: Image.Image) -> list[dict[str, Any]]:
         from sahi.predict import get_sliced_prediction
@@ -207,7 +211,13 @@ class CVManager:
         for pred in result.object_prediction_list[:MAX_DETECTIONS]:
             bbox = pred.bbox.to_xyxy()
             category_id = int(pred.category.id)
-            detection = self._format_detection(tuple(bbox), category_id, img.size)
+            score = getattr(getattr(pred, "score", None), "value", None)
+            detection = self._format_detection(
+                tuple(bbox),
+                category_id,
+                img.size,
+                score=score,
+            )
             if detection is not None:
                 detections.append(detection)
         return detections
@@ -223,12 +233,14 @@ class CVManager:
 
             xyxy = boxes.xyxy.cpu().numpy()
             cls = boxes.cls.cpu().numpy().astype(int)
+            conf = boxes.conf.cpu().numpy() if getattr(boxes, "conf", None) is not None else None
 
             for i in range(len(xyxy)):
                 detection = self._format_detection(
                     tuple(float(v) for v in xyxy[i]),
                     int(cls[i]),
                     img.size,
+                    score=float(conf[i]) if conf is not None else None,
                 )
                 if detection is not None:
                     detections.append(detection)

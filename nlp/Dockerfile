@@ -14,6 +14,7 @@ ENV QWEN_TP_SIZE=2
 ENV QWEN_MAX_MODEL_LEN=131072
 ENV QWEN_BASE_URL=http://127.0.0.1:8000/v1
 ENV NLP_EMBEDDING_MODEL=BAAI/bge-m3
+ENV NLP_RERANKER_MODEL=BAAI/bge-reranker-large
 WORKDIR /workspace
 
 # Installs your dependencies.

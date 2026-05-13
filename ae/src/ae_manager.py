@@ -90,7 +90,7 @@ class AEManager:
         agent_viewcone = observation.get("agent_viewcone", None)
         frozen_ticks = int(observation.get("frozen_ticks", 0))
         team_resources = self._first(observation.get("team_resources"), 0.0)
-        team_bombs = int(observation.get("team_bombs", 0))
+        team_bombs = int(self._first(observation.get("team_bombs"), 1.0))
 
         self.step_count = step
 
@@ -113,7 +113,7 @@ class AEManager:
         if policy_action is not None:
             return policy_action
 
-        if self.stuck_counter > 6 and action_mask[4] == 1 and team_bombs > 0:
+        if self.stuck_counter > 6 and action_mask[4] == 1:
             self.stuck_counter = 0
             return 4
 
@@ -185,7 +185,7 @@ class AEManager:
             ties = [action for action, score in choices if abs(score - best_score) < 0.05]
             return random.choice(ties)
 
-        if action_mask[4] == 1 and team_bombs > 0 and team_resources >= 1:
+        if action_mask[4] == 1 and (team_bombs > 0 or team_resources >= 1):
             return 4
         return self._random_valid(action_mask)
 

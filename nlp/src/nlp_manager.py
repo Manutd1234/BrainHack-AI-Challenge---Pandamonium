@@ -20,6 +20,7 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 _sentence_model = None
+_cross_encoder = None
 _llm_client = None
 _llm_unavailable_logged = False
 
@@ -48,6 +49,17 @@ def _get_sentence_model(model_name: str):
     return _sentence_model
 
 
+def _get_cross_encoder(model_name: str):
+    """Lazy-load a lightweight reranker for higher-precision context."""
+    global _cross_encoder
+    if _cross_encoder is None:
+        from sentence_transformers import CrossEncoder
+
+        _cross_encoder = CrossEncoder(model_name)
+        logger.info("Loaded reranker model: %s", model_name)
+    return _cross_encoder
+
+
 def _get_llm_client(base_url: str):
     """Lazy-load an OpenAI-compatible client for the local vLLM server."""
     global _llm_client
@@ -68,6 +80,11 @@ class NLPManager:
 
     def __init__(self):
         self.embedding_model_name = os.getenv("NLP_EMBEDDING_MODEL", "BAAI/bge-m3")
+        self.reranker_model_name = os.getenv(
+            "NLP_RERANKER_MODEL",
+            "BAAI/bge-reranker-large",
+        )
+        self.use_reranker = _env_bool("NLP_USE_RERANKER", True)
         self.qwen_model = os.getenv("QWEN_MODEL", "Qwen/Qwen3.6-27B")
         self.qwen_base_url = os.getenv("QWEN_BASE_URL", "http://127.0.0.1:8000/v1")
         self.use_llm = _env_bool("NLP_USE_LLM", True)
@@ -83,6 +100,7 @@ class NLPManager:
         self.chunk_size_tokens = int(os.getenv("NLP_CHUNK_TOKENS", "1024"))
         self.chunk_overlap_tokens = int(os.getenv("NLP_CHUNK_OVERLAP_TOKENS", "160"))
         self.top_k_retrieve = int(os.getenv("NLP_TOP_K_RETRIEVE", "18"))
+        self.top_k_rerank = int(os.getenv("NLP_TOP_K_RERANK", "14"))
         self.top_k_context = int(os.getenv("NLP_TOP_K_CONTEXT", "8"))
         self.max_context_chars = int(os.getenv("NLP_MAX_CONTEXT_CHARS", "28000"))
 
@@ -209,6 +227,34 @@ class NLPManager:
 
         return "\n\n".join(selected)
 
+    def _rerank(
+        self,
+        question: str,
+        candidate_indices: list[int],
+    ) -> list[int]:
+        """Rerank fused retrieval results before building the LLM context."""
+        if not self.use_reranker or not candidate_indices:
+            return candidate_indices
+
+        try:
+            reranker = _get_cross_encoder(self.reranker_model_name)
+            shortlist = candidate_indices[: self.top_k_rerank]
+            pairs = [[question, self.chunks[idx]] for idx in shortlist]
+            scores = reranker.predict(pairs)
+            ranked = [
+                idx
+                for idx, _score in sorted(
+                    zip(shortlist, scores),
+                    key=lambda item: float(item[1]),
+                    reverse=True,
+                )
+            ]
+            ranked_set = set(ranked)
+            return ranked + [idx for idx in candidate_indices if idx not in ranked_set]
+        except Exception as exc:
+            logger.warning("Reranker unavailable; using fused order: %s", exc)
+            return candidate_indices
+
     def _build_prompt(self, question: str, context: str) -> list[dict[str, str]]:
         system_prompt = (
             "You answer questions about the Clairos corpus. Use only the "
@@ -262,6 +308,13 @@ class NLPManager:
         answer = answer.strip()
         answer = re.sub(r"^(final\s+answer|answer)\s*:\s*", "", answer, flags=re.I)
         if answer in {'""', "''", "N/A", "n/a", "None", "none"}:
+            return ""
+        if re.search(
+            r"\b(not\s+(available|provided|present|mentioned)|"
+            r"cannot\s+be\s+determined|insufficient\s+context)\b",
+            answer,
+            flags=re.I,
+        ):
             return ""
         if (
             (answer.startswith('"') and answer.endswith('"'))
@@ -320,6 +373,7 @@ class NLPManager:
         if not candidate_indices:
             return ""
 
+        candidate_indices = self._rerank(question, candidate_indices)
         context = self._build_context(candidate_indices)
         answer = self._call_llm(question, context)
         if answer is not None:
