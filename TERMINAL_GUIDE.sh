@@ -17,6 +17,11 @@ git submodule update --init --recursive
 export TEAM_ID=pandamonium
 export TAG="${TAG:-v4}"
 
+# Optional: clean duplicate folders in /home/jupyter without deleting them.
+# First preview, then apply if the preview looks right.
+bash tools/workbench_compact.sh
+# bash tools/workbench_compact.sh --apply
+
 # 2. Host dependencies for downloads and til test
 pip install -U pip
 pip install gdown faster-whisper ultralytics sahi sentence-transformers rank-bm25 openai huggingface-hub
