@@ -30,9 +30,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 ARG DOWNLOAD_QWEN=0
 COPY download_models.py .
 RUN if [ "${DOWNLOAD_QWEN}" = "1" ]; then \
-        python download_models.py; \
+        python3 download_models.py; \
     else \
-        python download_models.py --skip-qwen; \
+        python3 download_models.py --skip-qwen; \
     fi
 
 # Copies your source files.
