@@ -5,6 +5,6 @@ uvicorn[standard]==0.34.2
 sentence-transformers
 rank-bm25
 numpy
-openai
+openai==2.36.0
 huggingface-hub
-vllm>=0.19.0
+vllm==0.20.2

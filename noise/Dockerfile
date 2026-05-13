@@ -8,6 +8,10 @@ ENV PIP_ROOT_USER_ACTION=ignore
 ENV YOLO_SURROGATE_FALLBACK=yolo26l.pt
 WORKDIR /workspace
 
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libgl1 libglib2.0-0 libxcb1 && \
+    rm -rf /var/lib/apt/lists/*
+
 RUN pip install -U pip
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
