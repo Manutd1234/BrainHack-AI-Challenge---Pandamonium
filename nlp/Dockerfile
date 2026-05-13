@@ -1,8 +1,10 @@
 # Dockerfile for building the NLP image.
 
 
-# The base image, an example deep learning VM.
-FROM nvcr.io/nvidia/pytorch:25.11-py3
+# Start from the official vLLM OpenAI server image so Torch/CUDA/vLLM/openai
+# versions are already matched. Installing vLLM into the NGC PyTorch base caused
+# resolver backtracking and build failures.
+FROM vllm/vllm-openai:v0.20.2
 
 # Configures settings for the image.
 ENV PYTHONDONTWRITEBYTECODE=1
@@ -16,6 +18,7 @@ ENV QWEN_BASE_URL=http://127.0.0.1:8000/v1
 ENV NLP_EMBEDDING_MODEL=BAAI/bge-m3
 ENV NLP_RERANKER_MODEL=BAAI/bge-reranker-large
 WORKDIR /workspace
+ENTRYPOINT []
 
 # Installs your dependencies.
 RUN pip install -U pip
