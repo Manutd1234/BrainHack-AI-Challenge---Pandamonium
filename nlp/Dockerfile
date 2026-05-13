@@ -15,21 +15,15 @@ RUN pip install -U pip
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Pre-download all models during build (no internet at runtime).
+# Pre-download lightweight models during build (no internet at runtime).
 # 1. Sentence-transformer for embedding (22MB)
 # 2. Cross-encoder for reranking (22MB)
-# 3. Qwen2.5-3B-Instruct-AWQ for answer generation (~2GB, 4-bit quantized)
+# Total: ~44MB vs ~2GB for the old LLM approach
 RUN python -c "\
 from sentence_transformers import SentenceTransformer, CrossEncoder; \
 SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2'); \
 CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2'); \
-print('Embedding models downloaded')"
-
-RUN python -c "\
-from transformers import AutoModelForCausalLM, AutoTokenizer; \
-AutoTokenizer.from_pretrained('Qwen/Qwen2.5-3B-Instruct-AWQ'); \
-AutoModelForCausalLM.from_pretrained('Qwen/Qwen2.5-3B-Instruct-AWQ'); \
-print('LLM downloaded')"
+print('Models downloaded')"
 
 # Copies your source files.
 COPY src .

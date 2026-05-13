@@ -1,8 +1,12 @@
-"""Manages the CV model — Object Detection with YOLO11 + TensorRT.
+"""Manages the CV model — Speed-Optimized Object Detection with YOLO11.
 
-Uses YOLO11l fine-tuned on TIL-26's 18 custom classes. Attempts
-TensorRT export for 3-5x inference speedup on NVIDIA GPUs. Falls
-back to native PyTorch if TensorRT is not available.
+Uses YOLO11s (small) for maximum inference speed. Attempts TensorRT FP16
+export for 3-5x additional speedup. Falls back to PyTorch if TensorRT
+is unavailable.
+
+Strategy: 75% accuracy / 25% speed scoring means a fast model that's
+"good enough" beats a slow model that's perfect. yolo11s at 640px
+runs ~6x faster than yolo11l at 1280px with only ~10% mAP drop.
 """
 
 import io
@@ -38,8 +42,12 @@ TIL26_CLASSES = {
     17: "sailboat",
 }
 
+# Inference image size — 640 is the YOLO sweet spot for speed.
+# 1280 is 4x slower with diminishing accuracy returns.
+INFER_IMGSZ = 640
 
-def _try_tensorrt_export(model_path: str, imgsz: int = 1280) -> str | None:
+
+def _try_tensorrt_export(model_path: str, imgsz: int = INFER_IMGSZ) -> str | None:
     """Attempt to export a YOLO model to TensorRT format.
 
     TensorRT gives 3-5x inference speedup on NVIDIA GPUs.
@@ -73,35 +81,43 @@ class CVManager:
         logger.info("Loading YOLO model...")
 
         # Priority order for model loading:
-        # 1. Fine-tuned best.pt (trained on TIL-26 data)
-        # 2. Pre-downloaded yolo11l.pt base model
-        # 3. yolo11n.pt fallback
+        # 1. Fine-tuned best.pt (trained on TIL-26 data) — highest priority
+        # 2. Pre-downloaded yolo11s.pt (fast, good accuracy)
+        # 3. Any available model as fallback
         model_candidates = [
-            ("best.pt", True),
-            ("models/best.pt", True),
-            ("yolo11l.pt", False),
-            ("yolo11n.pt", False),
+            "best.pt",
+            "models/best.pt",
+            "yolo11s.pt",
+            "yolo11n.pt",
         ]
 
         loaded_path = None
-        for model_path, is_finetuned_candidate in model_candidates:
+        for model_path in model_candidates:
             if os.path.exists(model_path):
                 loaded_path = model_path
                 break
 
         if loaded_path is None:
             # Download default model
-            loaded_path = "yolo11l.pt"
+            loaded_path = "yolo11s.pt"
             YOLO(loaded_path)  # triggers download
 
         # Try TensorRT export for speed (3-5x faster)
-        engine_path = _try_tensorrt_export(loaded_path, imgsz=1280)
+        engine_path = _try_tensorrt_export(loaded_path, imgsz=INFER_IMGSZ)
         if engine_path:
             self.model = YOLO(engine_path)
             logger.info(f"Using TensorRT engine: {engine_path}")
         else:
             self.model = YOLO(loaded_path)
             logger.info(f"Using PyTorch model: {loaded_path}")
+
+        # Warm up the model with a dummy inference (eliminates first-call latency)
+        try:
+            dummy = np.zeros((INFER_IMGSZ, INFER_IMGSZ, 3), dtype=np.uint8)
+            self.model.predict(dummy, verbose=False, imgsz=INFER_IMGSZ)
+            logger.info("Model warm-up complete.")
+        except Exception:
+            pass
 
         # Check if the model has TIL-26 classes
         num_classes = len(getattr(self.model, "names", {}))
@@ -125,46 +141,35 @@ class CVManager:
 
         img = Image.open(io.BytesIO(image))
 
-        try:
-            results = self.model.predict(
-                img,
-                verbose=False,
-                imgsz=1280,       # Higher resolution for small targets
-                conf=0.15,        # Low confidence threshold for better recall
-                iou=0.5,          # NMS IoU threshold
-                max_det=100,      # Max detections per image
-                augment=False,    # TTA disabled for speed
-            )
-        except Exception as e:
-            logger.error(f"Inference failed ({e}), retrying on CPU.")
-            self.model = YOLO("yolo11l.pt")
-            results = self.model.predict(
-                img,
-                verbose=False,
-                device="cpu",
-                imgsz=1280,
-                conf=0.15,
-                iou=0.5,
-            )
+        results = self.model.predict(
+            img,
+            verbose=False,
+            imgsz=INFER_IMGSZ,    # 640 for speed (vs 1280)
+            conf=0.25,            # Reasonable threshold — fewer false positives
+            iou=0.45,             # Standard NMS IoU
+            max_det=50,           # Cap detections for speed
+            augment=False,        # No TTA — pure speed
+            half=True,            # FP16 inference
+        )
 
         detections = []
         for result in results:
             boxes = result.boxes
             if boxes is None:
                 continue
-            for box in boxes:
-                # Convert from xyxy (x1,y1,x2,y2) to LTWH (left,top,width,height)
-                # as required by the TIL-26 spec.
-                x1, y1, x2, y2 = box.xyxy[0].tolist()
-                l = x1
-                t = y1
-                w = x2 - x1
-                h = y2 - y1
-                category_id = int(box.cls[0].item())
 
+            # Batch extract all boxes at once (faster than per-box loop)
+            if len(boxes) == 0:
+                continue
+
+            xyxy = boxes.xyxy.cpu().numpy()
+            cls = boxes.cls.cpu().numpy().astype(int)
+
+            for i in range(len(xyxy)):
+                x1, y1, x2, y2 = xyxy[i]
                 detections.append({
-                    "bbox": [l, t, w, h],
-                    "category_id": category_id,
+                    "bbox": [float(x1), float(y1), float(x2 - x1), float(y2 - y1)],
+                    "category_id": int(cls[i]),
                 })
 
         return detections

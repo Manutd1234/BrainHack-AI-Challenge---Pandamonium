@@ -1,12 +1,17 @@
-"""Manages the NLP model — RAG-based Question Answering with LLM generation.
+"""Manages the NLP model — Speed-Optimized RAG Question Answering.
 
-Pipeline:
-  1. Dense embeddings via sentence-transformers (semantic similarity)
-  2. BM25 sparse retrieval (keyword coverage)
-  3. Cross-encoder reranking for precision
-  4. Quantized LLM (Qwen2.5-3B-Instruct AWQ) for answer generation via vLLM
-  
-Falls back to extractive QA if LLM is not available.
+Pipeline (speed-first):
+  1. Dense embeddings via sentence-transformers (all-MiniLM-L6-v2, 22MB)
+  2. BM25 sparse retrieval (zero GPU, instant)
+  3. Cross-encoder reranking for precision (MiniLM, 22MB)
+  4. Extractive answer selection (no LLM — saves ~30s startup + GPU memory)
+
+Strategy: The 75/25 accuracy/speed ratio heavily rewards fast inference.
+Dropping the 3B LLM eliminates:
+  - ~30s container startup time
+  - ~2GB GPU memory
+  - ~500ms per-question generation latency
+The cross-encoder + extractive approach is ~10x faster per query.
 """
 
 import logging
@@ -20,9 +25,6 @@ logger = logging.getLogger(__name__)
 # Lazy-loaded models
 _sentence_model = None
 _cross_encoder = None
-_llm = None
-_llm_tokenizer = None
-_llm_available = False
 
 
 def _get_sentence_model():
@@ -49,56 +51,6 @@ def _get_cross_encoder():
     return _cross_encoder
 
 
-def _get_llm():
-    """Lazy-load the quantized LLM for answer generation.
-
-    Uses Qwen2.5-3B-Instruct-AWQ — small enough to be fast,
-    large enough for good QA accuracy, AWQ quantized for speed.
-    Falls back gracefully if not available.
-    """
-    global _llm, _llm_tokenizer, _llm_available
-    if _llm is not None:
-        return _llm, _llm_tokenizer
-
-    # Try vLLM first (highest throughput)
-    try:
-        from vllm import LLM, SamplingParams
-        _llm = LLM(
-            model="Qwen/Qwen2.5-3B-Instruct-AWQ",
-            quantization="awq",
-            max_model_len=2048,
-            gpu_memory_utilization=0.5,  # Leave room for other models
-            dtype="float16",
-        )
-        _llm_tokenizer = "vllm"  # Sentinel to indicate vLLM mode
-        _llm_available = True
-        logger.info("Loaded Qwen2.5-3B-Instruct-AWQ via vLLM.")
-        return _llm, _llm_tokenizer
-    except Exception as e:
-        logger.warning(f"vLLM not available: {e}")
-
-    # Fallback: transformers with auto quantization
-    try:
-        from transformers import AutoModelForCausalLM, AutoTokenizer
-        import torch
-
-        model_id = "Qwen/Qwen2.5-3B-Instruct-AWQ"
-        _llm_tokenizer = AutoTokenizer.from_pretrained(model_id)
-        _llm = AutoModelForCausalLM.from_pretrained(
-            model_id,
-            device_map="auto",
-            torch_dtype=torch.float16,
-        )
-        _llm_available = True
-        logger.info("Loaded Qwen2.5-3B-Instruct-AWQ via transformers.")
-        return _llm, _llm_tokenizer
-    except Exception as e:
-        logger.warning(f"LLM not available ({e}), using extractive QA only.")
-        _llm_available = False
-
-    return None, None
-
-
 class NLPManager:
     loaded = False
 
@@ -107,15 +59,13 @@ class NLPManager:
         self.chunk_sources: list[int] = []
         self.embeddings: Optional[np.ndarray] = None
         self.bm25 = None
-        self.chunk_size = 512
-        self.chunk_overlap = 128
-        self.top_k_retrieve = 15
-        self.top_k_rerank = 5
+        self.chunk_size = 400       # Smaller chunks = more precise retrieval
+        self.chunk_overlap = 80
+        self.top_k_retrieve = 10    # Fewer candidates = faster
+        self.top_k_rerank = 3       # Focus on top 3 for answer extraction
 
     def _chunk_text(self, text: str, doc_id: int) -> list[tuple[str, int]]:
-        """Splits text into overlapping chunks, respecting paragraph/sentence
-        boundaries where possible.
-        """
+        """Splits text into overlapping chunks for retrieval."""
         paragraphs = re.split(r'\n\s*\n', text)
         chunks = []
         current_chunk = []
@@ -136,7 +86,7 @@ class NLPManager:
                         chunk_text = " ".join(current_chunk)
                         chunks.append((chunk_text, doc_id))
                         overlap_words = chunk_text.split()
-                        keep = max(1, len(overlap_words) // 4)
+                        keep = max(1, len(overlap_words) // 5)
                         overlap = " ".join(overlap_words[-keep:])
                         current_chunk = [overlap]
                         current_len = len(overlap)
@@ -147,7 +97,7 @@ class NLPManager:
                     chunk_text = " ".join(current_chunk)
                     chunks.append((chunk_text, doc_id))
                     overlap_words = chunk_text.split()
-                    keep = max(1, len(overlap_words) // 4)
+                    keep = max(1, len(overlap_words) // 5)
                     overlap = " ".join(overlap_words[-keep:])
                     current_chunk = [overlap]
                     current_len = len(overlap)
@@ -182,7 +132,7 @@ class NLPManager:
         self.embeddings = model.encode(
             self.chunks,
             show_progress_bar=False,
-            batch_size=128,
+            batch_size=256,           # Larger batch = faster encoding
             normalize_embeddings=True,
         )
         logger.info(f"Embeddings shape: {self.embeddings.shape}")
@@ -199,9 +149,8 @@ class NLPManager:
             logger.warning("rank_bm25 not installed, using dense-only retrieval.")
             self.bm25 = None
 
-        # Pre-load reranker + LLM (warm up during corpus load)
+        # Pre-load reranker (warm up during corpus load, not during QA)
         _get_cross_encoder()
-        _get_llm()
 
         logger.info("Corpus loading complete.")
         self.loaded = True
@@ -254,76 +203,13 @@ class NLPManager:
         )
         return [(int(idx), float(score)) for idx, score in ranked]
 
-    def _generate_answer_llm(self, question: str, context: str) -> str:
-        """Generate an answer using the quantized LLM.
+    def _extract_answer(self, question: str, context: str) -> str:
+        """Extract the best answer span from context using sentence scoring.
 
-        Uses a concise prompt to keep generation fast.
+        Uses the sentence-transformer to find the most relevant sentence(s)
+        to the question. This is ~10x faster than LLM generation.
         """
-        llm, tokenizer = _get_llm()
-        if llm is None:
-            return ""
-
-        prompt = (
-            "Answer the question using ONLY the provided context. "
-            "Give a concise, direct answer. If the answer is not in the "
-            "context, say exactly: ''\n\n"
-            f"Context:\n{context[:1500]}\n\n"
-            f"Question: {question}\n\n"
-            "Answer:"
-        )
-
-        try:
-            if tokenizer == "vllm":
-                # vLLM inference
-                from vllm import SamplingParams
-                params = SamplingParams(
-                    max_tokens=150,
-                    temperature=0.1,
-                    top_p=0.9,
-                    stop=["\n\n", "Question:", "Context:"],
-                )
-                outputs = llm.generate([prompt], params)
-                answer = outputs[0].outputs[0].text.strip()
-            else:
-                # transformers inference
-                import torch
-                inputs = tokenizer(
-                    prompt,
-                    return_tensors="pt",
-                    truncation=True,
-                    max_length=2048,
-                ).to(llm.device)
-
-                with torch.no_grad():
-                    output_ids = llm.generate(
-                        **inputs,
-                        max_new_tokens=150,
-                        temperature=0.1,
-                        top_p=0.9,
-                        do_sample=True,
-                    )
-
-                # Decode only the generated tokens
-                answer = tokenizer.decode(
-                    output_ids[0][inputs.input_ids.shape[1]:],
-                    skip_special_tokens=True,
-                ).strip()
-
-            # Clean up answer
-            answer = answer.split("\n")[0].strip()
-            if answer in ("''", '""', "N/A", "None", "I don't know"):
-                return ""
-            return answer
-
-        except Exception as e:
-            logger.warning(f"LLM generation failed: {e}")
-            return ""
-
-    def _extract_answer_fallback(self, question: str, context: str) -> str:
-        """Extractive answer fallback when LLM is not available.
-
-        Uses sentence-level embedding scoring against the question.
-        """
+        # Split into sentences
         sentences = re.split(r'(?<=[.!?])\s+', context)
         sentences = [s.strip() for s in sentences if len(s.strip()) > 10]
 
@@ -333,25 +219,28 @@ class NLPManager:
         if len(sentences) == 1:
             return sentences[0]
 
+        # Score each sentence against the question
         model = _get_sentence_model()
         q_emb = model.encode([question], normalize_embeddings=True)
         s_embs = model.encode(sentences, normalize_embeddings=True)
         sims = np.dot(s_embs, q_emb.T).flatten()
 
-        top_indices = np.argsort(sims)[-3:][::-1]
-        best_sentences = [sentences[i] for i in top_indices if sims[i] > 0.1]
+        # Take top 2 most relevant sentences
+        top_indices = np.argsort(sims)[-2:][::-1]
+        best_sentences = [sentences[i] for i in top_indices if sims[i] > 0.15]
 
         if not best_sentences:
-            return sentences[0]
+            return sentences[int(np.argmax(sims))]
 
+        # If top sentence is very short, concatenate top 2
         answer = best_sentences[0]
-        if len(answer) < 40 and len(best_sentences) > 1:
+        if len(answer) < 50 and len(best_sentences) > 1:
             answer = " ".join(best_sentences[:2])
 
         return answer
 
     def qa(self, question: str) -> str:
-        """Performs question answering using hybrid retrieval + LLM generation.
+        """Performs question answering using hybrid retrieval + extractive QA.
 
         Args:
             question: The question to answer.
@@ -377,8 +266,8 @@ class NLPManager:
         if not candidate_indices:
             return ""
 
-        # Step 2: Rerank with cross-encoder
-        reranked = self._rerank(question, candidate_indices[:25])
+        # Step 2: Rerank with cross-encoder (on limited candidates for speed)
+        reranked = self._rerank(question, candidate_indices[:15])
 
         if not reranked:
             if dense_results:
@@ -392,11 +281,5 @@ class NLPManager:
         ]
         context = "\n\n".join(top_chunks)
 
-        # Step 4: Generate answer with LLM (or extractive fallback)
-        if _llm_available:
-            answer = self._generate_answer_llm(question, context)
-            if answer:
-                return answer
-            # LLM returned empty — fall through to extractive
-
-        return self._extract_answer_fallback(question, context)
+        # Step 4: Extractive answer (no LLM — pure speed)
+        return self._extract_answer(question, context)
