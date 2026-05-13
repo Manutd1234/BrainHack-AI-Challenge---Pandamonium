@@ -17,6 +17,7 @@ class AEManager:
 
         # Exploration state
         self.visited = set()
+        self.visit_counts = {} # Track how many times each tile was stepped on
         self.last_action = None
         self.stuck_counter = 0
         self.last_location = None
@@ -61,6 +62,7 @@ class AEManager:
 
         self.last_location = location
         self.visited.add(location)
+        self.visit_counts[location] = self.visit_counts.get(location, 0) + 1
 
         # --- Priority 1: Interact with challenges if available ---
         if action_mask[3] == 1:
@@ -78,67 +80,83 @@ class AEManager:
                 return 4
             return self._random_valid(action_mask)
 
-        # --- Priority 3: Use viewcone to navigate ---
+        # --- Priority 3: Greedy Local Visited-Count Navigation ---
+        # Evaluates immediate neighbor tiles and chooses the direction 
+        # pointing to the least-visited cell to maximize maze coverage.
+        
+        # Coordinates delta: 0=North, 1=East, 2=South, 3=West
+        dx = [0, 1, 0, -1]
+        dy = [-1, 0, 1, 0]
+        
+        # 1. Compute coordinate mapping for all adjacent directions
+        loc_fwd = (location[0] + dx[direction], location[1] + dy[direction])
+        
+        dir_left = (direction - 1) % 4
+        loc_left = (location[0] + dx[dir_left], location[1] + dy[dir_left])
+        
+        dir_right = (direction + 1) % 4
+        loc_right = (location[0] + dx[dir_right], location[1] + dy[dir_right])
+        
+        dir_back = (direction + 2) % 4
+        loc_back = (location[0] + dx[dir_back], location[1] + dy[dir_back])
+        
+        # 2. Detect walls to prune blocked directions
+        front_blocked = (action_mask[0] == 0)
+        left_blocked = False
+        right_blocked = False
+        
         if agent_viewcone is not None:
             try:
                 vc = np.array(agent_viewcone)
-                # The viewcone is 7x5x25 - agent is at row 0, center col
-                # Check if path ahead is clear (look at forward cells)
-                # Channel interpretation varies, but we can check for walls
-
-                # Simple heuristic: check if the cells ahead have obstacles
-                # by looking at the sum of relevant channels
-                forward_clear = True
-                if vc.shape[0] > 1 and vc.shape[1] > 2:
-                    # Check the cell directly ahead (row 1, center col 2)
-                    ahead_cell = vc[1, 2, :]
-                    # If wall channel has high value, path is blocked
-                    # Channel 0 is typically walls/boundaries
-                    if ahead_cell[0] > 0.5:
-                        forward_clear = False
-
-                if not forward_clear and action_mask[0] == 1:
-                    # Path seems blocked, try turning
-                    turn_actions = [a for a in [1, 2] if action_mask[a] == 1]
-                    if turn_actions:
-                        return random.choice(turn_actions)
-
+                # The agent is at row 0, col 2. 
+                # Left is row 0, col 1. Right is row 0, col 3.
+                if vc.shape[0] > 0 and vc.shape[1] > 3:
+                    # Channel 0 has walls (value > 0.5)
+                    if vc[0, 1, 0] > 0.5:
+                        left_blocked = True
+                    if vc[0, 3, 0] > 0.5:
+                        right_blocked = True
             except Exception:
-                pass  # Fall through to default logic
-
-        # --- Priority 4: Explore unvisited areas ---
-        # Move forward if possible (main exploration action)
-        if action_mask[0] == 1:
-            # Check adjacent cells for unvisited locations
-            dx = [0, 1, 0, -1]  # direction 0=north, 1=east, 2=south, 3=west
-            dy = [-1, 0, 1, 0]
-            next_loc = (location[0] + dx[direction], location[1] + dy[direction])
-
-            if next_loc not in self.visited:
-                # Prefer moving to unvisited locations
-                return 0
-            elif random.random() < 0.7:
-                # Still move forward most of the time even if visited
-                return 0
-
-        # --- Priority 5: Turn to explore new directions ---
-        # Check which turns lead to unvisited areas
-        turn_actions = []
-        if action_mask[1] == 1:
-            turn_actions.append(1)
-        if action_mask[2] == 1:
-            turn_actions.append(2)
-
-        if turn_actions:
-            # Alternate turning direction to avoid circles
-            self.explore_dir = (self.explore_dir + 1) % len(turn_actions)
-            return turn_actions[self.explore_dir % len(turn_actions)]
-
-        # --- Priority 6: Place bomb if nothing else works ---
-        if action_mask[4] == 1 and random.random() < 0.1:
+                pass
+                
+        # 3. Evaluate and score each valid movement choice
+        choices = []
+        
+        # Choice A: Move Forward (Action 0)
+        if not front_blocked:
+            v_fwd = self.visit_counts.get(loc_fwd, 0)
+            choices.append((0, v_fwd))
+            
+        # Choice B: Turn Left (Action 1)
+        if not left_blocked and action_mask[1] == 1:
+            # Small penalty added to turning to break ties and encourage going straight
+            v_left = self.visit_counts.get(loc_left, 0) + 0.1
+            choices.append((1, v_left))
+            
+        # Choice C: Turn Right (Action 2)
+        if not right_blocked and action_mask[2] == 1:
+            v_right = self.visit_counts.get(loc_right, 0) + 0.1
+            choices.append((2, v_right))
+            
+        # Choice D: Backtrack / Turn Around (Action 1 or 2)
+        # High penalty - only used as a complete dead-end escape
+        v_back = self.visit_counts.get(loc_back, 0) + 5.0
+        back_act = 1 if action_mask[1] == 1 else (2 if action_mask[2] == 1 else 5)
+        choices.append((back_act, v_back))
+        
+        # 4. Sort choices to select direction of least visited tile
+        choices.sort(key=lambda x: x[1])
+        
+        if choices:
+            # Tie breaker
+            best_val = choices[0][1]
+            ties = [c for c in choices if abs(c[1] - best_val) < 0.05]
+            return random.choice(ties)[0]
+            
+        # --- Priority 4: Random Bomb Placement ---
+        if action_mask[4] == 1 and random.random() < 0.05:
             return 4
-
-        # Fallback: random valid action
+        
         return self._random_valid(action_mask)
 
     def _random_valid(self, action_mask):

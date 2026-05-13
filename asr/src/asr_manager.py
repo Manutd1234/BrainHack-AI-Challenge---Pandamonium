@@ -81,6 +81,7 @@ class ASRManager:
                 beam_size=5,
                 language=None,  # auto-detect for multilingual support
                 initial_prompt=INITIAL_PROMPT,
+                vad_filter=True,  # Enable VAD with default safe parameters
                 condition_on_previous_text=False,  # prevent hallucination cascading
             )
 

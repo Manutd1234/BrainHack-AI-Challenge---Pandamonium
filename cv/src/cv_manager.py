@@ -155,8 +155,8 @@ class CVManager:
             img,
             verbose=False,
             imgsz=INFER_IMGSZ,    # 640 for speed (vs 1280)
-            conf=0.25,            # Reasonable threshold — fewer false positives
-            iou=0.45,             # Standard NMS IoU
+            conf=0.15,            # Lower threshold to maximize recall for target classes
+            iou=0.50,             # Raised IoU to better handle packed objects/convoys
             max_det=50,           # Cap detections for speed
             augment=False,        # No TTA — pure speed
             half=True,            # FP16 inference

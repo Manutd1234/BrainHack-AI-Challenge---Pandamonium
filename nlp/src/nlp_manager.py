@@ -62,7 +62,7 @@ class NLPManager:
         self.chunk_size = 400       # Smaller chunks = more precise retrieval
         self.chunk_overlap = 80
         self.top_k_retrieve = 10    # Fewer candidates = faster
-        self.top_k_rerank = 3       # Focus on top 3 for answer extraction
+        self.top_k_rerank = 5       # Increased to top 5 for higher-recall context building
 
     def _chunk_text(self, text: str, doc_id: int) -> list[tuple[str, int]]:
         """Splits text into overlapping chunks for retrieval."""
@@ -243,6 +243,13 @@ class NLPManager:
         if len(answer) < 50 and len(best_sentences) > 1:
             answer = " ".join(best_sentences[:2])
 
+        # Advanced Cleaning Strategy: Strip leading transition words and cleanup
+        answer = answer.strip()
+        # Remove phrases like "However, ", "Therefore, ", "Additionally, "
+        answer = re.sub(r'^(Additionally|However|Therefore|Furthermore|Indeed|Specifically|In addition|Moreover),\s*', '', answer, flags=re.IGNORECASE)
+        # Clean double spaces and strip brackets
+        answer = re.sub(r'\s+', ' ', answer).strip()
+        
         return answer
 
     def qa(self, question: str) -> str:
