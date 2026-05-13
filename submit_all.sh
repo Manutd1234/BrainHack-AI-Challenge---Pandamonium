@@ -17,7 +17,7 @@
 set -e
 
 REPO_ROOT="$(cd "$(dirname "$0")" && pwd)"
-TAG="${TAG:-v3}"  # Override with: TAG=v4 bash submit_all.sh
+TAG="${TAG:-v4}"  # Override with: TAG=v5 bash submit_all.sh
 
 echo ""
 echo "╔══════════════════════════════════════════════════════════╗"

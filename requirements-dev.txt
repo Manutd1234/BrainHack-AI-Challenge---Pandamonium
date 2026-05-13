@@ -9,6 +9,7 @@ jiwer
 python-dotenv
 requests
 tqdm
+gdown
 pycocotools
 transformers
 torch

@@ -64,6 +64,10 @@ class ASRManager:
             self.device = "cpu"
             logger.info("Whisper model loaded on CPU (int8).")
 
+        self.language_hint = os.getenv("WHISPER_LANGUAGE")
+        if not self.language_hint and os.getenv("TEAM_TRACK", "").lower() == "novice":
+            self.language_hint = "en"
+
     @staticmethod
     def _resolve_model_name() -> str:
         """Prefer bundled/fine-tuned CTranslate2 weights before remote IDs."""
@@ -80,6 +84,39 @@ class ASRManager:
                 continue
             return candidate
         return "large-v3"
+
+    def _transcribe_once(
+        self,
+        temp_path: str,
+        *,
+        vad_filter: bool,
+        language: str | None,
+    ) -> tuple[str, object]:
+        vad_parameters = None
+        if vad_filter:
+            vad_parameters = {
+                "min_silence_duration_ms": int(os.getenv("WHISPER_VAD_SILENCE_MS", "250")),
+                "speech_pad_ms": int(os.getenv("WHISPER_VAD_PAD_MS", "300")),
+            }
+
+        segments, info = self.model.transcribe(
+            temp_path,
+            beam_size=int(os.getenv("WHISPER_BEAM_SIZE", "7")),
+            language=language,
+            initial_prompt=INITIAL_PROMPT,
+            task="transcribe",
+            temperature=0.0,
+            vad_filter=vad_filter,
+            vad_parameters=vad_parameters,
+            condition_on_previous_text=False,
+            word_timestamps=False,
+            no_speech_threshold=float(os.getenv("WHISPER_NO_SPEECH_THRESHOLD", "0.95")),
+            log_prob_threshold=float(os.getenv("WHISPER_LOG_PROB_THRESHOLD", "-1.5")),
+            compression_ratio_threshold=float(os.getenv("WHISPER_COMPRESSION_RATIO_THRESHOLD", "2.6")),
+        )
+        transcription = " ".join(segment.text.strip() for segment in segments)
+        transcription = " ".join(transcription.split())
+        return transcription, info
 
     def asr(self, audio_bytes: bytes) -> str:
         """Performs ASR transcription on an audio file.
@@ -98,29 +135,20 @@ class ASRManager:
                 f.write(audio_bytes)
                 temp_path = f.name
 
-            # Auto-detect language to support multilingual Advanced track
-            # (English, Malay, Tamil, Chinese). Setting language=None
-            # enables auto-detection. For Novice (English-only), this
-            # still works fine since it will detect English.
-            segments, info = self.model.transcribe(
+            # Auto-detect language by default for Advanced, but force English
+            # when WHISPER_LANGUAGE=en or TEAM_TRACK=novice is present.
+            transcription, info = self._transcribe_once(
                 temp_path,
-                beam_size=int(os.getenv("WHISPER_BEAM_SIZE", "7")),
-                language=None,  # auto-detect for multilingual support
-                initial_prompt=INITIAL_PROMPT,
-                task="transcribe",
-                temperature=0.0,
                 vad_filter=True,  # Enable VAD with default safe parameters
-                vad_parameters={
-                    "min_silence_duration_ms": 350,
-                    "speech_pad_ms": 250,
-                },
-                condition_on_previous_text=False,  # prevent hallucination cascading
-                word_timestamps=False,
+                language=self.language_hint,
             )
-
-            transcription = " ".join(
-                segment.text.strip() for segment in segments
-            )
+            if not transcription:
+                logger.info("Empty ASR result with VAD; retrying without VAD.")
+                transcription, info = self._transcribe_once(
+                    temp_path,
+                    vad_filter=False,
+                    language=self.language_hint,
+                )
             logger.info(
                 f"Detected language: {info.language} "
                 f"(prob={info.language_probability:.2f}), "

@@ -15,11 +15,11 @@ git pull --ff-only origin main
 git submodule update --init --recursive
 
 export TEAM_ID=pandamonium
-export TAG="${TAG:-v3}"
+export TAG="${TAG:-v4}"
 
 # 2. Host dependencies for downloads and til test
 pip install -U pip
-pip install faster-whisper ultralytics sahi sentence-transformers rank-bm25 openai huggingface-hub
+pip install gdown faster-whisper ultralytics sahi sentence-transformers rank-bm25 openai huggingface-hub
 pip install python-dotenv jiwer pycocotools scikit-image transformers stable-baselines3 gymnasium
 pip install git+https://github.com/til-ai/til-26-ae.git
 
@@ -35,7 +35,8 @@ python nlp/download_models.py
 #   cp runs/noise/.../weights/best.pt noise/models/best.pt
 #   python ae/train.py --mode advanced --envs 8 --total-steps 5000000
 
-# 4. Build latest Docker images
+# 4. Build latest Docker images. Use a new tag so stale v3 images cannot be
+# accidentally re-submitted.
 docker build --no-cache -t "${TEAM_ID}-asr:${TAG}" ./asr
 docker build --no-cache -t "${TEAM_ID}-cv:${TAG}" ./cv
 docker build --no-cache -t "${TEAM_ID}-noise:${TAG}" ./noise
