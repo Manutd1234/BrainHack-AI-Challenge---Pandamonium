@@ -20,8 +20,13 @@ RUN pip install -U pip
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Pre-download the YOLO model during build (no internet at runtime).
-RUN python -c "from ultralytics import YOLO; YOLO('yolo11n.pt')"
+# Pre-download the YOLO11l model during build (no internet at runtime).
+# Using 'l' (large) variant for best accuracy/speed tradeoff.
+RUN python -c "from ultralytics import YOLO; YOLO('yolo11l.pt')"
+
+# Copy fine-tuned model weights if available.
+# If you've trained on TIL-26 data, place best.pt in cv/models/
+COPY models/ ./models/
 
 # Copies your source files.
 COPY src .

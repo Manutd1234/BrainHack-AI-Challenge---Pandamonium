@@ -15,6 +15,9 @@ RUN pip install -U pip
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Pre-download MobileNetV2 weights for surrogate-model FGSM attacks.
+RUN python -c "import torchvision.models as m; m.mobilenet_v2(weights=m.MobileNet_V2_Weights.DEFAULT)"
+
 # Copies your source files.
 COPY src .
 

@@ -19,8 +19,9 @@ RUN pip install -U pip
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Pre-download the Whisper model during build so it's cached in the image.
-RUN python -c "from faster_whisper import WhisperModel; WhisperModel('small', device='cpu', compute_type='int8')"
+# Pre-download the Whisper large-v3 model during build so it's cached in the image.
+# No internet is available at runtime, so all weights must be bundled in.
+RUN python -c "from faster_whisper import WhisperModel; WhisperModel('large-v3', device='cpu', compute_type='int8')"
 
 # Copies your source files.
 COPY src .

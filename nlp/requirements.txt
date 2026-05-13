@@ -2,6 +2,11 @@
 
 fastapi==0.115.12
 uvicorn[standard]==0.34.2
-asyncio
-scikit-learn
+sentence-transformers
+faiss-cpu
+rank-bm25
 numpy
+vllm
+transformers
+autoawq
+accelerate

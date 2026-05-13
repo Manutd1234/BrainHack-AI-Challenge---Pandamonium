@@ -46,17 +46,31 @@ async def nlp(request: Request) -> dict[str, list[str]]:
     inputs_json = await request.json()
     first = inputs_json["instances"][0]
 
-    # Load: any request carrying `documents` kicks off the load.
+    # Corpus loading: the first request with "documents" triggers the load.
+    # Per spec, must return {"predictions": ["loaded"]} when complete.
     if first.get("documents") is not None:
         async with load_state.lock:
-            if load_state.status == "idle":
+            if load_state.status in ("idle", "failed"):
                 load_state.status = "loading"
-                load_state.task = asyncio.create_task(_load_task(first["documents"]))
-            return {"predictions": [load_state.status]}
+                load_state.task = asyncio.create_task(
+                    _load_task(first["documents"])
+                )
+
+        # Wait for loading to complete (spec expects "loaded" response)
+        if load_state.task is not None:
+            try:
+                await asyncio.wait_for(load_state.task, timeout=600)
+            except asyncio.TimeoutError:
+                load_state.status = "failed"
+                load_state.error = "Corpus load timed out"
+
+        return {"predictions": [load_state.status]}
+
     # Poll: returns current status (subsequent polls).
     if first.get("poll") is not None:
         return {"predictions": [load_state.status]}
 
+    # QA: answer questions using RAG pipeline.
     predictions = [
         await asyncio.to_thread(manager.qa, instance["question"])
         for instance in inputs_json["instances"]
