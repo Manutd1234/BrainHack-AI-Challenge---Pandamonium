@@ -1,69 +1,68 @@
 #!/bin/bash
 # ════════════════════════════════════════════════════════════════
-# TIL-AI 2026 — COMPLETE TERMINAL GUIDE
+# TIL-AI 2026 — COMPLETE BUILD + SUBMIT GUIDE (v3)
 # ════════════════════════════════════════════════════════════════
-# Paste each section into your GCP Workbench terminal in order.
-# Do NOT run this as a single script — follow step by step.
+# Run each section in order on your GCP Workbench terminal.
 # ════════════════════════════════════════════════════════════════
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# STEP 0: VERIFY GCP AUTHENTICATION
+# STEP 0: VERIFY GCP + DOCKER AUTHENTICATION
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-# 0a. Check which GCP account is active
+# Check active GCP account
 gcloud auth list
 
-# 0b. Set the correct service account (replace TEAM-NAME with yours, e.g. pandamonium)
+# Set your team's service account
 gcloud config set account svc-pandamonium@til-ai-2026.iam.gserviceaccount.com
 
-# 0c. Verify the correct project is set
+# Set project
 gcloud config set project til-ai-2026
 
-# 0d. Configure Docker to push to Artifact Registry
+# Authenticate Docker with Artifact Registry
 gcloud auth configure-docker asia-southeast1-docker.pkg.dev
 
-# 0e. Verify Docker is running
-docker info > /dev/null 2>&1 && echo "✓ Docker is running" || echo "✗ Docker NOT running"
-
-# 0f. Verify GPU is available
-nvidia-smi > /dev/null 2>&1 && echo "✓ GPU available" || echo "⚠ No GPU detected"
+# Verify Docker + GPU
+docker info > /dev/null 2>&1 && echo "✓ Docker OK" || echo "✗ Docker NOT running"
+nvidia-smi > /dev/null 2>&1 && echo "✓ GPU OK" || echo "⚠ No GPU"
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# STEP 1: PULL LATEST CODE FROM GITHUB
+# STEP 1: PULL LATEST CODE + INSTALL HOST TEST DEPENDENCIES
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-cd /home/jupyter/til-26
+cd ~/BrainHack-AI-Challenge---Pandamonium
 git pull origin main
-
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# STEP 2: ENSURE MODELS DIRECTORIES EXIST
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
 mkdir -p asr/models cv/models noise/models nlp/models ae/models
 
-# Check if fine-tuned CV model exists
-ls -la cv/models/best.pt 2>/dev/null && echo "✓ Fine-tuned CV model found" || echo "⚠ No best.pt — CV will score ~0 on TIL-26 classes"
+# Install ALL host-side test dependencies in one shot
+pip install python-dotenv jiwer pycocotools scikit-image transformers
+
+# Install til_environment (from the official TIL-26-AE repo)
+pip install git+https://github.com/til-ai/til-26-ae.git
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# STEP 3: BUILD ALL DOCKER IMAGES
+# STEP 2: REBUILD ALL DOCKER IMAGES (--no-cache for fresh models)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# CRITICAL: --no-cache forces Docker to download the NEW models
+# (large-v3, yolo11l, Qwen2.5, MobileNetV2) instead of using
+# the old cached layers (small, yolo11n).
 
-til build asr v2
-til build cv v2
-til build noise v2
-til build nlp v2
-til build ae v2
+cd ~/BrainHack-AI-Challenge---Pandamonium
 
-# Verify all images were built
+docker build --no-cache -t pandamonium-asr:v2 ./asr
+docker build --no-cache -t pandamonium-cv:v2 ./cv
+docker build --no-cache -t pandamonium-noise:v2 ./noise
+docker build --no-cache -t pandamonium-nlp:v2 ./nlp
+docker build --no-cache -t pandamonium-ae:v2 ./ae
+
+# Verify all images exist
 docker image ls | grep pandamonium
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# STEP 4: TEST ALL IMAGES LOCALLY (runs offline, scores models)
+# STEP 3: TEST ALL IMAGES LOCALLY
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 til test asr v2
@@ -74,7 +73,7 @@ til test ae v2
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# STEP 5: SUBMIT ALL IMAGES FOR EVALUATION
+# STEP 4: SUBMIT ALL IMAGES FOR EVALUATION
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 til submit asr v2
@@ -85,30 +84,28 @@ til submit ae v2
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# DONE! Check your results:
+# DONE! Check results:
 #   → Discord team channel for evaluation notifications
-#   → Leaderboard in the Strategist's Handbook
+#   → Leaderboard: https://tribegroup.notion.site/33a5263ef45a80c3bad7d6006752cba4
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 
 # ════════════════════════════════════════════════════════════════
 # TROUBLESHOOTING
 # ════════════════════════════════════════════════════════════════
-
-# If "til" command not found:
-#   → You must be on the GCP Workbench instance, not local machine
-
-# If authentication fails:
-#   gcloud auth activate-service-account svc-pandamonium@til-ai-2026.iam.gserviceaccount.com --key-file=/path/to/key.json
-#   gcloud auth configure-docker asia-southeast1-docker.pkg.dev
-
-# If Docker push fails (permission denied):
+#
+# "til" command not found:
+#   → You must be on the GCP Workbench instance
+#
+# Docker authentication fails:
 #   gcloud auth print-access-token | docker login -u oauth2accesstoken --password-stdin https://asia-southeast1-docker.pkg.dev
-
-# If a single build/test/submit fails, retry individually:
-#   til build TASK v2
+#
+# til_environment install fails:
+#   git clone https://github.com/til-ai/til-26-ae.git /tmp/til-26-ae
+#   cd /tmp/til-26-ae
+#   pip install .
+#
+# Retry a single task:
+#   docker build --no-cache -t pandamonium-TASK:v2 ./TASK
 #   til test TASK v2
 #   til submit TASK v2
-
-# To re-tag an existing image:
-#   docker tag pandamonium-asr:v2 pandamonium-asr:latest
