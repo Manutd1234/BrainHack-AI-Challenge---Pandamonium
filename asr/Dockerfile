@@ -8,6 +8,8 @@ FROM nvcr.io/nvidia/pytorch:25.11-py3
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 ENV PIP_ROOT_USER_ACTION=ignore
+ENV WHISPER_FALLBACK_MODEL=large-v3
+ENV WHISPER_DEVICE_INDEX=0
 WORKDIR /workspace
 
 # Install ffmpeg for audio processing.
@@ -24,6 +26,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 RUN python -c "from faster_whisper import WhisperModel; WhisperModel('large-v3', device='cpu', compute_type='int8')"
 
 # Copies your source files.
+COPY models/ ./models/
 COPY src .
 
 # Starts your model server.

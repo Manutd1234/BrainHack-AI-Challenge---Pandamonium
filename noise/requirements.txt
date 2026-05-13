@@ -5,3 +5,4 @@ uvicorn[standard]==0.34.2
 pillow
 numpy
 torchvision
+ultralytics

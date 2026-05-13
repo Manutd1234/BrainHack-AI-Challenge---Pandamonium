@@ -1,20 +1,17 @@
-"""Manages the NLP model — Speed-Optimized RAG Question Answering.
+"""Manages the NLP model: hybrid RAG with Qwen3.6 generation.
 
-Pipeline (speed-first):
-  1. Dense embeddings via sentence-transformers (all-MiniLM-L6-v2, 22MB)
-  2. BM25 sparse retrieval (zero GPU, instant)
-  3. Cross-encoder reranking for precision (MiniLM, 22MB)
-  4. Extractive answer selection (no LLM — saves ~30s startup + GPU memory)
-
-Strategy: The 75/25 accuracy/speed ratio heavily rewards fast inference.
-Dropping the 3B LLM eliminates:
-  - ~30s container startup time
-  - ~2GB GPU memory
-  - ~500ms per-question generation latency
-The cross-encoder + extractive approach is ~10x faster per query.
+The qualifier endpoint receives a corpus at runtime, so this manager builds a
+fresh dense+sparse index per corpus. At answer time it sends the fused context
+to a local OpenAI-compatible vLLM server running Qwen3.6. If that server is not
+available in a lightweight local test environment, it falls back to extractive
+answer selection instead of failing the endpoint.
 """
 
+from __future__ import annotations
+
+from collections import defaultdict
 import logging
+import os
 import re
 from typing import Optional
 
@@ -22,146 +19,147 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-# Lazy-loaded models
 _sentence_model = None
-_cross_encoder = None
+_llm_client = None
+_llm_unavailable_logged = False
 
 
-def _get_sentence_model():
-    """Lazy-load the sentence-transformer embedding model."""
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _get_sentence_model(model_name: str):
+    """Lazy-load the BGE-M3 embedding model."""
     global _sentence_model
     if _sentence_model is None:
         from sentence_transformers import SentenceTransformer
-        _sentence_model = SentenceTransformer(
-            "sentence-transformers/all-MiniLM-L6-v2"
-        )
-        logger.info("Loaded sentence-transformer embedding model.")
+
+        try:
+            _sentence_model = SentenceTransformer(
+                model_name,
+                trust_remote_code=True,
+            )
+        except TypeError:
+            _sentence_model = SentenceTransformer(model_name)
+        logger.info("Loaded embedding model: %s", model_name)
     return _sentence_model
 
 
-def _get_cross_encoder():
-    """Lazy-load the cross-encoder reranker model."""
-    global _cross_encoder
-    if _cross_encoder is None:
-        from sentence_transformers import CrossEncoder
-        _cross_encoder = CrossEncoder(
-            "cross-encoder/ms-marco-MiniLM-L-6-v2"
+def _get_llm_client(base_url: str):
+    """Lazy-load an OpenAI-compatible client for the local vLLM server."""
+    global _llm_client
+    if _llm_client is None:
+        from openai import OpenAI
+
+        _llm_client = OpenAI(
+            base_url=base_url,
+            api_key=os.getenv("QWEN_API_KEY", "EMPTY"),
+            timeout=float(os.getenv("QWEN_TIMEOUT_SECONDS", "45")),
         )
-        logger.info("Loaded cross-encoder reranker model.")
-    return _cross_encoder
+        logger.info("Configured Qwen client at %s", base_url)
+    return _llm_client
 
 
 class NLPManager:
     loaded = False
 
     def __init__(self):
+        self.embedding_model_name = os.getenv("NLP_EMBEDDING_MODEL", "BAAI/bge-m3")
+        self.qwen_model = os.getenv("QWEN_MODEL", "Qwen/Qwen3.6-27B")
+        self.qwen_base_url = os.getenv("QWEN_BASE_URL", "http://127.0.0.1:8000/v1")
+        self.use_llm = _env_bool("NLP_USE_LLM", True)
+
         self.chunks: list[str] = []
         self.chunk_sources: list[int] = []
         self.embeddings: Optional[np.ndarray] = None
         self.bm25 = None
-        self.chunk_size = 400       # Smaller chunks = more precise retrieval
-        self.chunk_overlap = 80
-        self.top_k_retrieve = 10    # Fewer candidates = faster
-        self.top_k_rerank = 5       # Increased to top 5 for higher-recall context building
+
+        # Larger chunks are intentional for Qwen3.6's long-context reasoning.
+        # This is an approximate word-token budget; the prompt builder also
+        # enforces a character budget before generation.
+        self.chunk_size_tokens = int(os.getenv("NLP_CHUNK_TOKENS", "1024"))
+        self.chunk_overlap_tokens = int(os.getenv("NLP_CHUNK_OVERLAP_TOKENS", "160"))
+        self.top_k_retrieve = int(os.getenv("NLP_TOP_K_RETRIEVE", "18"))
+        self.top_k_context = int(os.getenv("NLP_TOP_K_CONTEXT", "8"))
+        self.max_context_chars = int(os.getenv("NLP_MAX_CONTEXT_CHARS", "28000"))
 
     def _chunk_text(self, text: str, doc_id: int) -> list[tuple[str, int]]:
-        """Splits text into overlapping chunks for retrieval."""
-        paragraphs = re.split(r'\n\s*\n', text)
-        chunks = []
-        current_chunk = []
-        current_len = 0
+        """Splits text into overlapping, retrieval-sized chunks."""
+        words = text.split()
+        if not words:
+            return []
 
-        for para in paragraphs:
-            para = para.strip()
-            if not para:
-                continue
-
-            if len(para) > self.chunk_size:
-                sentences = re.split(r'(?<=[.!?])\s+', para)
-                for sent in sentences:
-                    sent = sent.strip()
-                    if not sent:
-                        continue
-                    if current_len + len(sent) > self.chunk_size and current_chunk:
-                        chunk_text = " ".join(current_chunk)
-                        chunks.append((chunk_text, doc_id))
-                        overlap_words = chunk_text.split()
-                        keep = max(1, len(overlap_words) // 5)
-                        overlap = " ".join(overlap_words[-keep:])
-                        current_chunk = [overlap]
-                        current_len = len(overlap)
-                    current_chunk.append(sent)
-                    current_len += len(sent) + 1
-            else:
-                if current_len + len(para) > self.chunk_size and current_chunk:
-                    chunk_text = " ".join(current_chunk)
-                    chunks.append((chunk_text, doc_id))
-                    overlap_words = chunk_text.split()
-                    keep = max(1, len(overlap_words) // 5)
-                    overlap = " ".join(overlap_words[-keep:])
-                    current_chunk = [overlap]
-                    current_len = len(overlap)
-                current_chunk.append(para)
-                current_len += len(para) + 1
-
-        if current_chunk:
-            chunks.append((" ".join(current_chunk), doc_id))
-
-        return [(c, d) for c, d in chunks if len(c.strip()) > 20]
+        step = max(1, self.chunk_size_tokens - self.chunk_overlap_tokens)
+        chunks: list[tuple[str, int]] = []
+        for start in range(0, len(words), step):
+            end = min(len(words), start + self.chunk_size_tokens)
+            chunk = " ".join(words[start:end]).strip()
+            if len(chunk) > 20:
+                chunks.append((chunk, doc_id))
+            if end == len(words):
+                break
+        return chunks
 
     def load_corpus(self, documents: list[str]) -> None:
         """Loads and indexes the corpus of documents for RAG QA."""
-        logger.info(f"Loading corpus of {len(documents)} documents...")
+        logger.info("Loading corpus of %d documents...", len(documents))
 
         self.chunks = []
         self.chunk_sources = []
         for doc_id, doc in enumerate(documents):
-            doc_chunks = self._chunk_text(doc, doc_id)
-            for chunk_text, did in doc_chunks:
+            for chunk_text, source_id in self._chunk_text(doc, doc_id):
                 self.chunks.append(chunk_text)
-                self.chunk_sources.append(did)
+                self.chunk_sources.append(source_id)
 
         logger.info(
-            f"Created {len(self.chunks)} chunks from "
-            f"{len(documents)} documents."
+            "Created %d chunks from %d documents.",
+            len(self.chunks),
+            len(documents),
         )
 
-        # Build dense embeddings index
-        model = _get_sentence_model()
-        logger.info("Encoding chunks with sentence-transformer...")
-        self.embeddings = model.encode(
+        if not self.chunks:
+            self.embeddings = np.empty((0, 0), dtype=np.float32)
+            self.loaded = True
+            return
+
+        model = _get_sentence_model(self.embedding_model_name)
+        logger.info("Encoding chunks with %s...", self.embedding_model_name)
+        embeddings = model.encode(
             self.chunks,
             show_progress_bar=False,
-            batch_size=256,           # Larger batch = faster encoding
+            batch_size=int(os.getenv("NLP_EMBED_BATCH_SIZE", "32")),
             normalize_embeddings=True,
         )
-        logger.info(f"Embeddings shape: {self.embeddings.shape}")
+        self.embeddings = np.asarray(embeddings, dtype=np.float32)
+        logger.info("Embeddings shape: %s", self.embeddings.shape)
 
-        # Build BM25 sparse index
         try:
             from rank_bm25 import BM25Okapi
-            tokenized_chunks = [
-                chunk.lower().split() for chunk in self.chunks
-            ]
+
+            tokenized_chunks = [self._bm25_tokens(chunk) for chunk in self.chunks]
             self.bm25 = BM25Okapi(tokenized_chunks)
             logger.info("BM25 index built successfully.")
         except ImportError:
             logger.warning("rank_bm25 not installed, using dense-only retrieval.")
             self.bm25 = None
 
-        # Pre-load reranker (warm up during corpus load, not during QA)
-        _get_cross_encoder()
-
-        logger.info("Corpus loading complete.")
         self.loaded = True
+
+    @staticmethod
+    def _bm25_tokens(text: str) -> list[str]:
+        return re.findall(r"[A-Za-z0-9_]+", text.lower())
 
     def _retrieve_dense(self, question: str, top_k: int) -> list[tuple[int, float]]:
         """Retrieve top-k chunks using dense embedding similarity."""
-        if self.embeddings is None:
+        if self.embeddings is None or len(self.embeddings) == 0:
             return []
 
-        model = _get_sentence_model()
+        model = _get_sentence_model(self.embedding_model_name)
         q_emb = model.encode([question], normalize_embeddings=True)
+        q_emb = np.asarray(q_emb, dtype=np.float32)
         similarities = np.dot(self.embeddings, q_emb.T).flatten()
         top_indices = np.argsort(similarities)[-top_k:][::-1]
         return [
@@ -175,8 +173,7 @@ class NLPManager:
         if self.bm25 is None:
             return []
 
-        tokenized_query = question.lower().split()
-        scores = self.bm25.get_scores(tokenized_query)
+        scores = self.bm25.get_scores(self._bm25_tokens(question))
         top_indices = np.argsort(scores)[-top_k:][::-1]
         return [
             (int(idx), float(scores[idx]))
@@ -184,115 +181,147 @@ class NLPManager:
             if scores[idx] > 0.0
         ]
 
-    def _rerank(
-        self, question: str, candidate_indices: list[int]
-    ) -> list[tuple[int, float]]:
-        """Re-score candidates using cross-encoder for precision."""
-        if not candidate_indices:
-            return []
+    def _fuse_results(
+        self,
+        dense_results: list[tuple[int, float]],
+        bm25_results: list[tuple[int, float]],
+    ) -> list[int]:
+        """Fuse dense and sparse retrieval with reciprocal-rank fusion."""
+        scores: defaultdict[int, float] = defaultdict(float)
+        for results, weight in ((dense_results, 1.0), (bm25_results, 0.85)):
+            for rank, (idx, _score) in enumerate(results, start=1):
+                scores[idx] += weight / (60.0 + rank)
 
-        cross_encoder = _get_cross_encoder()
-        pairs = [
-            [question, self.chunks[idx]] for idx in candidate_indices
-        ]
-        scores = cross_encoder.predict(pairs)
-        ranked = sorted(
-            zip(candidate_indices, scores),
-            key=lambda x: x[1],
-            reverse=True,
+        ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)
+        return [idx for idx, _score in ranked]
+
+    def _build_context(self, candidate_indices: list[int]) -> str:
+        selected: list[str] = []
+        total_chars = 0
+
+        for rank, idx in enumerate(candidate_indices[: self.top_k_context], start=1):
+            chunk = self.chunks[idx]
+            block = f"[{rank}] {chunk}"
+            if selected and total_chars + len(block) > self.max_context_chars:
+                break
+            selected.append(block)
+            total_chars += len(block)
+
+        return "\n\n".join(selected)
+
+    def _build_prompt(self, question: str, context: str) -> list[dict[str, str]]:
+        system_prompt = (
+            "You answer questions about the Clairos corpus. Use only the "
+            "provided context. If the answer is not present, or the question "
+            "contains a false premise, return an empty string. Return only the "
+            "final answer, with no citations or explanation."
         )
-        return [(int(idx), float(score)) for idx, score in ranked]
+        user_prompt = f"Context:\n{context}\n\nQuestion: {question}"
+        return [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+
+    def _call_llm(self, question: str, context: str) -> Optional[str]:
+        """Calls Qwen3.6 through vLLM. Returns None when unavailable."""
+        global _llm_unavailable_logged
+        if not self.use_llm:
+            return None
+
+        try:
+            client = _get_llm_client(self.qwen_base_url)
+            response = client.chat.completions.create(
+                model=self.qwen_model,
+                messages=self._build_prompt(question, context),
+                max_tokens=int(os.getenv("QWEN_MAX_NEW_TOKENS", "512")),
+                temperature=float(os.getenv("QWEN_TEMPERATURE", "0.2")),
+                top_p=float(os.getenv("QWEN_TOP_P", "0.8")),
+                presence_penalty=float(os.getenv("QWEN_PRESENCE_PENALTY", "1.5")),
+                extra_body={
+                    "top_k": int(os.getenv("QWEN_TOP_K", "20")),
+                    "chat_template_kwargs": {
+                        "enable_thinking": False,
+                        "preserve_thinking": True,
+                    },
+                },
+            )
+            content = response.choices[0].message.content or ""
+            return self._clean_llm_answer(content)
+        except Exception as exc:
+            if not _llm_unavailable_logged:
+                logger.warning(
+                    "Qwen generation unavailable, using extractive fallback: %s",
+                    exc,
+                )
+                _llm_unavailable_logged = True
+            return None
+
+    @staticmethod
+    def _clean_llm_answer(answer: str) -> str:
+        answer = re.sub(r"<think>.*?</think>", "", answer, flags=re.DOTALL)
+        answer = answer.strip()
+        answer = re.sub(r"^(final\s+answer|answer)\s*:\s*", "", answer, flags=re.I)
+        if answer in {'""', "''", "N/A", "n/a", "None", "none"}:
+            return ""
+        if (
+            (answer.startswith('"') and answer.endswith('"'))
+            or (answer.startswith("'") and answer.endswith("'"))
+        ):
+            answer = answer[1:-1].strip()
+        return answer[:1200]
 
     def _extract_answer(self, question: str, context: str) -> str:
-        """Extract the best answer span from context using sentence scoring.
-
-        Uses the sentence-transformer to find the most relevant sentence(s)
-        to the question. This is ~10x faster than LLM generation.
-        """
-        # Split into sentences
-        sentences = re.split(r'(?<=[.!?])\s+', context)
-        sentences = [s.strip() for s in sentences if len(s.strip()) > 10]
+        """Extract a likely answer span when the LLM runtime is unavailable."""
+        sentences = re.split(r"(?<=[.!?])\s+", context)
+        sentences = [
+            re.sub(r"^\[\d+\]\s*", "", sentence).strip()
+            for sentence in sentences
+            if len(sentence.strip()) > 10
+        ]
 
         if not sentences:
-            return context[:300]
-
+            return ""
         if len(sentences) == 1:
-            return sentences[0]
+            return sentences[0][:500]
 
-        # Score each sentence against the question
-        model = _get_sentence_model()
+        model = _get_sentence_model(self.embedding_model_name)
         q_emb = model.encode([question], normalize_embeddings=True)
         s_embs = model.encode(sentences, normalize_embeddings=True)
-        sims = np.dot(s_embs, q_emb.T).flatten()
+        sims = np.dot(np.asarray(s_embs), np.asarray(q_emb).T).flatten()
 
-        # Check for unanswerable questions
-        # The Advanced track evaluates strictly — if unanswerable, it expects ""
         max_sim = float(np.max(sims))
-        if max_sim < 0.3:  # Threshold for "unanswerable"
+        if max_sim < float(os.getenv("NLP_UNANSWERABLE_SIM_THRESHOLD", "0.28")):
             return ""
 
-        # Take top 2 most relevant sentences
-        top_indices = np.argsort(sims)[-2:][::-1]
+        top_indices = np.argsort(sims)[-3:][::-1]
         best_sentences = [sentences[i] for i in top_indices if sims[i] > 0.15]
-
         if not best_sentences:
             return ""
 
-        # If top sentence is very short, concatenate top 2
-        answer = best_sentences[0]
-        if len(answer) < 50 and len(best_sentences) > 1:
-            answer = " ".join(best_sentences[:2])
-
-        # Advanced Cleaning Strategy: Strip leading transition words and cleanup
-        answer = answer.strip()
-        # Remove phrases like "However, ", "Therefore, ", "Additionally, "
-        answer = re.sub(r'^(Additionally|However|Therefore|Furthermore|Indeed|Specifically|In addition|Moreover),\s*', '', answer, flags=re.IGNORECASE)
-        # Clean double spaces and strip brackets
-        answer = re.sub(r'\s+', ' ', answer).strip()
-        
-        return answer
+        answer = " ".join(best_sentences[:2]).strip()
+        answer = re.sub(
+            r"^(Additionally|However|Therefore|Furthermore|Indeed|"
+            r"Specifically|In addition|Moreover),\s*",
+            "",
+            answer,
+            flags=re.IGNORECASE,
+        )
+        return re.sub(r"\s+", " ", answer).strip()[:800]
 
     def qa(self, question: str) -> str:
-        """Performs question answering using hybrid retrieval + extractive QA.
-
-        Args:
-            question: The question to answer.
-
-        Returns:
-            A string containing the answer to the question.
-        """
+        """Performs question answering using hybrid retrieval + Qwen3.6."""
         if not self.loaded:
             return ""
 
-        # Step 1: Hybrid retrieval — dense + BM25
         dense_results = self._retrieve_dense(question, self.top_k_retrieve)
         bm25_results = self._retrieve_bm25(question, self.top_k_retrieve)
-
-        # Merge candidates (deduplicated union)
-        seen = set()
-        candidate_indices = []
-        for idx, _score in dense_results + bm25_results:
-            if idx not in seen:
-                seen.add(idx)
-                candidate_indices.append(idx)
+        candidate_indices = self._fuse_results(dense_results, bm25_results)
 
         if not candidate_indices:
             return ""
 
-        # Step 2: Rerank with cross-encoder (on limited candidates for speed)
-        reranked = self._rerank(question, candidate_indices[:15])
-
-        if not reranked:
-            if dense_results:
-                return self.chunks[dense_results[0][0]][:300]
-            return ""
-
-        # Step 3: Build context from top reranked chunks
-        top_chunks = [
-            self.chunks[idx]
-            for idx, score in reranked[:self.top_k_rerank]
-        ]
-        context = "\n\n".join(top_chunks)
-
-        # Step 4: Extractive answer (no LLM — pure speed)
+        context = self._build_context(candidate_indices)
+        answer = self._call_llm(question, context)
+        if answer is not None:
+            return answer
         return self._extract_answer(question, context)

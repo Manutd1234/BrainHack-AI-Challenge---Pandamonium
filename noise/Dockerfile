@@ -1,25 +1,21 @@
-# Dockerfile for building the noise image.
+# Dockerfile for building the adversarial noise image.
 
-
-# The base image, an example deep learning VM.
 FROM nvcr.io/nvidia/pytorch:25.11-py3
 
-# Configures settings for the image.
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 ENV PIP_ROOT_USER_ACTION=ignore
+ENV YOLO_SURROGATE_FALLBACK=yolo26l.pt
 WORKDIR /workspace
 
-# Installs your dependencies.
 RUN pip install -U pip
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Pre-download MobileNetV2 weights for surrogate-model FGSM attacks.
-RUN python -c "import torchvision.models as m; m.mobilenet_v2(weights=m.MobileNet_V2_Weights.DEFAULT)"
+COPY download_models.py .
+RUN python download_models.py --model "${YOLO_SURROGATE_FALLBACK}"
 
-# Copies your source files.
+COPY models/ ./models/
 COPY src .
 
-# Starts your model server.
 CMD uvicorn noise_server:app --port 5003 --host 0.0.0.0

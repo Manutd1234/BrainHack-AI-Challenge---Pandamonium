@@ -25,14 +25,22 @@ class ASRManager:
     def __init__(self):
         logger.info("Loading Whisper model...")
 
-        # Determine model: prefer large-v3 if pre-downloaded, else fall back
-        model_name = "large-v3"
+        # Prefer a fine-tuned CTranslate2 model if bundled, else large-v3.
+        model_name = os.getenv("WHISPER_MODEL", "models/whisper-large-v3-finetuned")
+        if not os.path.exists(model_name):
+            model_name = os.getenv("WHISPER_FALLBACK_MODEL", "large-v3")
+        device_index = int(os.getenv("WHISPER_DEVICE_INDEX", "0"))
+        cpu_threads = int(os.getenv("WHISPER_CPU_THREADS", "4"))
+        num_workers = int(os.getenv("WHISPER_NUM_WORKERS", "1"))
 
         try:
             self.model = WhisperModel(
                 model_name,
                 device="cuda",
+                device_index=device_index,
                 compute_type="float16",
+                cpu_threads=cpu_threads,
+                num_workers=num_workers,
             )
             self.device = "cuda"
             logger.info(f"Whisper {model_name} loaded on GPU (float16).")
@@ -43,6 +51,8 @@ class ASRManager:
                     model_name,
                     device="cpu",
                     compute_type="int8",
+                    cpu_threads=cpu_threads,
+                    num_workers=num_workers,
                 )
             except Exception:
                 # If large-v3 isn't available, fall back to small
@@ -51,6 +61,8 @@ class ASRManager:
                     "small",
                     device="cpu",
                     compute_type="int8",
+                    cpu_threads=cpu_threads,
+                    num_workers=num_workers,
                 )
             self.device = "cpu"
             logger.info("Whisper model loaded on CPU (int8).")

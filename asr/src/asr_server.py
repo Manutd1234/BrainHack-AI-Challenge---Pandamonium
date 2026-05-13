@@ -4,6 +4,7 @@
 # to change anything in this file.
 
 
+import asyncio
 import base64
 
 from asr_manager import ASRManager
@@ -35,7 +36,7 @@ async def asr(request: Request) -> dict[str, list[str]]:
         audio_bytes = base64.b64decode(instance["b64"])
 
         # Performs ASR and appends the result.
-        transcription = manager.asr(audio_bytes)
+        transcription = await asyncio.to_thread(manager.asr, audio_bytes)
         predictions.append(transcription)
 
     return {"predictions": predictions}

@@ -3,7 +3,8 @@
 
 
 # Large files like model weights, training data, and results should be ignored.
-**/models/
+**/models/*
+!**/models/.gitkeep
 **/results/
 
 # Byte-compiled / optimized / DLL files

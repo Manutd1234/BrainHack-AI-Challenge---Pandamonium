@@ -1,8 +1,6 @@
 """Runs the AE server."""
 
-# Unless you want to do something special with the server, you shouldn't need
-# to change anything in this file.
-
+from __future__ import annotations
 
 from ae_manager import AEManager
 from fastapi import FastAPI, Request
@@ -11,43 +9,42 @@ app = FastAPI()
 manager = AEManager()
 
 
+def _reset_manager() -> None:
+    global manager
+    manager = AEManager()
+
+
 @app.post("/ae")
 async def ae(request: Request) -> dict[str, list[dict[str, int]]]:
-    """Feeds an observation into the AE model.
+    """Feeds an observation into the model and returns the selected action."""
+    try:
+        input_json = await request.json()
+    except Exception:
+        _reset_manager()
+        return {"predictions": []}
 
-    Returns action taken given current observation (int)
-    """
-
-    # get observation, feed into model
-    input_json = await request.json()
+    instances = input_json.get("instances", [])
+    if not instances:
+        _reset_manager()
+        return {"predictions": []}
 
     predictions = []
-    # each is a dict with one key "observation" and the value as a dictionary observation
-    for instance in input_json["instances"]:
+    for instance in instances:
         observation = instance["observation"]
-        # reset environment on a new round
-        if observation["step"] == 0:
-            await reset({})
+        if observation.get("step", 0) == 0:
+            _reset_manager()
         predictions.append({"action": manager.ae(observation)})
     return {"predictions": predictions}
 
 
+@app.get("/reset")
 @app.post("/reset")
-async def reset(_: Request) -> None:
-    """Resets the `AEManager` for a new round."""
-
-    # The Docker container is not restarted between rounds (during Qualifiers).
-    # Your model is reset via this endpoint by creating a new instance. You
-    # should avoid storing persistent state information outside your
-    # `AEManager` instance; but if you must, you should also reset it here.
-
-    global manager  # pylint: disable=global-statement
-    manager = AEManager()
-
-    return
+async def reset() -> dict[str, str]:
+    """Resets the AE manager for a new round."""
+    _reset_manager()
+    return {"message": "reset ok"}
 
 
 @app.get("/health")
 def health() -> dict[str, str]:
-    """Health check function for your model."""
     return {"message": "health ok"}
