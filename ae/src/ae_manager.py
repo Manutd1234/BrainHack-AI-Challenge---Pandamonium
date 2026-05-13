@@ -144,4 +144,7 @@ class AEManager:
     def _random_valid(self, action_mask):
         """Pick a random valid action."""
         valid = [i for i, m in enumerate(action_mask) if m == 1]
-        return random.choice(valid) if valid else 0
+        if valid:
+            return random.choice(valid)
+        # If no valid actions (e.g. completely frozen), return 5 (stay)
+        return 5

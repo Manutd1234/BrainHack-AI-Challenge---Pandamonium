@@ -81,14 +81,7 @@ class ASRManager:
                 beam_size=5,
                 language=None,  # auto-detect for multilingual support
                 initial_prompt=INITIAL_PROMPT,
-                vad_filter=True,
-                vad_parameters=dict(
-                    min_silence_duration_ms=300,
-                    speech_pad_ms=200,
-                ),
                 condition_on_previous_text=False,  # prevent hallucination cascading
-                no_speech_threshold=0.5,
-                log_prob_threshold=-0.8,
             )
 
             transcription = " ".join(

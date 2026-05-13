@@ -225,12 +225,18 @@ class NLPManager:
         s_embs = model.encode(sentences, normalize_embeddings=True)
         sims = np.dot(s_embs, q_emb.T).flatten()
 
+        # Check for unanswerable questions
+        # The Advanced track evaluates strictly — if unanswerable, it expects ""
+        max_sim = float(np.max(sims))
+        if max_sim < 0.3:  # Threshold for "unanswerable"
+            return ""
+
         # Take top 2 most relevant sentences
         top_indices = np.argsort(sims)[-2:][::-1]
         best_sentences = [sentences[i] for i in top_indices if sims[i] > 0.15]
 
         if not best_sentences:
-            return sentences[int(np.argmax(sims))]
+            return ""
 
         # If top sentence is very short, concatenate top 2
         answer = best_sentences[0]

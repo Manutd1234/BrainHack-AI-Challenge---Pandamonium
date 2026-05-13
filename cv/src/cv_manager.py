@@ -46,6 +46,16 @@ TIL26_CLASSES = {
 # 1280 is 4x slower with diminishing accuracy returns.
 INFER_IMGSZ = 640
 
+# Map COCO classes to the closest TIL-26 classes.
+# Required because the base YOLO model predicts COCO (80 classes),
+# but the evaluator strictly expects TIL-26 (18 classes).
+COCO_TO_TIL26_MAP = {
+    2: 9,   # COCO car -> TIL26 car
+    4: 1,   # COCO airplane -> TIL26 commercial aircraft
+    5: 11,  # COCO bus -> TIL26 bus
+    7: 8,   # COCO truck -> TIL26 truck
+    8: 13,  # COCO boat -> TIL26 cargo ship
+}
 
 def _try_tensorrt_export(model_path: str, imgsz: int = INFER_IMGSZ) -> str | None:
     """Attempt to export a YOLO model to TensorRT format.
@@ -166,10 +176,20 @@ class CVManager:
             cls = boxes.cls.cpu().numpy().astype(int)
 
             for i in range(len(xyxy)):
+                original_cls = int(cls[i])
+                
+                # If model is not finetuned, map COCO -> TIL-26
+                if not self.is_finetuned:
+                    if original_cls not in COCO_TO_TIL26_MAP:
+                        continue  # Skip detections that don't map to a target
+                    mapped_cls = COCO_TO_TIL26_MAP[original_cls]
+                else:
+                    mapped_cls = original_cls
+                
                 x1, y1, x2, y2 = xyxy[i]
                 detections.append({
                     "bbox": [float(x1), float(y1), float(x2 - x1), float(y2 - y1)],
-                    "category_id": int(cls[i]),
+                    "category_id": mapped_cls,
                 })
 
         return detections
