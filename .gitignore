@@ -222,3 +222,5 @@ cv/data/
 cv/runs/
 cv/yolo*.pt
 cv/model/*.pt
+nlp/src/qwen-quantized/*
+!nlp/src/qwen-quantized/.gitkeep
