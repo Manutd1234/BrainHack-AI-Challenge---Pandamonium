@@ -1,10 +1,11 @@
 # Runtime dependencies for the AE container.
-fastapi==0.115.12
-uvicorn[standard]==0.34.2
-pydantic>=2.11,<3
-numpy>=1.24,<3
+fastapi>=0.111.0
+uvicorn[standard]>=0.30.0
+pydantic>=2.7.0
+numpy>=1.26.0
+torch>=2.3.0
 
 # Optional PPO checkpoint loading. The rule fallback works if these fail to load,
 # but keeping them in the image lets model/policy.zip run without code changes.
-stable-baselines3[extra]>=2.5.0,<3
+stable-baselines3[extra]>=2.3.0,<3
 sb3-contrib>=2.5.0,<3
