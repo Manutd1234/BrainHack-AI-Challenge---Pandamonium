@@ -229,3 +229,4 @@ ae/runs/
 ae/model/*.zip
 ae/model/checkpoints/
 ae/model/best/
+noise/model/*.pt
