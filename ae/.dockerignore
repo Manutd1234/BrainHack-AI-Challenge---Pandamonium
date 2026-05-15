@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+logs/
+runs/
+model/checkpoints/
+model/best/

@@ -224,3 +224,8 @@ cv/yolo*.pt
 cv/model/*.pt
 nlp/src/qwen-quantized/*
 !nlp/src/qwen-quantized/.gitkeep
+ae/logs/
+ae/runs/
+ae/model/*.zip
+ae/model/checkpoints/
+ae/model/best/
