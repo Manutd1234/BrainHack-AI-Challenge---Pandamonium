@@ -1,0 +1,5 @@
+data/
+runs/
+yolo*.pt
+__pycache__/
+*.pyc

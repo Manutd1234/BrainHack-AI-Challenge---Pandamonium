@@ -216,3 +216,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# TIL training artifacts
+cv/data/
+cv/runs/
+cv/yolo*.pt
+cv/model/*.pt
