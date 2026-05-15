@@ -1,0 +1,17 @@
+# Runtime dependencies for the ASR container.
+fastapi==0.115.12
+uvicorn[standard]==0.34.2
+
+# MERaLiON-2 requires transformers 4.50.1.
+transformers==4.50.1
+huggingface_hub>=0.30.2,<1.0
+accelerate>=1.6.0,<2.0
+safetensors>=0.5.3
+sentencepiece==0.2.0
+protobuf>=4.25.3,<6
+
+# Audio decoding, resampling, and DeepFilterNet3 enhancement.
+numpy>=1.24,<2
+librosa==0.10.2.post1
+soundfile==0.12.1
+deepfilternet==0.5.6
