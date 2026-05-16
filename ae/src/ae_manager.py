@@ -86,6 +86,9 @@ class AEManager:
         self.collectibles: dict[tuple[int, int], float] = {}
         self.enemy_bases: set[tuple[int, int]] = set()
         self.enemy_agents: set[tuple[int, int]] = set()
+        self.base_threats: set[tuple[int, int]] = set()
+        self.base_location: tuple[int, int] | None = None
+        self.base_health = 100.0
         self.ally_bombs: dict[tuple[int, int], float] = {}
         self.enemy_bombs: dict[tuple[int, int], float] = {}
         self.last_location: tuple[int, int] | None = None
@@ -199,6 +202,9 @@ class AEManager:
         self.known_open.add(location)
         self.collectibles.pop(location, None)
         self.enemy_agents.clear()
+        self.base_threats.clear()
+        self.base_location = self._optional_location(observation.get("base_location"))
+        self.base_health = self._scalar(observation.get("base_health"), 100.0)
         self.ally_bombs = {
             cell: timer - 1 for cell, timer in self.ally_bombs.items() if timer > 1
         }
@@ -214,6 +220,14 @@ class AEManager:
             self._parse_channel_viewcone(view_array, direction, location)
         elif view_array.ndim >= 2:
             self._parse_legacy_viewcone(view_array, direction, location)
+
+        base_view = np.asarray(observation.get("base_viewcone", []), dtype=np.float32)
+        if (
+            self.base_location is not None
+            and base_view.ndim == 3
+            and base_view.shape[-1] >= 21
+        ):
+            self._parse_base_viewcone(base_view, self.base_location)
 
     def _parse_channel_viewcone(
         self,
@@ -282,6 +296,52 @@ class AEManager:
                 else:
                     self.enemy_bombs.pop(world, None)
 
+    def _parse_base_viewcone(
+        self,
+        view: np.ndarray,
+        base_location: tuple[int, int],
+    ) -> None:
+        rows, cols = view.shape[:2]
+        center_row = rows // 2
+        center_col = cols // 2
+
+        for row in range(rows):
+            for col in range(cols):
+                cell = view[row, col]
+                if cell[VISIBLE] <= 0 and cell[ENEMY_AGENT] <= 0:
+                    continue
+
+                world = (
+                    base_location[0] + row - center_row,
+                    base_location[1] + col - center_col,
+                )
+                if not self._in_bounds(world):
+                    continue
+
+                self.known_open.add(world)
+
+                for wall_dir, channel in WALL_CHANNELS.items():
+                    edge = self._edge(world, wall_dir)
+                    if edge is None:
+                        continue
+                    if cell[channel] > 0:
+                        self.known_walls.add(edge)
+                    elif edge in self.known_walls and cell[VISIBLE] > 0:
+                        self.known_walls.discard(edge)
+
+                for wall_dir, channel in DESTRUCTIBLE_CHANNELS.items():
+                    edge = self._edge(world, wall_dir)
+                    if edge is not None and cell[channel] > 0:
+                        self.destructible_walls.add(edge)
+
+                if cell[ENEMY_AGENT] > 0:
+                    self.enemy_agents.add(world)
+                    self.base_threats.add(world)
+
+                if cell.shape[0] > ENEMY_BOMB and cell[ENEMY_BOMB] > 0:
+                    timer = float(cell[ENEMY_BOMB_TIMER]) if cell.shape[0] > ENEMY_BOMB_TIMER else 1.0
+                    self.enemy_bombs[world] = timer
+
     def _parse_legacy_viewcone(
         self,
         view: np.ndarray,
@@ -311,6 +371,16 @@ class AEManager:
             if self._in_bounds(base):
                 for target in self._bombing_positions(base):
                     scored_targets.append((140.0, target))
+
+        for threat in self.base_threats:
+            if not self._in_bounds(threat):
+                continue
+            urgency = 90.0
+            if self.base_location is not None:
+                urgency += max(0.0, 5.0 - self._manhattan(threat, self.base_location)) * 14.0
+            urgency += max(0.0, 100.0 - self.base_health) * 0.6
+            for target in self._bombing_positions(threat):
+                scored_targets.append((urgency, target))
 
         for cell, value in self.collectibles.items():
             if self._in_bounds(cell):
@@ -593,6 +663,23 @@ class AEManager:
     def _location(self, observation: dict[str, Any]) -> tuple[int, int]:
         location = observation.get("location", [0, 0])
         return int(location[0]), int(location[1])
+
+    def _optional_location(self, value: Any) -> tuple[int, int] | None:
+        if value is None:
+            return None
+        arr = np.asarray(value).reshape(-1)
+        if arr.size < 2:
+            return None
+        location = (int(arr[0]), int(arr[1]))
+        return location if self._in_bounds(location) else None
+
+    def _scalar(self, value: Any, default: float) -> float:
+        if value is None:
+            return default
+        arr = np.asarray(value).reshape(-1)
+        if arr.size == 0:
+            return default
+        return float(arr[0])
 
     def _is_frozen(self, observation: dict[str, Any]) -> bool:
         return int(observation.get("frozen_ticks", 0)) > 0
