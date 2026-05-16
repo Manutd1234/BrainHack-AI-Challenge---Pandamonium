@@ -19,7 +19,9 @@ from pathlib import Path
 from typing import Any
 
 import torch
-from datasets import Audio, Dataset
+import librosa
+import soundfile as sf
+from datasets import Dataset
 from transformers import (
     Seq2SeqTrainer,
     Seq2SeqTrainingArguments,
@@ -99,7 +101,7 @@ def load_dataset() -> Dataset:
                 }
             )
 
-    return Dataset.from_list(rows).cast_column("audio", Audio(sampling_rate=16_000))
+    return Dataset.from_list(rows)
 
 
 def main() -> None:
@@ -114,10 +116,18 @@ def main() -> None:
     model.gradient_checkpointing_enable()
 
     def prepare(batch: dict[str, Any]) -> dict[str, Any]:
-        audio = batch["audio"]
+        audio_array, sample_rate = sf.read(batch["audio"], dtype="float32", always_2d=False)
+        if getattr(audio_array, "ndim", 1) == 2:
+            audio_array = audio_array.mean(axis=1)
+        if sample_rate != 16_000:
+            audio_array = librosa.resample(
+                audio_array,
+                orig_sr=sample_rate,
+                target_sr=16_000,
+            )
         batch["input_features"] = processor.feature_extractor(
-            audio["array"],
-            sampling_rate=audio["sampling_rate"],
+            audio_array,
+            sampling_rate=16_000,
         ).input_features[0]
         batch["labels"] = processor.tokenizer(batch["sentence"]).input_ids
         return batch
