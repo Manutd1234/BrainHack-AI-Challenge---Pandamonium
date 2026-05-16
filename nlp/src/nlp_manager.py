@@ -6,6 +6,7 @@ import os
 import re
 import threading
 from dataclasses import dataclass
+from collections import Counter
 from typing import Any
 
 import numpy as np
@@ -16,6 +17,45 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
 TOKEN_PATTERN = re.compile(r"[A-Za-z0-9]+")
+SENTENCE_PATTERN = re.compile(r"(?<=[.!?])\s+|\n+")
+STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "are",
+    "as",
+    "at",
+    "be",
+    "by",
+    "did",
+    "do",
+    "does",
+    "for",
+    "from",
+    "given",
+    "how",
+    "if",
+    "in",
+    "is",
+    "it",
+    "of",
+    "on",
+    "or",
+    "that",
+    "the",
+    "their",
+    "this",
+    "to",
+    "under",
+    "was",
+    "were",
+    "what",
+    "when",
+    "where",
+    "which",
+    "who",
+    "with",
+}
 
 
 @dataclass(frozen=True)
@@ -49,34 +89,47 @@ class NLPManager:
         self.top_k_rerank = int(os.getenv("NLP_TOP_K_RERANK", "4"))
         self.max_context_chars = int(os.getenv("NLP_MAX_CONTEXT_CHARS", "7000"))
         self.max_new_tokens = int(os.getenv("NLP_MAX_NEW_TOKENS", "256"))
+        self.use_dense = _env_flag("NLP_USE_DENSE", False)
+        self.use_llm = _env_flag("NLP_USE_LLM", False)
         self.enable_thinking = _env_flag("QWEN_ENABLE_THINKING", False)
         self.do_sample = _env_flag("QWEN_DO_SAMPLE", False)
         self.lock = threading.Lock()
 
+        self.embedding_model = None
+        self.reranker = None
+        self.tokenizer = None
+        self.llm = None
+
         use_fp16 = torch.cuda.is_available()
-        print(f"Loading embedding model: {self.embedding_model_id}", flush=True)
-        self.embedding_model = BGEM3FlagModel(self.embedding_model_id, use_fp16=use_fp16)
+        if self.use_dense:
+            print(f"Loading embedding model: {self.embedding_model_id}", flush=True)
+            self.embedding_model = BGEM3FlagModel(
+                self.embedding_model_id,
+                use_fp16=use_fp16,
+            )
 
-        print(f"Loading reranker: {self.reranker_model_id}", flush=True)
-        self.reranker = FlagReranker(self.reranker_model_id, use_fp16=use_fp16)
+            print(f"Loading reranker: {self.reranker_model_id}", flush=True)
+            self.reranker = FlagReranker(self.reranker_model_id, use_fp16=use_fp16)
 
-        print(f"Loading quantized Qwen3 model from {self.model_path}", flush=True)
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            self.model_path,
-            trust_remote_code=True,
-        )
-        self.llm = AutoModelForCausalLM.from_pretrained(
-            self.model_path,
-            torch_dtype="auto",
-            device_map="auto",
-            trust_remote_code=True,
-        )
-        self.llm.eval()
+        if self.use_llm:
+            print(f"Loading quantized Qwen3 model from {self.model_path}", flush=True)
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                self.model_path,
+                trust_remote_code=True,
+            )
+            self.llm = AutoModelForCausalLM.from_pretrained(
+                self.model_path,
+                torch_dtype="auto",
+                device_map="auto",
+                trust_remote_code=True,
+            )
+            self.llm.eval()
 
         self.documents: dict[str, str] = {}
         self.chunks: list[Chunk] = []
         self.bm25: BM25Okapi | None = None
         self.dense_embeddings: np.ndarray | None = None
+        self.loaded = False
 
     def load_corpus(self, documents: list[dict[str, str]]) -> None:
         """Load challenge documents and build sparse and dense retrieval indexes."""
@@ -86,11 +139,15 @@ class NLPManager:
         tokenized_chunks = [self._tokenize(chunk.text) for chunk in self.chunks]
         self.bm25 = BM25Okapi(tokenized_chunks)
 
-        dense_embeddings = self.embedding_model.encode(
-            [chunk.text for chunk in self.chunks],
-            batch_size=int(os.getenv("NLP_EMBED_BATCH_SIZE", "12")),
-        )["dense_vecs"]
-        self.dense_embeddings = self._normalise_matrix(np.asarray(dense_embeddings))
+        if self.embedding_model is not None:
+            dense_embeddings = self.embedding_model.encode(
+                [chunk.text for chunk in self.chunks],
+                batch_size=int(os.getenv("NLP_EMBED_BATCH_SIZE", "12")),
+            )["dense_vecs"]
+            self.dense_embeddings = self._normalise_matrix(np.asarray(dense_embeddings))
+        else:
+            self.dense_embeddings = None
+
         self.loaded = True
         print(
             f"Loaded {len(self.documents)} documents into {len(self.chunks)} chunks.",
@@ -99,7 +156,7 @@ class NLPManager:
 
     def qa(self, question: str) -> dict[str, list[str] | str]:
         """Answer one question and return relevant document IDs."""
-        if not self.loaded or self.bm25 is None or self.dense_embeddings is None:
+        if not self.loaded or self.bm25 is None:
             return {"documents": [], "answer": ""}
 
         candidate_chunk_ids = self._retrieve(question)
@@ -146,10 +203,12 @@ class NLPManager:
         tokenized_query = self._tokenize(question)
         bm25_scores = np.asarray(self.bm25.get_scores(tokenized_query), dtype=np.float32)
 
+        if self.embedding_model is None or self.dense_embeddings is None:
+            return np.argsort(-bm25_scores).tolist()[: self.top_k_retrieve]
+
         query_embedding = self.embedding_model.encode([question])["dense_vecs"]
         query_embedding = self._normalise_matrix(np.asarray(query_embedding))[0]
         dense_scores = self.dense_embeddings @ query_embedding
-
         return self._rrf(bm25_scores, dense_scores)[: self.top_k_retrieve]
 
     def _rrf(
@@ -168,6 +227,8 @@ class NLPManager:
     def _rerank(self, question: str, candidate_chunk_ids: list[int]) -> list[int]:
         if not candidate_chunk_ids:
             return []
+        if self.reranker is None:
+            return candidate_chunk_ids[: self.top_k_rerank]
 
         pairs = [[question, self.chunks[index].text] for index in candidate_chunk_ids]
         scores = self.reranker.compute_score(pairs)
@@ -182,6 +243,9 @@ class NLPManager:
         return [chunk_id for chunk_id, _ in scored[: self.top_k_rerank]]
 
     def _generate(self, question: str, context_chunks: list[Chunk]) -> str:
+        if self.llm is None or self.tokenizer is None:
+            return self._extract_answer(question, context_chunks)
+
         context = self._format_context(context_chunks)
         prompt = (
             "Answer the question using only the context below. "
@@ -215,6 +279,57 @@ class NLPManager:
         generated_ids = outputs[0][inputs["input_ids"].shape[-1] :]
         answer = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
         return self._strip_thinking(answer)
+
+    def _extract_answer(self, question: str, context_chunks: list[Chunk]) -> str:
+        query_terms = [
+            token
+            for token in self._tokenize(question)
+            if len(token) > 2 and token not in STOPWORDS
+        ]
+        query_counts = Counter(query_terms)
+        best_sentence = ""
+        best_score = float("-inf")
+
+        for rank, chunk in enumerate(context_chunks):
+            for sentence in self._split_sentences(chunk.text):
+                sentence_tokens = self._tokenize(sentence)
+                if not sentence_tokens:
+                    continue
+                sentence_counts = Counter(sentence_tokens)
+                overlap = sum(
+                    min(count, sentence_counts.get(token, 0))
+                    for token, count in query_counts.items()
+                )
+                rare_overlap = sum(
+                    1
+                    for token in query_counts
+                    if len(token) >= 5 and sentence_counts.get(token, 0)
+                )
+                number_overlap = sum(
+                    1
+                    for token in query_counts
+                    if token.isdigit() and sentence_counts.get(token, 0)
+                )
+                score = overlap + 0.75 * rare_overlap + 1.5 * number_overlap
+                score -= 0.08 * rank
+                score -= 0.002 * len(sentence)
+                if score > best_score:
+                    best_score = score
+                    best_sentence = sentence
+
+        if best_sentence:
+            return best_sentence[:420].strip()
+        if context_chunks:
+            return context_chunks[0].text[:420].strip()
+        return ""
+
+    def _split_sentences(self, text: str) -> list[str]:
+        sentences = []
+        for part in SENTENCE_PATTERN.split(text):
+            sentence = " ".join(part.split()).strip()
+            if sentence:
+                sentences.append(sentence)
+        return sentences
 
     def _apply_chat_template(self, messages: list[dict[str, str]]) -> str:
         try:
