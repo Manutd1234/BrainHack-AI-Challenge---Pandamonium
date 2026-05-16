@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import logging
 import os
+import json
 from typing import Any
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -14,10 +16,26 @@ from ultralytics import YOLO
 
 LOGGER = logging.getLogger(__name__)
 MODEL_PATH = os.getenv("CV_MODEL_PATH", "/app/model/best.pt")
-DEFAULT_CONF = float(os.getenv("CV_DEFAULT_CONF", "0.20"))
-DEFAULT_IOU = float(os.getenv("CV_IOU", "0.45"))
-DEFAULT_IMGSZ = int(os.getenv("CV_IMGSZ", "1280"))
-MAX_DETECTIONS = int(os.getenv("CV_MAX_DETECTIONS", "20"))
+THRESHOLD_CONFIG_PATH = Path(
+    os.getenv("CV_THRESHOLD_CONFIG", Path(__file__).with_name("cv_thresholds.json"))
+)
+
+
+def _load_threshold_config() -> dict[str, Any]:
+    if not THRESHOLD_CONFIG_PATH.exists():
+        return {}
+    try:
+        return json.loads(THRESHOLD_CONFIG_PATH.read_text(encoding="utf-8"))
+    except Exception as exc:
+        LOGGER.warning("Could not load CV threshold config %s: %s", THRESHOLD_CONFIG_PATH, exc)
+        return {}
+
+
+THRESHOLD_CONFIG = _load_threshold_config()
+DEFAULT_CONF = float(os.getenv("CV_DEFAULT_CONF", THRESHOLD_CONFIG.get("default_conf", 0.20)))
+DEFAULT_IOU = float(os.getenv("CV_IOU", THRESHOLD_CONFIG.get("iou", 0.45)))
+DEFAULT_IMGSZ = int(os.getenv("CV_IMGSZ", THRESHOLD_CONFIG.get("imgsz", 1280)))
+MAX_DETECTIONS = int(os.getenv("CV_MAX_DETECTIONS", THRESHOLD_CONFIG.get("max_detections", 20)))
 USE_SAHI = os.getenv("CV_USE_SAHI", "0").strip().lower() in {"1", "true", "yes"}
 SAHI_MIN_SIZE = int(os.getenv("CV_SAHI_MIN_SIZE", "640"))
 SAHI_SLICE_SIZE = int(os.getenv("CV_SAHI_SLICE_SIZE", "640"))
@@ -44,7 +62,7 @@ CLASS_NAMES = [
     "sailboat",
 ]
 
-CLASS_CONF = {
+DEFAULT_CLASS_CONF = {
     0: 0.35,
     1: 0.35,
     2: 0.28,
@@ -63,6 +81,10 @@ CLASS_CONF = {
     15: 0.35,
     16: 0.35,
     17: 0.32,
+}
+CLASS_CONF = {
+    int(category_id): float(confidence)
+    for category_id, confidence in THRESHOLD_CONFIG.get("class_conf", DEFAULT_CLASS_CONF).items()
 }
 
 

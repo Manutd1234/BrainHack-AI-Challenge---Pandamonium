@@ -25,11 +25,9 @@ RUN python -c "from ultralytics import YOLO; YOLO('${YOLO_BASE_WEIGHTS}')"
 COPY model/best.pt /app/model/best.pt
 
 ENV CV_MODEL_PATH=/app/model/best.pt \
+    CV_THRESHOLD_CONFIG=/app/src/cv_thresholds.json \
     CV_USE_SAHI=0 \
     CV_IMGSZ=1280 \
-    CV_DEFAULT_CONF=0.30 \
-    CV_IOU=0.50 \
-    CV_MAX_DETECTIONS=20 \
     NVIDIA_VISIBLE_DEVICES=all \
     NVIDIA_DRIVER_CAPABILITIES=compute,utility
 
