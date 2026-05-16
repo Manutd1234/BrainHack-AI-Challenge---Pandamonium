@@ -36,6 +36,7 @@ DEFAULT_CONF = float(os.getenv("CV_DEFAULT_CONF", THRESHOLD_CONFIG.get("default_
 DEFAULT_IOU = float(os.getenv("CV_IOU", THRESHOLD_CONFIG.get("iou", 0.45)))
 DEFAULT_IMGSZ = int(os.getenv("CV_IMGSZ", THRESHOLD_CONFIG.get("imgsz", 1280)))
 MAX_DETECTIONS = int(os.getenv("CV_MAX_DETECTIONS", THRESHOLD_CONFIG.get("max_detections", 20)))
+PRED_BATCH_SIZE = int(os.getenv("CV_PRED_BATCH_SIZE", "4"))
 USE_SAHI = os.getenv("CV_USE_SAHI", "0").strip().lower() in {"1", "true", "yes"}
 SAHI_MIN_SIZE = int(os.getenv("CV_SAHI_MIN_SIZE", "640"))
 SAHI_SLICE_SIZE = int(os.getenv("CV_SAHI_SLICE_SIZE", "640"))
@@ -163,20 +164,25 @@ class CVManager:
         return self._predict_full_batch([image])[0]
 
     def _predict_full_batch(self, images: list[np.ndarray]) -> list[list[dict[str, Any]]]:
-        results = self.model.predict(
-            images,
-            conf=DEFAULT_CONF,
-            iou=DEFAULT_IOU,
-            imgsz=DEFAULT_IMGSZ,
-            half=self.device == "cuda",
-            max_det=MAX_DETECTIONS,
-            verbose=False,
-            device=self.device,
-        )
-        return [
-            self._format_yolo_result(result, image.shape)
-            for result, image in zip(results, images)
-        ]
+        predictions = []
+        batch_size = max(1, PRED_BATCH_SIZE)
+        for start in range(0, len(images), batch_size):
+            batch = images[start : start + batch_size]
+            results = self.model.predict(
+                batch,
+                conf=DEFAULT_CONF,
+                iou=DEFAULT_IOU,
+                imgsz=DEFAULT_IMGSZ,
+                half=self.device == "cuda",
+                max_det=MAX_DETECTIONS,
+                verbose=False,
+                device=self.device,
+            )
+            predictions.extend(
+                self._format_yolo_result(result, image.shape)
+                for result, image in zip(results, batch)
+            )
+        return predictions
 
     def _predict_sahi(self, image: np.ndarray) -> list[dict[str, Any]]:
         from sahi.predict import get_sliced_prediction

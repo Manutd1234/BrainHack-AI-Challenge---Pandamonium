@@ -47,6 +47,12 @@ class ASRManager:
         self.hybrid_max_repeat_ratio = float(
             os.getenv("ASR_HYBRID_MAX_REPEAT_RATIO", "0.55")
         )
+        self.hybrid_min_chars_per_second = float(
+            os.getenv("ASR_HYBRID_MIN_CHARS_PER_SECOND", "4.0")
+        )
+        self.hybrid_min_words_per_second = float(
+            os.getenv("ASR_HYBRID_MIN_WORDS_PER_SECOND", "0.45")
+        )
         self.use_deepfilter = _env_flag("ASR_USE_DEEPFILTERNET", False)
         self.use_whisper_fallback = _env_flag("ASR_USE_WHISPER_FALLBACK", True)
         self.whisper_path = os.getenv(
@@ -96,7 +102,8 @@ class ASRManager:
             return self._whisper_transcribe(audio_arrays)
 
         if self.engine == "hybrid":
-            return self._hybrid_transcribe(audio_arrays)
+            durations = [len(audio) / TARGET_SAMPLE_RATE for audio in audio_arrays]
+            return self._hybrid_transcribe(audio_arrays, durations)
 
         return self._meralion_transcribe(audio_arrays)
 
@@ -139,13 +146,17 @@ class ASRManager:
             ]
         return cleaned
 
-    def _hybrid_transcribe(self, audio_arrays: list[np.ndarray]) -> list[str]:
+    def _hybrid_transcribe(
+        self,
+        audio_arrays: list[np.ndarray],
+        durations: list[float],
+    ) -> list[str]:
         """Use fast Whisper first, then MERaLiON only for suspicious outputs."""
         whisper_predictions = self._whisper_transcribe(audio_arrays)
         fallback_indexes = [
             index
             for index, prediction in enumerate(whisper_predictions)
-            if self._needs_meralion_fallback(prediction)
+            if self._needs_meralion_fallback(prediction, durations[index])
         ]
 
         if not fallback_indexes:
@@ -326,13 +337,18 @@ class ASRManager:
                 return prediction[len(prefix) :].strip()
         return prediction
 
-    def _needs_meralion_fallback(self, prediction: str) -> bool:
+    def _needs_meralion_fallback(self, prediction: str, duration: float) -> bool:
         if len(prediction) < self.hybrid_min_chars:
             return True
 
         words = prediction.split()
         if len(words) < self.hybrid_min_words:
             return True
+        if duration >= 8.0:
+            if len(prediction) / duration < self.hybrid_min_chars_per_second:
+                return True
+            if len(words) / duration < self.hybrid_min_words_per_second:
+                return True
         if len(words) >= 8:
             counts = {}
             for word in words:
