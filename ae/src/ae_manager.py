@@ -14,13 +14,15 @@ LOGGER = logging.getLogger(__name__)
 
 GRID_SIZE = int(os.getenv("AE_GRID_SIZE", "16"))
 CHECKPOINT_PATH = os.getenv("AE_CHECKPOINT_PATH", "/app/model/policy.zip")
-BASE_ATTACK_SCORE = float(os.getenv("AE_BASE_ATTACK_SCORE", "115.0"))
-AGENT_ATTACK_SCORE = float(os.getenv("AE_AGENT_ATTACK_SCORE", "28.0"))
-COLLECTIBLE_SCORE_MULT = float(os.getenv("AE_COLLECTIBLE_SCORE_MULT", "24.0"))
-PATH_LENGTH_PENALTY = float(os.getenv("AE_PATH_LENGTH_PENALTY", "1.35"))
-VISIT_PENALTY = float(os.getenv("AE_VISIT_PENALTY", "0.55"))
-WALL_BREAK_SCORE = float(os.getenv("AE_WALL_BREAK_SCORE", "42.0"))
-BOMB_COOLDOWN_STEPS = int(os.getenv("AE_BOMB_COOLDOWN_STEPS", "7"))
+BASE_ATTACK_SCORE = float(os.getenv("AE_BASE_ATTACK_SCORE", "105.0"))
+AGENT_ATTACK_SCORE = float(os.getenv("AE_AGENT_ATTACK_SCORE", "22.0"))
+COLLECTIBLE_SCORE_MULT = float(os.getenv("AE_COLLECTIBLE_SCORE_MULT", "30.0"))
+PATH_LENGTH_PENALTY = float(os.getenv("AE_PATH_LENGTH_PENALTY", "1.50"))
+VISIT_PENALTY = float(os.getenv("AE_VISIT_PENALTY", "0.45"))
+WALL_BREAK_SCORE = float(os.getenv("AE_WALL_BREAK_SCORE", "20.0"))
+BOMB_COOLDOWN_STEPS = int(os.getenv("AE_BOMB_COOLDOWN_STEPS", "12"))
+CENTER_FARM_SCORE = float(os.getenv("AE_CENTER_FARM_SCORE", "80.0"))
+CENTER_BONUS = float(os.getenv("AE_CENTER_BONUS", "20.0"))
 
 FORWARD = 0
 BACKWARD = 1
@@ -120,7 +122,15 @@ class AEManager:
             if self._is_legal(action, action_mask):
                 return self._finish_action(action, observation)
 
-        action = self._rule_act(observation, action_mask)
+        try:
+            action = self._rule_act(observation, action_mask)
+        except Exception as exc:
+            LOGGER.exception("Rule-agent inference failed: %s", exc)
+            action = self._fallback_action(
+                self._location(observation),
+                int(observation.get("direction", 0)) % 4,
+                action_mask,
+            )
         return self._finish_action(action, observation)
 
     def act(self, observation: dict[str, Any]) -> int:
@@ -318,21 +328,31 @@ class AEManager:
         scored_targets: list[tuple[float, tuple[int, int]]] = []
 
         for base in self.enemy_bases:
-            if self._in_bounds(base):
+            if self._in_bounds(base) and self._manhattan(location, base) <= 7:
                 for target in self._bombing_positions(base):
                     scored_targets.append((BASE_ATTACK_SCORE, target))
 
         for cell, value in self.collectibles.items():
             if self._in_bounds(cell):
-                scored_targets.append((value * COLLECTIBLE_SCORE_MULT, cell))
+                scored_targets.append(
+                    (value * COLLECTIBLE_SCORE_MULT + self._center_bonus(cell), cell)
+                )
 
         for agent in self.enemy_agents:
-            if self._in_bounds(agent):
+            if self._in_bounds(agent) and self._manhattan(location, agent) <= 5:
                 for target in self._bombing_positions(agent):
                     scored_targets.append((AGENT_ATTACK_SCORE, target))
 
         for target in self._wall_break_positions():
-            scored_targets.append((WALL_BREAK_SCORE, target))
+            if self._manhattan(location, target) <= 3:
+                scored_targets.append(
+                    (WALL_BREAK_SCORE + 8.0 * self._wall_break_value(target), target)
+                )
+
+        for target in self._center_targets():
+            scored_targets.append(
+                (CENTER_FARM_SCORE + self._center_bonus(target), target)
+            )
 
         if scored_targets:
             best_path = self._best_scored_path(location, scored_targets)
@@ -446,20 +466,40 @@ class AEManager:
         direction: int,
         action_mask: list[int],
     ) -> int:
-        forward = self._destination(location, direction, FORWARD)
-        backward = self._destination(location, direction, BACKWARD)
+        candidates: list[tuple[float, int]] = []
 
-        if (
-            self._is_legal(FORWARD, action_mask)
-            and not self._dangerous(forward)
-            and self.visit_counts.get(forward, 0) <= self.visit_counts.get(location, 0)
-        ):
-            return FORWARD
-        for action in (RIGHT, LEFT):
-            if self._is_legal(action, action_mask):
-                return action
-        if self._is_legal(BACKWARD, action_mask) and not self._dangerous(backward):
-            return BACKWARD
+        for action in (FORWARD, BACKWARD):
+            if not self._is_legal(action, action_mask):
+                continue
+            destination = self._destination(location, direction, action)
+            if self._dangerous(destination):
+                continue
+            score = 5.0
+            score -= 2.0 * self.visit_counts.get(destination, 0)
+            if destination not in self.visited:
+                score += 6.0
+            score += 0.6 * self._center_bonus(destination)
+            candidates.append((score, action))
+
+        for action in (LEFT, RIGHT):
+            if not self._is_legal(action, action_mask):
+                continue
+            new_direction = (direction + (3 if action == LEFT else 1)) % 4
+            forward = self._destination(location, new_direction, FORWARD)
+            score = 1.0
+            if self._in_bounds(forward) and not self._dangerous(forward):
+                score += 4.0
+                if forward not in self.visited:
+                    score += 4.0
+                score += 0.4 * self._center_bonus(forward)
+                score -= self.visit_counts.get(forward, 0)
+            candidates.append((score, action))
+
+        if self._is_legal(STAY, action_mask):
+            candidates.append((-10.0, STAY))
+
+        if candidates:
+            return max(candidates, key=lambda item: item[0])[1]
         return self._first_legal(action_mask)
 
     def _escape_danger(
@@ -496,7 +536,7 @@ class AEManager:
                 return True
         if step - self.last_bomb_step < BOMB_COOLDOWN_STEPS:
             return False
-        return self._wall_break_value(location) >= 2
+        return self._wall_break_value(location) >= 3
 
     def _bombing_positions(self, target: tuple[int, int]) -> list[tuple[int, int]]:
         positions = []
@@ -519,6 +559,7 @@ class AEManager:
                     self._in_bounds(cell)
                     and not self._dangerous(cell)
                     and self._can_escape_after_bomb(cell)
+                    and self._wall_break_value(cell) >= 3
                 ):
                     positions.append(cell)
         return positions
@@ -553,10 +594,77 @@ class AEManager:
             if cell not in self.visited and not self._dangerous(cell)
         ]
 
+    def _center_targets(self) -> list[tuple[int, int]]:
+        targets = []
+        for x in range(max(0, GRID_SIZE // 2 - 2), min(GRID_SIZE, GRID_SIZE // 2 + 2)):
+            for y in range(max(0, GRID_SIZE // 2 - 2), min(GRID_SIZE, GRID_SIZE // 2 + 2)):
+                cell = (x, y)
+                if not self._dangerous(cell):
+                    targets.append(cell)
+        return targets
+
+    def _center_bonus(self, cell: tuple[int, int]) -> float:
+        center = (GRID_SIZE - 1) / 2.0
+        distance = abs(cell[0] - center) + abs(cell[1] - center)
+        return max(0.0, CENTER_BONUS - 4.0 * distance)
+
     def _blast_reaches(self, origin: tuple[int, int], target: tuple[int, int]) -> bool:
         if max(abs(origin[0] - target[0]), abs(origin[1] - target[1])) > 2:
             return False
+        return self._line_clear(origin, target)
+
+    def _line_clear(self, origin: tuple[int, int], target: tuple[int, int]) -> bool:
+        x, y = origin
+        tx, ty = target
+        dx = tx - x
+        dy = ty - y
+        steps = max(abs(dx), abs(dy))
+        if steps == 0:
+            return True
+
+        sx = 0 if dx == 0 else (1 if dx > 0 else -1)
+        sy = 0 if dy == 0 else (1 if dy > 0 else -1)
+
+        current = (x, y)
+        for _ in range(steps):
+            next_cell = (
+                current[0] + (sx if current[0] != tx else 0),
+                current[1] + (sy if current[1] != ty else 0),
+            )
+            if not self._diagonal_step_clear(current, next_cell):
+                return False
+            current = next_cell
         return True
+
+    def _diagonal_step_clear(
+        self,
+        current: tuple[int, int],
+        next_cell: tuple[int, int],
+    ) -> bool:
+        dx = next_cell[0] - current[0]
+        dy = next_cell[1] - current[1]
+        if dx == 0 and dy == 0:
+            return True
+        if dx == 0 or dy == 0:
+            direction = self._direction_from_delta(dx, dy)
+            return direction is None or not self._has_wall(current, next_cell, direction)
+
+        horizontal = (next_cell[0], current[1])
+        vertical = (current[0], next_cell[1])
+        h1 = self._blocked_between(current, horizontal)
+        h2 = self._blocked_between(horizontal, next_cell)
+        v1 = self._blocked_between(current, vertical)
+        v2 = self._blocked_between(vertical, next_cell)
+        return not ((h1 or h2) and (v1 or v2))
+
+    def _blocked_between(
+        self,
+        left: tuple[int, int],
+        right: tuple[int, int],
+    ) -> bool:
+        direction = self._direction_from_delta(right[0] - left[0], right[1] - left[1])
+        return direction is not None and self._has_wall(left, right, direction)
+
 
     def _adjacent_destructible_wall(self, location: tuple[int, int]) -> bool:
         for direction in DIR_DELTA:
