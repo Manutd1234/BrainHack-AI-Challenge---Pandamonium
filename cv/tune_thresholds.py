@@ -31,7 +31,7 @@ OUT_PATH = Path(os.getenv("CV_THRESHOLD_OUTPUT", "/home/jupyter/cv/src/cv_thresh
 CACHE_PATH = Path(os.getenv("CV_TUNE_CACHE", "/home/jupyter/cv/cv_tune_predictions.json"))
 
 IMGSZ = int(os.getenv("CV_TUNE_IMGSZ", "1280"))
-BATCH = int(os.getenv("CV_TUNE_BATCH", "16"))
+BATCH = int(os.getenv("CV_TUNE_BATCH", "1"))
 PRED_CONF = float(os.getenv("CV_TUNE_PRED_CONF", "0.01"))
 PRED_IOU = float(os.getenv("CV_TUNE_PRED_IOU", "0.70"))
 PRED_MAX_DET = int(os.getenv("CV_TUNE_PRED_MAX_DET", "100"))
