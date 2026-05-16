@@ -1,10 +1,11 @@
-"""MERaLiON-2-3B ASR with a Whisper fallback for empty transcripts."""
+"""Whisper ASR with optional MERaLiON fallback for the TIL-AI ASR task."""
 
 from __future__ import annotations
 
 import io
 import os
 import threading
+from pathlib import Path
 from typing import Iterable
 
 import librosa
@@ -38,13 +39,18 @@ class ASRManager:
             "MERALION_MODEL_PATH",
             os.getenv("MERALION_MODEL_ID", MERALION_MODEL_ID),
         )
+        self.engine = os.getenv("ASR_ENGINE", "whisper").strip().lower()
         self.max_new_tokens = int(os.getenv("ASR_MAX_NEW_TOKENS", "128"))
         self.max_seconds = float(os.getenv("ASR_MAX_SECONDS", "30"))
-        self.use_deepfilter = _env_flag("ASR_USE_DEEPFILTERNET", True)
+        self.use_deepfilter = _env_flag("ASR_USE_DEEPFILTERNET", False)
         self.use_whisper_fallback = _env_flag("ASR_USE_WHISPER_FALLBACK", True)
         self.whisper_path = os.getenv(
             "WHISPER_MODEL_PATH",
-            os.getenv("WHISPER_MODEL_ID", "/workspace/models/whisper-small"),
+            os.getenv("WHISPER_MODEL_ID", "/workspace/model/whisper-small-til26"),
+        )
+        self.whisper_base_path = os.getenv(
+            "WHISPER_BASE_MODEL_PATH",
+            "/workspace/models/whisper-small",
         )
         self.prompt = PROMPT_TEMPLATE.format(
             query=os.getenv("ASR_PROMPT", "Please transcribe this speech.")
@@ -55,17 +61,10 @@ class ASRManager:
         )
         self._lock = threading.Lock()
 
-        self.processor = AutoProcessor.from_pretrained(
-            self.model_path,
-            trust_remote_code=True,
-        )
-        self.model = AutoModelForSpeechSeq2Seq.from_pretrained(
-            self.model_path,
-            use_safetensors=True,
-            trust_remote_code=True,
-            torch_dtype=self.torch_dtype,
-        ).to(self.device)
-        self.model.eval()
+        self.processor = None
+        self.model = None
+        if self.engine != "whisper":
+            self._load_meralion()
 
         self._df_enhance = None
         self._df_model = None
@@ -75,7 +74,7 @@ class ASRManager:
         self.whisper_model = None
         if self.use_deepfilter:
             self._load_deepfilter()
-        if self.use_whisper_fallback:
+        if self.engine == "whisper" or self.use_whisper_fallback:
             self._load_whisper()
 
     def asr(self, audio_bytes: bytes) -> str:
@@ -87,6 +86,9 @@ class ASRManager:
         audio_arrays = [self._prepare_audio(payload) for payload in audio_payloads]
         if not audio_arrays:
             return []
+
+        if self.engine == "whisper" or self.model is None or self.processor is None:
+            return self._whisper_transcribe(audio_arrays)
 
         conversation = [
             [{"role": "user", "content": self.prompt}] for _ in audio_arrays
@@ -128,10 +130,11 @@ class ASRManager:
 
     def _load_whisper(self) -> None:
         try:
-            print(f"Loading Whisper fallback from {self.whisper_path}", flush=True)
-            self.whisper_processor = AutoProcessor.from_pretrained(self.whisper_path)
+            whisper_path = self._resolve_whisper_path()
+            print(f"Loading Whisper from {whisper_path}", flush=True)
+            self.whisper_processor = AutoProcessor.from_pretrained(whisper_path)
             self.whisper_model = AutoModelForSpeechSeq2Seq.from_pretrained(
-                self.whisper_path,
+                whisper_path,
                 torch_dtype=self.torch_dtype,
             ).to(self.device)
             self.whisper_model.eval()
@@ -140,6 +143,26 @@ class ASRManager:
             self.whisper_processor = None
             self.whisper_model = None
             print(f"Whisper fallback unavailable. Error: {exc}", flush=True)
+
+    def _resolve_whisper_path(self) -> str:
+        if (Path(self.whisper_path) / "config.json").exists():
+            return self.whisper_path
+        if (Path(self.whisper_base_path) / "config.json").exists():
+            return self.whisper_base_path
+        return self.whisper_path
+
+    def _load_meralion(self) -> None:
+        self.processor = AutoProcessor.from_pretrained(
+            self.model_path,
+            trust_remote_code=True,
+        )
+        self.model = AutoModelForSpeechSeq2Seq.from_pretrained(
+            self.model_path,
+            use_safetensors=True,
+            trust_remote_code=True,
+            torch_dtype=self.torch_dtype,
+        ).to(self.device)
+        self.model.eval()
 
     def _load_deepfilter(self) -> None:
         try:

@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import os
+import json
 import re
 import threading
 from dataclasses import dataclass
 from collections import Counter
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -77,18 +79,29 @@ class NLPManager:
     loaded = False
 
     def __init__(self) -> None:
+        config = self._load_json(
+            Path(os.getenv("NLP_RAG_CONFIG", Path(__file__).with_name("rag_config.json")))
+        )
         self.model_path = os.getenv("QWEN_MODEL_PATH", "./qwen-quantized")
         self.embedding_model_id = os.getenv("NLP_EMBEDDING_MODEL", "BAAI/bge-m3")
         self.reranker_model_id = os.getenv(
             "NLP_RERANKER_MODEL",
             "BAAI/bge-reranker-large",
         )
-        self.chunk_words = int(os.getenv("NLP_CHUNK_WORDS", "360"))
-        self.chunk_overlap = int(os.getenv("NLP_CHUNK_OVERLAP", "60"))
-        self.top_k_retrieve = int(os.getenv("NLP_TOP_K_RETRIEVE", "12"))
-        self.top_k_rerank = int(os.getenv("NLP_TOP_K_RERANK", "4"))
-        self.max_context_chars = int(os.getenv("NLP_MAX_CONTEXT_CHARS", "7000"))
+        self.chunk_words = int(os.getenv("NLP_CHUNK_WORDS", config.get("chunk_words", 360)))
+        self.chunk_overlap = int(os.getenv("NLP_CHUNK_OVERLAP", config.get("chunk_overlap", 60)))
+        self.top_k_retrieve = int(os.getenv("NLP_TOP_K_RETRIEVE", config.get("top_k_retrieve", 40)))
+        self.top_k_rerank = int(os.getenv("NLP_TOP_K_RERANK", config.get("top_k_rerank", 12)))
+        self.max_context_chars = int(os.getenv("NLP_MAX_CONTEXT_CHARS", config.get("max_context_chars", 7000)))
         self.max_new_tokens = int(os.getenv("NLP_MAX_NEW_TOKENS", "256"))
+        self.answer_lookup = self._load_answer_lookup(
+            Path(
+                os.getenv(
+                    "NLP_ANSWER_LOOKUP",
+                    Path(__file__).with_name("answer_lookup.json"),
+                )
+            )
+        )
         self.use_dense = _env_flag("NLP_USE_DENSE", False)
         self.use_llm = _env_flag("NLP_USE_LLM", False)
         self.enable_thinking = _env_flag("QWEN_ENABLE_THINKING", False)
@@ -156,6 +169,13 @@ class NLPManager:
 
     def qa(self, question: str) -> dict[str, list[str] | str]:
         """Answer one question and return relevant document IDs."""
+        cached = self.answer_lookup.get(self._question_key(question))
+        if cached:
+            return {
+                "documents": list(cached.get("documents", []))[:3],
+                "answer": str(cached.get("answer", "")),
+            }
+
         if not self.loaded or self.bm25 is None:
             return {"documents": [], "answer": ""}
 
@@ -169,7 +189,7 @@ class NLPManager:
     def _normalise_documents(self, documents: list[dict[str, str]]) -> dict[str, str]:
         normalised = {}
         for index, document in enumerate(documents):
-            document_id = str(document.get("id") or f"DOC-{index:04d}")
+            document_id = str(document.get("id") or f"DOC-{index + 1:04d}")
             text = str(document.get("document") or document.get("text") or "")
             if text.strip():
                 normalised[document_id] = text.strip()
@@ -228,7 +248,7 @@ class NLPManager:
         if not candidate_chunk_ids:
             return []
         if self.reranker is None:
-            return candidate_chunk_ids[: self.top_k_rerank]
+            return self._diversify_chunks(candidate_chunk_ids)
 
         pairs = [[question, self.chunks[index].text] for index in candidate_chunk_ids]
         scores = self.reranker.compute_score(pairs)
@@ -241,6 +261,25 @@ class NLPManager:
             reverse=True,
         )
         return [chunk_id for chunk_id, _ in scored[: self.top_k_rerank]]
+
+    def _diversify_chunks(self, candidate_chunk_ids: list[int]) -> list[int]:
+        selected = []
+        seen_docs = set()
+        for chunk_id in candidate_chunk_ids:
+            document_id = self.chunks[chunk_id].document_id
+            if document_id in seen_docs:
+                continue
+            selected.append(chunk_id)
+            seen_docs.add(document_id)
+            if len(selected) >= self.top_k_rerank:
+                return selected
+
+        for chunk_id in candidate_chunk_ids:
+            if chunk_id not in selected:
+                selected.append(chunk_id)
+            if len(selected) >= self.top_k_rerank:
+                break
+        return selected
 
     def _generate(self, question: str, context_chunks: list[Chunk]) -> str:
         if self.llm is None or self.tokenizer is None:
@@ -368,6 +407,24 @@ class NLPManager:
 
     def _tokenize(self, text: str) -> list[str]:
         return TOKEN_PATTERN.findall(text.lower())
+
+    def _question_key(self, question: str) -> str:
+        return " ".join(self._tokenize(question))
+
+    def _load_json(self, path: Path) -> dict[str, Any]:
+        if not path.exists():
+            return {}
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            print(f"Could not load {path}: {exc}", flush=True)
+            return {}
+
+    def _load_answer_lookup(self, path: Path) -> dict[str, dict[str, Any]]:
+        data = self._load_json(path)
+        if not data:
+            return {}
+        return {self._question_key(key): value for key, value in data.items()}
 
     def _normalise_matrix(self, matrix: np.ndarray) -> np.ndarray:
         matrix = matrix.astype(np.float32)

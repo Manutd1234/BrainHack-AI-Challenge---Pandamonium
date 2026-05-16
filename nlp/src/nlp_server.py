@@ -41,7 +41,7 @@ def _normalise_load_documents(raw_documents: list[Any]) -> list[dict[str, str]]:
     documents = []
     for index, document in enumerate(raw_documents):
         if isinstance(document, str):
-            documents.append({"id": f"DOC-{index:04d}", "document": document})
+            documents.append({"id": f"DOC-{index + 1:04d}", "document": document})
         else:
             documents.append(
                 {

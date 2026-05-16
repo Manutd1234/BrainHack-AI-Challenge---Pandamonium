@@ -5,9 +5,11 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_ROOT_USER_ACTION=ignore \
     HF_HOME=/workspace/.cache/huggingface \
+    ASR_ENGINE=whisper \
     MERALION_MODEL_PATH=/workspace/models/MERaLiON-2-3B \
-    WHISPER_MODEL_PATH=/workspace/models/whisper-small \
-    ASR_USE_DEEPFILTERNET=1 \
+    WHISPER_MODEL_PATH=/workspace/model/whisper-small-til26 \
+    WHISPER_BASE_MODEL_PATH=/workspace/models/whisper-small \
+    ASR_USE_DEEPFILTERNET=0 \
     ASR_USE_WHISPER_FALLBACK=1
 
 WORKDIR /workspace
@@ -22,13 +24,19 @@ RUN pip install --upgrade pip setuptools wheel
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Bake MERaLiON into the image so evaluation can run without network access.
-ARG MERALION_MODEL_ID=MERaLiON/MERaLiON-2-3B
-RUN python -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='${MERALION_MODEL_ID}', local_dir='${MERALION_MODEL_PATH}', local_dir_use_symlinks=False, ignore_patterns=['*.md', '*.png', '*.pdf'])"
+COPY model ./model/
 
-# Whisper is a compact fallback for cases where MERaLiON returns an empty string.
+# Bake MERaLiON only when explicitly using it; trained Whisper is the default.
+ARG MERALION_MODEL_ID=MERaLiON/MERaLiON-2-3B
+RUN if [ "${ASR_ENGINE}" != "whisper" ]; then \
+        python -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='${MERALION_MODEL_ID}', local_dir='${MERALION_MODEL_PATH}', local_dir_use_symlinks=False, ignore_patterns=['*.md', '*.png', '*.pdf'])"; \
+    fi
+
+# If no fine-tuned Whisper checkpoint was copied in, bake the base model.
 ARG WHISPER_MODEL_ID=openai/whisper-small
-RUN python -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='${WHISPER_MODEL_ID}', local_dir='${WHISPER_MODEL_PATH}', local_dir_use_symlinks=False, ignore_patterns=['*.md', '*.png', '*.pdf'])"
+RUN if [ ! -f "${WHISPER_MODEL_PATH}/config.json" ]; then \
+        python -c "import os; from huggingface_hub import snapshot_download; snapshot_download(repo_id='${WHISPER_MODEL_ID}', local_dir=os.environ['WHISPER_BASE_MODEL_PATH'], local_dir_use_symlinks=False, ignore_patterns=['*.md', '*.png', '*.pdf'])"; \
+    fi
 
 COPY src .
 
