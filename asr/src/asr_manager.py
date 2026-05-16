@@ -1,4 +1,4 @@
-"""MERaLiON-2-3B ASR with DeepFilterNet3 speech enhancement."""
+"""MERaLiON-2-3B ASR with a Whisper fallback for empty transcripts."""
 
 from __future__ import annotations
 
@@ -41,6 +41,11 @@ class ASRManager:
         self.max_new_tokens = int(os.getenv("ASR_MAX_NEW_TOKENS", "128"))
         self.max_seconds = float(os.getenv("ASR_MAX_SECONDS", "30"))
         self.use_deepfilter = _env_flag("ASR_USE_DEEPFILTERNET", True)
+        self.use_whisper_fallback = _env_flag("ASR_USE_WHISPER_FALLBACK", True)
+        self.whisper_path = os.getenv(
+            "WHISPER_MODEL_PATH",
+            os.getenv("WHISPER_MODEL_ID", "/workspace/models/whisper-small"),
+        )
         self.prompt = PROMPT_TEMPLATE.format(
             query=os.getenv("ASR_PROMPT", "Please transcribe this speech.")
         )
@@ -66,8 +71,12 @@ class ASRManager:
         self._df_model = None
         self._df_state = None
         self._df_atten_lim_db = os.getenv("ASR_DF_ATTEN_LIM_DB")
+        self.whisper_processor = None
+        self.whisper_model = None
         if self.use_deepfilter:
             self._load_deepfilter()
+        if self.use_whisper_fallback:
+            self._load_whisper()
 
     def asr(self, audio_bytes: bytes) -> str:
         """Transcribe one WAV byte payload."""
@@ -108,7 +117,29 @@ class ASRManager:
             generated_ids,
             skip_special_tokens=True,
         )
-        return [self._clean_prediction(prediction) for prediction in predictions]
+        cleaned = [self._clean_prediction(prediction) for prediction in predictions]
+        if self.whisper_model is not None and any(not prediction for prediction in cleaned):
+            fallback = self._whisper_transcribe(audio_arrays)
+            cleaned = [
+                prediction if prediction else fallback[index]
+                for index, prediction in enumerate(cleaned)
+            ]
+        return cleaned
+
+    def _load_whisper(self) -> None:
+        try:
+            print(f"Loading Whisper fallback from {self.whisper_path}", flush=True)
+            self.whisper_processor = AutoProcessor.from_pretrained(self.whisper_path)
+            self.whisper_model = AutoModelForSpeechSeq2Seq.from_pretrained(
+                self.whisper_path,
+                torch_dtype=self.torch_dtype,
+            ).to(self.device)
+            self.whisper_model.eval()
+        except Exception as exc:
+            self.use_whisper_fallback = False
+            self.whisper_processor = None
+            self.whisper_model = None
+            print(f"Whisper fallback unavailable. Error: {exc}", flush=True)
 
     def _load_deepfilter(self) -> None:
         try:
@@ -124,6 +155,38 @@ class ASRManager:
                 f"DeepFilterNet3 unavailable; using raw audio. Error: {exc}",
                 flush=True,
             )
+
+    def _whisper_transcribe(self, audio_arrays: list[np.ndarray]) -> list[str]:
+        predictions = []
+        if self.whisper_model is None or self.whisper_processor is None:
+            return ["" for _ in audio_arrays]
+
+        forced_decoder_ids = self.whisper_processor.get_decoder_prompt_ids(
+            task="transcribe",
+        )
+        for audio in audio_arrays:
+            inputs = self.whisper_processor(
+                audio,
+                sampling_rate=TARGET_SAMPLE_RATE,
+                return_tensors="pt",
+            )
+            input_features = inputs.input_features.to(self.device)
+            if self.device.type == "cuda":
+                input_features = input_features.to(self.torch_dtype)
+
+            with self._lock, torch.inference_mode():
+                predicted_ids = self.whisper_model.generate(
+                    input_features,
+                    forced_decoder_ids=forced_decoder_ids,
+                    max_new_tokens=self.max_new_tokens,
+                    do_sample=False,
+                )
+            text = self.whisper_processor.batch_decode(
+                predicted_ids,
+                skip_special_tokens=True,
+            )[0]
+            predictions.append(self._clean_prediction(text))
+        return predictions
 
     def _prepare_audio(self, audio_bytes: bytes) -> np.ndarray:
         audio, sample_rate = self._read_wav(audio_bytes)
