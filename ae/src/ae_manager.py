@@ -43,7 +43,9 @@ DESTR_WALL_RIGHT = 13
 DESTR_WALL_DOWN = 14
 DESTR_WALL_LEFT = 15
 DESTR_WALL_UP = 16
+ALLY_BOMB = 17
 ENEMY_BOMB = 18
+ALLY_BOMB_TIMER = 19
 ENEMY_BOMB_TIMER = 20
 
 WALL_CHANNELS = {
@@ -84,6 +86,7 @@ class AEManager:
         self.collectibles: dict[tuple[int, int], float] = {}
         self.enemy_bases: set[tuple[int, int]] = set()
         self.enemy_agents: set[tuple[int, int]] = set()
+        self.ally_bombs: dict[tuple[int, int], float] = {}
         self.enemy_bombs: dict[tuple[int, int], float] = {}
         self.last_location: tuple[int, int] | None = None
         self.last_action: int | None = None
@@ -196,6 +199,9 @@ class AEManager:
         self.known_open.add(location)
         self.collectibles.pop(location, None)
         self.enemy_agents.clear()
+        self.ally_bombs = {
+            cell: timer - 1 for cell, timer in self.ally_bombs.items() if timer > 1
+        }
         self.enemy_bombs = {
             cell: timer - 1 for cell, timer in self.enemy_bombs.items() if timer > 1
         }
@@ -264,6 +270,12 @@ class AEManager:
                 if cell[ENEMY_AGENT] > 0:
                     self.enemy_agents.add(world)
 
+                if cell.shape[0] > ALLY_BOMB and cell[ALLY_BOMB] > 0:
+                    timer = float(cell[ALLY_BOMB_TIMER]) if cell.shape[0] > ALLY_BOMB_TIMER else 4.0
+                    self.ally_bombs[world] = timer
+                else:
+                    self.ally_bombs.pop(world, None)
+
                 if cell[ENEMY_BOMB] > 0:
                     timer = float(cell[ENEMY_BOMB_TIMER]) if cell.shape[0] > ENEMY_BOMB_TIMER else 1.0
                     self.enemy_bombs[world] = timer
@@ -298,16 +310,16 @@ class AEManager:
         for base in self.enemy_bases:
             if self._in_bounds(base):
                 for target in self._bombing_positions(base):
-                    scored_targets.append((100.0, target))
+                    scored_targets.append((140.0, target))
 
         for cell, value in self.collectibles.items():
             if self._in_bounds(cell):
-                scored_targets.append((value * 12.0, cell))
+                scored_targets.append((value * 18.0, cell))
 
         for agent in self.enemy_agents:
             if self._in_bounds(agent):
                 for target in self._bombing_positions(agent):
-                    scored_targets.append((25.0, target))
+                    scored_targets.append((40.0, target))
 
         if scored_targets:
             best_path = self._best_scored_path(location, scored_targets)
@@ -340,7 +352,7 @@ class AEManager:
             path = self._path_to_any(location, {target})
             if not path:
                 continue
-            value = score - 0.55 * len(path) - 0.2 * self.visit_counts.get(target, 0)
+            value = score - 1.15 * len(path) - 0.35 * self.visit_counts.get(target, 0)
             if value > best_value:
                 best_value = value
                 best_path = path
@@ -432,10 +444,9 @@ class AEManager:
             and self.visit_counts.get(forward, 0) <= self.visit_counts.get(location, 0)
         ):
             return FORWARD
-        if self._is_legal(RIGHT, action_mask):
-            return RIGHT
-        if self._is_legal(LEFT, action_mask):
-            return LEFT
+        for action in (RIGHT, LEFT):
+            if self._is_legal(action, action_mask):
+                return action
         if self._is_legal(BACKWARD, action_mask) and not self._dangerous(backward):
             return BACKWARD
         return self._first_legal(action_mask)
@@ -453,12 +464,21 @@ class AEManager:
             destination = self._destination(location, direction, action)
             if self._is_legal(action, action_mask) and not self._dangerous(destination):
                 return action
-        for action in (LEFT, RIGHT, STAY):
-            if self._is_legal(action, action_mask):
-                return action
+        for turn in (LEFT, RIGHT):
+            if not self._is_legal(turn, action_mask):
+                continue
+            new_direction = (direction + (3 if turn == LEFT else 1)) % 4
+            forward = self._destination(location, new_direction, FORWARD)
+            if not self._dangerous(forward):
+                return turn
+        if self._is_legal(STAY, action_mask) and not self._dangerous(location):
+            return STAY
         return self._first_legal(action_mask)
 
     def _should_bomb_now(self, location: tuple[int, int]) -> bool:
+        if not self._can_escape_after_bomb(location):
+            return False
+
         high_value_targets = self.enemy_bases | self.enemy_agents
         for target in high_value_targets:
             if self._blast_reaches(location, target):
@@ -470,7 +490,11 @@ class AEManager:
         for x in range(max(0, target[0] - 2), min(GRID_SIZE, target[0] + 3)):
             for y in range(max(0, target[1] - 2), min(GRID_SIZE, target[1] + 3)):
                 cell = (x, y)
-                if self._blast_reaches(cell, target) and not self._dangerous(cell):
+                if (
+                    self._blast_reaches(cell, target)
+                    and not self._dangerous(cell)
+                    and self._can_escape_after_bomb(cell)
+                ):
                     positions.append(cell)
         return positions
 
@@ -487,9 +511,31 @@ class AEManager:
         return False
 
     def _dangerous(self, cell: tuple[int, int]) -> bool:
-        for bomb, timer in self.enemy_bombs.items():
-            if timer <= 1.0 and max(abs(cell[0] - bomb[0]), abs(cell[1] - bomb[1])) <= 2:
+        for bomb, timer in self.ally_bombs.items():
+            if timer <= 4.0 and self._blast_reaches(bomb, cell):
                 return True
+        for bomb, timer in self.enemy_bombs.items():
+            if timer <= 2.0 and self._blast_reaches(bomb, cell):
+                return True
+        return False
+
+    def _can_escape_after_bomb(self, location: tuple[int, int]) -> bool:
+        """Return whether there is a nearby tile outside a newly placed bomb."""
+        queue = deque([(location, 0)])
+        seen = {location}
+
+        while queue:
+            cell, depth = queue.popleft()
+            if depth > 0 and not self._blast_reaches(location, cell) and not self._dangerous(cell):
+                return True
+            if depth >= 4:
+                continue
+            for neighbor in self._neighbors(cell):
+                if neighbor in seen:
+                    continue
+                seen.add(neighbor)
+                queue.append((neighbor, depth + 1))
+
         return False
 
     def _view_to_world(
@@ -574,6 +620,8 @@ class AEManager:
             action = self._first_legal(action_mask)
         self.last_action = int(action)
         self.last_location = self._location(observation)
+        if action == PLACE_BOMB:
+            self.ally_bombs[self.last_location] = 4.0
         return int(action)
 
     def _numpy_observation(self, observation: dict[str, Any]) -> dict[str, Any]:
