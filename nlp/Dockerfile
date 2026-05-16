@@ -21,8 +21,6 @@ RUN python -m pip install --no-cache-dir --upgrade pip setuptools wheel \
     && pip install --no-cache-dir --upgrade "transformers>=4.51.0"
 
 COPY src/ ./src/
-RUN test -f /app/src/qwen-quantized/config.json || \
-    (echo "Missing /app/src/qwen-quantized/config.json. Run quantize.py or place the quantized Qwen3 model in nlp/src/qwen-quantized before docker build." && false)
 
 WORKDIR /app/src
 
