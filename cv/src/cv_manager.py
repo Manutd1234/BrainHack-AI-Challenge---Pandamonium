@@ -204,10 +204,10 @@ class CVManager:
             if obj.score.value < CLASS_CONF.get(category_id, DEFAULT_CONF):
                 continue
 
-            left = int(round(max(0, min(obj.bbox.minx, width - 1))))
-            top = int(round(max(0, min(obj.bbox.miny, height - 1))))
-            right = int(round(max(0, min(obj.bbox.maxx, width))))
-            bottom = int(round(max(0, min(obj.bbox.maxy, height))))
+            left = float(max(0.0, min(float(obj.bbox.minx), float(width - 1))))
+            top = float(max(0.0, min(float(obj.bbox.miny), float(height - 1))))
+            right = float(max(0.0, min(float(obj.bbox.maxx), float(width))))
+            bottom = float(max(0.0, min(float(obj.bbox.maxy), float(height))))
             box_width = right - left
             box_height = bottom - top
             if box_width <= 0 or box_height <= 0:
@@ -274,16 +274,16 @@ class CVManager:
         xywh: np.ndarray,
         image_width: int,
         image_height: int,
-    ) -> tuple[int, int, int, int]:
+    ) -> tuple[float, float, float, float]:
         center_x, center_y, box_width, box_height = (float(v) for v in xywh)
         left = center_x - box_width / 2
         top = center_y - box_height / 2
         right = center_x + box_width / 2
         bottom = center_y + box_height / 2
 
-        left = int(round(max(0, min(left, image_width - 1))))
-        top = int(round(max(0, min(top, image_height - 1))))
-        right = int(round(max(0, min(right, image_width))))
-        bottom = int(round(max(0, min(bottom, image_height))))
+        left = float(max(0.0, min(left, float(image_width - 1))))
+        top = float(max(0.0, min(top, float(image_height - 1))))
+        right = float(max(0.0, min(right, float(image_width))))
+        bottom = float(max(0.0, min(bottom, float(image_height))))
 
         return left, top, right - left, bottom - top
