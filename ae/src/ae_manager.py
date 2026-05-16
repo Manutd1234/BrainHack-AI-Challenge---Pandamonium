@@ -14,6 +14,11 @@ LOGGER = logging.getLogger(__name__)
 
 GRID_SIZE = int(os.getenv("AE_GRID_SIZE", "16"))
 CHECKPOINT_PATH = os.getenv("AE_CHECKPOINT_PATH", "/app/model/policy.zip")
+BASE_ATTACK_SCORE = float(os.getenv("AE_BASE_ATTACK_SCORE", "95.0"))
+AGENT_ATTACK_SCORE = float(os.getenv("AE_AGENT_ATTACK_SCORE", "25.0"))
+COLLECTIBLE_SCORE_MULT = float(os.getenv("AE_COLLECTIBLE_SCORE_MULT", "24.0"))
+PATH_LENGTH_PENALTY = float(os.getenv("AE_PATH_LENGTH_PENALTY", "1.45"))
+VISIT_PENALTY = float(os.getenv("AE_VISIT_PENALTY", "0.50"))
 
 FORWARD = 0
 BACKWARD = 1
@@ -181,6 +186,7 @@ class AEManager:
             self.stuck_count >= 2
             and self._is_legal(PLACE_BOMB, action_mask)
             and self._adjacent_destructible_wall(location)
+            and self._can_escape_after_bomb(location)
         ):
             return PLACE_BOMB
 
@@ -310,16 +316,16 @@ class AEManager:
         for base in self.enemy_bases:
             if self._in_bounds(base):
                 for target in self._bombing_positions(base):
-                    scored_targets.append((140.0, target))
+                    scored_targets.append((BASE_ATTACK_SCORE, target))
 
         for cell, value in self.collectibles.items():
             if self._in_bounds(cell):
-                scored_targets.append((value * 18.0, cell))
+                scored_targets.append((value * COLLECTIBLE_SCORE_MULT, cell))
 
         for agent in self.enemy_agents:
             if self._in_bounds(agent):
                 for target in self._bombing_positions(agent):
-                    scored_targets.append((40.0, target))
+                    scored_targets.append((AGENT_ATTACK_SCORE, target))
 
         if scored_targets:
             best_path = self._best_scored_path(location, scored_targets)
@@ -352,7 +358,11 @@ class AEManager:
             path = self._path_to_any(location, {target})
             if not path:
                 continue
-            value = score - 1.15 * len(path) - 0.35 * self.visit_counts.get(target, 0)
+            value = (
+                score
+                - PATH_LENGTH_PENALTY * len(path)
+                - VISIT_PENALTY * self.visit_counts.get(target, 0)
+            )
             if value > best_value:
                 best_value = value
                 best_path = path
