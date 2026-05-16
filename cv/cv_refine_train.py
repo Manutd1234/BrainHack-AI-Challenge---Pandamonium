@@ -8,7 +8,7 @@ precision more than another aggressive full-training run.
 Run in Jupyter:
 
     cd ~/cv
-    CV_REFINE_EPOCHS=40 CV_REFINE_IMGSZ=1536 CV_REFINE_BATCH=2 python cv_refine_train.py
+    CV_REFINE_EPOCHS=12 CV_REFINE_IMGSZ=1536 CV_REFINE_BATCH=2 python cv_refine_train.py
 """
 
 from __future__ import annotations
@@ -66,7 +66,7 @@ def main() -> None:
             f"{base_checkpoint} not found. Run cv_train.py first or copy your best.pt there."
         )
 
-    epochs = int(os.getenv("CV_REFINE_EPOCHS", "40"))
+    epochs = int(os.getenv("CV_REFINE_EPOCHS", "12"))
     imgsz = int(os.getenv("CV_REFINE_IMGSZ", "1536"))
     batch = int(os.getenv("CV_REFINE_BATCH", "2"))
     lr0 = float(os.getenv("CV_REFINE_LR0", "0.0012"))
