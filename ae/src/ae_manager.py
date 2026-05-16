@@ -14,11 +14,11 @@ LOGGER = logging.getLogger(__name__)
 
 GRID_SIZE = int(os.getenv("AE_GRID_SIZE", "16"))
 CHECKPOINT_PATH = os.getenv("AE_CHECKPOINT_PATH", "/app/model/policy.zip")
-BASE_ATTACK_SCORE = float(os.getenv("AE_BASE_ATTACK_SCORE", "140.0"))
-AGENT_ATTACK_SCORE = float(os.getenv("AE_AGENT_ATTACK_SCORE", "40.0"))
-COLLECTIBLE_SCORE_MULT = float(os.getenv("AE_COLLECTIBLE_SCORE_MULT", "18.0"))
-PATH_LENGTH_PENALTY = float(os.getenv("AE_PATH_LENGTH_PENALTY", "1.15"))
-VISIT_PENALTY = float(os.getenv("AE_VISIT_PENALTY", "0.35"))
+BASE_ATTACK_SCORE = float(os.getenv("AE_BASE_ATTACK_SCORE", "115.0"))
+AGENT_ATTACK_SCORE = float(os.getenv("AE_AGENT_ATTACK_SCORE", "28.0"))
+COLLECTIBLE_SCORE_MULT = float(os.getenv("AE_COLLECTIBLE_SCORE_MULT", "24.0"))
+PATH_LENGTH_PENALTY = float(os.getenv("AE_PATH_LENGTH_PENALTY", "1.35"))
+VISIT_PENALTY = float(os.getenv("AE_VISIT_PENALTY", "0.55"))
 
 FORWARD = 0
 BACKWARD = 1
