@@ -1,4 +1,4 @@
-"""YOLO26x + SAHI CV manager for TIL-AI 2026."""
+"""YOLO26x CV manager for TIL-AI 2026."""
 
 from __future__ import annotations
 
@@ -16,6 +16,9 @@ LOGGER = logging.getLogger(__name__)
 MODEL_PATH = os.getenv("CV_MODEL_PATH", "/app/model/best.pt")
 DEFAULT_CONF = float(os.getenv("CV_DEFAULT_CONF", "0.20"))
 DEFAULT_IOU = float(os.getenv("CV_IOU", "0.45"))
+DEFAULT_IMGSZ = int(os.getenv("CV_IMGSZ", "1280"))
+MAX_DETECTIONS = int(os.getenv("CV_MAX_DETECTIONS", "20"))
+USE_SAHI = os.getenv("CV_USE_SAHI", "0").strip().lower() in {"1", "true", "yes"}
 SAHI_MIN_SIZE = int(os.getenv("CV_SAHI_MIN_SIZE", "640"))
 SAHI_SLICE_SIZE = int(os.getenv("CV_SAHI_SLICE_SIZE", "640"))
 SAHI_OVERLAP = float(os.getenv("CV_SAHI_OVERLAP", "0.20"))
@@ -42,24 +45,24 @@ CLASS_NAMES = [
 ]
 
 CLASS_CONF = {
-    0: 0.25,
-    1: 0.25,
-    2: 0.15,
-    3: 0.25,
-    4: 0.25,
-    5: 0.20,
-    6: 0.20,
-    7: 0.15,
-    8: 0.25,
-    9: 0.25,
-    10: 0.25,
-    11: 0.25,
-    12: 0.25,
-    13: 0.25,
-    14: 0.20,
-    15: 0.25,
-    16: 0.25,
-    17: 0.20,
+    0: 0.35,
+    1: 0.35,
+    2: 0.28,
+    3: 0.35,
+    4: 0.35,
+    5: 0.32,
+    6: 0.32,
+    7: 0.28,
+    8: 0.35,
+    9: 0.35,
+    10: 0.35,
+    11: 0.35,
+    12: 0.35,
+    13: 0.35,
+    14: 0.32,
+    15: 0.35,
+    16: 0.35,
+    17: 0.32,
 }
 
 
@@ -78,19 +81,38 @@ class CVManager:
         self.model = YOLO(MODEL_PATH)
         self.model.to(self.device)
 
-        self.sahi_model = self._load_sahi_model()
-        self.model.predict(np.zeros((640, 640, 3), dtype=np.uint8), verbose=False)
+        self.sahi_model = self._load_sahi_model() if USE_SAHI else None
+        self.model.predict(
+            np.zeros((640, 640, 3), dtype=np.uint8),
+            imgsz=DEFAULT_IMGSZ,
+            conf=DEFAULT_CONF,
+            iou=DEFAULT_IOU,
+            half=self.device == "cuda",
+            verbose=False,
+        )
         LOGGER.info("CVManager ready")
 
     def cv(self, image: bytes) -> list[dict[str, Any]]:
         """Perform object detection on one JPEG image."""
-        frame = self._decode(image)
-        height, width = frame.shape[:2]
+        return self.cv_many([image])[0]
 
-        if self.sahi_model is not None and max(height, width) >= SAHI_MIN_SIZE:
-            return self._predict_sahi(frame)
+    def cv_many(self, images: list[bytes]) -> list[list[dict[str, Any]]]:
+        """Perform object detection on a request batch."""
+        frames = [self._decode(image) for image in images]
+        if not frames:
+            return []
 
-        return self._predict_full_image(frame)
+        if self.sahi_model is None:
+            return self._predict_full_batch(frames)
+
+        predictions = []
+        for frame in frames:
+            height, width = frame.shape[:2]
+            if max(height, width) >= SAHI_MIN_SIZE:
+                predictions.append(self._predict_sahi(frame))
+            else:
+                predictions.extend(self._predict_full_batch([frame]))
+        return predictions
 
     def _load_sahi_model(self):
         try:
@@ -116,14 +138,23 @@ class CVManager:
         return image
 
     def _predict_full_image(self, image: np.ndarray) -> list[dict[str, Any]]:
-        result = self.model.predict(
-            image,
+        return self._predict_full_batch([image])[0]
+
+    def _predict_full_batch(self, images: list[np.ndarray]) -> list[list[dict[str, Any]]]:
+        results = self.model.predict(
+            images,
             conf=DEFAULT_CONF,
             iou=DEFAULT_IOU,
+            imgsz=DEFAULT_IMGSZ,
+            half=self.device == "cuda",
+            max_det=MAX_DETECTIONS,
             verbose=False,
             device=self.device,
-        )[0]
-        return self._format_yolo_result(result, image.shape)
+        )
+        return [
+            self._format_yolo_result(result, image.shape)
+            for result, image in zip(results, images)
+        ]
 
     def _predict_sahi(self, image: np.ndarray) -> list[dict[str, Any]]:
         from sahi.predict import get_sliced_prediction
@@ -167,7 +198,7 @@ class CVManager:
                 }
             )
 
-        return predictions
+        return self._limit_predictions(predictions)
 
     def _format_yolo_result(
         self,
@@ -183,6 +214,7 @@ class CVManager:
         confidences = result.boxes.conf.detach().cpu().numpy()
 
         predictions = []
+        kept_confidences = []
         for xywh, category_id, confidence in zip(boxes_xywh, class_ids, confidences):
             if category_id < 0 or category_id >= len(CLASS_NAMES):
                 continue
@@ -199,8 +231,21 @@ class CVManager:
                     "category_id": int(category_id),
                 }
             )
+            kept_confidences.append(float(confidence))
 
-        return predictions
+        return self._limit_predictions(predictions, kept_confidences)
+
+    def _limit_predictions(
+        self,
+        predictions: list[dict[str, Any]],
+        confidences: list[float] | None = None,
+    ) -> list[dict[str, Any]]:
+        if len(predictions) <= MAX_DETECTIONS:
+            return predictions
+        if confidences is None:
+            return predictions[:MAX_DETECTIONS]
+        order = np.argsort(-np.asarray(confidences))[:MAX_DETECTIONS]
+        return [predictions[int(index)] for index in order]
 
     def _xywh_to_ltwh(
         self,

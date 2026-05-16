@@ -15,10 +15,10 @@ async def cv(request: Request) -> dict[str, list[list[dict[str, Any]]]]:
     """Perform CV object detection on image frames."""
     inputs_json = await request.json()
 
-    predictions = []
-    for instance in inputs_json["instances"]:
-        image_bytes = base64.b64decode(instance["b64"])
-        predictions.append(manager.cv(image_bytes))
+    image_payloads = [
+        base64.b64decode(instance["b64"]) for instance in inputs_json["instances"]
+    ]
+    predictions = manager.cv_many(image_payloads)
 
     return {"predictions": predictions}
 
