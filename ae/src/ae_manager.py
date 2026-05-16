@@ -19,6 +19,8 @@ AGENT_ATTACK_SCORE = float(os.getenv("AE_AGENT_ATTACK_SCORE", "28.0"))
 COLLECTIBLE_SCORE_MULT = float(os.getenv("AE_COLLECTIBLE_SCORE_MULT", "24.0"))
 PATH_LENGTH_PENALTY = float(os.getenv("AE_PATH_LENGTH_PENALTY", "1.35"))
 VISIT_PENALTY = float(os.getenv("AE_VISIT_PENALTY", "0.55"))
+WALL_BREAK_SCORE = float(os.getenv("AE_WALL_BREAK_SCORE", "42.0"))
+BOMB_COOLDOWN_STEPS = int(os.getenv("AE_BOMB_COOLDOWN_STEPS", "7"))
 
 FORWARD = 0
 BACKWARD = 1
@@ -95,6 +97,7 @@ class AEManager:
         self.enemy_bombs: dict[tuple[int, int], float] = {}
         self.last_location: tuple[int, int] | None = None
         self.last_action: int | None = None
+        self.last_bomb_step = -999
         self.stuck_count = 0
         self.last_step = -1
         LOGGER.info("AEManager rule memory reset")
@@ -173,7 +176,7 @@ class AEManager:
         if escape is not None:
             return escape
 
-        if self._is_legal(PLACE_BOMB, action_mask) and self._should_bomb_now(location):
+        if self._is_legal(PLACE_BOMB, action_mask) and self._should_bomb_now(location, step):
             return PLACE_BOMB
 
         target_path = self._choose_target_path(location)
@@ -186,6 +189,7 @@ class AEManager:
             self.stuck_count >= 2
             and self._is_legal(PLACE_BOMB, action_mask)
             and self._adjacent_destructible_wall(location)
+            and self._can_escape_after_bomb(location)
         ):
             return PLACE_BOMB
 
@@ -326,18 +330,15 @@ class AEManager:
                 for target in self._bombing_positions(agent):
                     scored_targets.append((AGENT_ATTACK_SCORE, target))
 
+        for target in self._wall_break_positions():
+            scored_targets.append((WALL_BREAK_SCORE, target))
+
         if scored_targets:
             best_path = self._best_scored_path(location, scored_targets)
             if best_path:
                 return best_path
 
-        frontier_targets = [
-            cell
-            for x in range(GRID_SIZE)
-            for y in range(GRID_SIZE)
-            for cell in [(x, y)]
-            if cell not in self.visited and not self._dangerous(cell)
-        ]
+        frontier_targets = self._frontier_targets()
         return self._nearest_path(location, frontier_targets)
 
     def _best_scored_path(
@@ -484,7 +485,7 @@ class AEManager:
             return STAY
         return self._first_legal(action_mask)
 
-    def _should_bomb_now(self, location: tuple[int, int]) -> bool:
+    def _should_bomb_now(self, location: tuple[int, int], step: int) -> bool:
         if not self._can_escape_after_bomb(location):
             return False
 
@@ -492,7 +493,9 @@ class AEManager:
         for target in high_value_targets:
             if self._blast_reaches(location, target):
                 return True
-        return False
+        if step - self.last_bomb_step < BOMB_COOLDOWN_STEPS:
+            return False
+        return self._wall_break_value(location) >= 2
 
     def _bombing_positions(self, target: tuple[int, int]) -> list[tuple[int, int]]:
         positions = []
@@ -506,6 +509,48 @@ class AEManager:
                 ):
                     positions.append(cell)
         return positions
+
+    def _wall_break_positions(self) -> list[tuple[int, int]]:
+        positions = []
+        for left, right in self.destructible_walls:
+            for cell in (left, right):
+                if (
+                    self._in_bounds(cell)
+                    and not self._dangerous(cell)
+                    and self._can_escape_after_bomb(cell)
+                ):
+                    positions.append(cell)
+        return positions
+
+    def _wall_break_value(self, location: tuple[int, int]) -> int:
+        value = 0
+        for direction, delta in DIR_DELTA.items():
+            edge = self._edge(location, direction)
+            if edge not in self.destructible_walls:
+                continue
+            neighbor = (location[0] + delta[0], location[1] + delta[1])
+            value += 2 if neighbor not in self.known_open else 1
+        return value
+
+    def _frontier_targets(self) -> list[tuple[int, int]]:
+        candidates = set()
+        for cell in self.known_open:
+            if cell not in self.visited and not self._dangerous(cell):
+                candidates.add(cell)
+            for neighbor in self._neighbors(cell):
+                if neighbor not in self.visited and not self._dangerous(neighbor):
+                    candidates.add(neighbor)
+
+        if candidates:
+            return list(candidates)
+
+        return [
+            cell
+            for x in range(GRID_SIZE)
+            for y in range(GRID_SIZE)
+            for cell in [(x, y)]
+            if cell not in self.visited and not self._dangerous(cell)
+        ]
 
     def _blast_reaches(self, origin: tuple[int, int], target: tuple[int, int]) -> bool:
         if max(abs(origin[0] - target[0]), abs(origin[1] - target[1])) > 2:
@@ -631,6 +676,7 @@ class AEManager:
         self.last_location = self._location(observation)
         if action == PLACE_BOMB:
             self.ally_bombs[self.last_location] = 4.0
+            self.last_bomb_step = int(observation.get("step", self.last_step))
         return int(action)
 
     def _numpy_observation(self, observation: dict[str, Any]) -> dict[str, Any]:
