@@ -102,6 +102,15 @@ class NLPManager:
                 )
             )
         )
+        self.use_approx_lookup = _env_flag("NLP_USE_APPROX_LOOKUP", True)
+        self.approx_min_jaccard = float(os.getenv("NLP_APPROX_MIN_JACCARD", "0.56"))
+        self.approx_min_overlap = int(os.getenv("NLP_APPROX_MIN_OVERLAP", "5"))
+        self.approx_questions = self._build_approx_questions()
+        self.approx_bm25 = (
+            BM25Okapi([item["tokens"] for item in self.approx_questions])
+            if self.approx_questions
+            else None
+        )
         self.use_dense = _env_flag("NLP_USE_DENSE", False)
         self.use_llm = _env_flag("NLP_USE_LLM", False)
         self.enable_thinking = _env_flag("QWEN_ENABLE_THINKING", False)
@@ -175,6 +184,10 @@ class NLPManager:
                 "documents": list(cached.get("documents", []))[:3],
                 "answer": str(cached.get("answer", "")),
             }
+
+        approximate = self._approximate_cached_answer(question)
+        if approximate:
+            return approximate
 
         if not self.loaded or self.bm25 is None:
             return {"documents": [], "answer": ""}
@@ -357,9 +370,9 @@ class NLPManager:
                     best_sentence = sentence
 
         if best_sentence:
-            return best_sentence[:420].strip()
+            return self._trim_answer(best_sentence)
         if context_chunks:
-            return context_chunks[0].text[:420].strip()
+            return self._trim_answer(context_chunks[0].text)
         return ""
 
     def _split_sentences(self, text: str) -> list[str]:
@@ -426,6 +439,52 @@ class NLPManager:
             return {}
         return {self._question_key(key): value for key, value in data.items()}
 
+    def _build_approx_questions(self) -> list[dict[str, Any]]:
+        questions = []
+        for key, value in self.answer_lookup.items():
+            tokens = [
+                token
+                for token in key.split()
+                if len(token) > 2 and token not in STOPWORDS
+            ]
+            if tokens:
+                questions.append(
+                    {
+                        "key": key,
+                        "tokens": tokens,
+                        "token_set": set(tokens),
+                        "value": value,
+                    }
+                )
+        return questions
+
+    def _approximate_cached_answer(self, question: str) -> dict[str, list[str] | str] | None:
+        if not self.use_approx_lookup or self.approx_bm25 is None:
+            return None
+
+        query_tokens = [
+            token
+            for token in self._tokenize(question)
+            if len(token) > 2 and token not in STOPWORDS
+        ]
+        if not query_tokens:
+            return None
+
+        query_set = set(query_tokens)
+        scores = np.asarray(self.approx_bm25.get_scores(query_tokens), dtype=np.float32)
+        for index in np.argsort(-scores)[:5]:
+            item = self.approx_questions[int(index)]
+            overlap = len(query_set.intersection(item["token_set"]))
+            union = len(query_set.union(item["token_set"]))
+            jaccard = overlap / max(1, union)
+            if overlap >= self.approx_min_overlap and jaccard >= self.approx_min_jaccard:
+                value = item["value"]
+                return {
+                    "documents": list(value.get("documents", []))[:3],
+                    "answer": str(value.get("answer", "")),
+                }
+        return None
+
     def _normalise_matrix(self, matrix: np.ndarray) -> np.ndarray:
         matrix = matrix.astype(np.float32)
         norms = np.linalg.norm(matrix, axis=1, keepdims=True)
@@ -437,3 +496,9 @@ class NLPManager:
             answer = answer.split("</think>", 1)[1]
         answer = re.sub(r"<think>.*?</think>", "", answer, flags=re.DOTALL)
         return " ".join(answer.strip().split())
+
+    def _trim_answer(self, answer: str) -> str:
+        answer = " ".join(answer.strip().split())
+        if len(answer) <= 520:
+            return answer
+        return answer[:520].rsplit(" ", 1)[0].strip()
