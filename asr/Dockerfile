@@ -30,9 +30,6 @@ RUN python -c "from huggingface_hub import snapshot_download; snapshot_download(
 ARG WHISPER_MODEL_ID=openai/whisper-small
 RUN python -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='${WHISPER_MODEL_ID}', local_dir='${WHISPER_MODEL_PATH}', local_dir_use_symlinks=False, ignore_patterns=['*.md', '*.png', '*.pdf'])"
 
-# Warm the DeepFilterNet3 cache during build instead of first inference.
-RUN python -c "from df.enhance import init_df; init_df('DeepFilterNet3', log_level='ERROR', log_file=None)"
-
 COPY src .
 
 EXPOSE 5001
