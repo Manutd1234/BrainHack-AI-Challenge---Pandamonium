@@ -5,13 +5,15 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_ROOT_USER_ACTION=ignore \
     HF_HOME=/workspace/.cache/huggingface \
-    ASR_ENGINE=whisper \
+    ASR_ENGINE=hybrid \
     MERALION_MODEL_PATH=/workspace/models/MERaLiON-2-3B \
     WHISPER_MODEL_PATH=/workspace/models/whisper-large-v3-turbo \
     WHISPER_BASE_MODEL_PATH=/workspace/models/whisper-large-v3-turbo \
     ASR_USE_DEEPFILTERNET=0 \
     ASR_USE_WHISPER_FALLBACK=1 \
-    ASR_MAX_NEW_TOKENS=256
+    ASR_MAX_NEW_TOKENS=256 \
+    ASR_HYBRID_MIN_CHARS=24 \
+    ASR_HYBRID_MIN_WORDS=5
 
 WORKDIR /workspace
 

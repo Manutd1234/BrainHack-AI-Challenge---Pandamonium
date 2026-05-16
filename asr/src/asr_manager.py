@@ -42,6 +42,11 @@ class ASRManager:
         self.engine = os.getenv("ASR_ENGINE", "whisper").strip().lower()
         self.max_new_tokens = int(os.getenv("ASR_MAX_NEW_TOKENS", "128"))
         self.max_seconds = float(os.getenv("ASR_MAX_SECONDS", "30"))
+        self.hybrid_min_chars = int(os.getenv("ASR_HYBRID_MIN_CHARS", "24"))
+        self.hybrid_min_words = int(os.getenv("ASR_HYBRID_MIN_WORDS", "5"))
+        self.hybrid_max_repeat_ratio = float(
+            os.getenv("ASR_HYBRID_MAX_REPEAT_RATIO", "0.55")
+        )
         self.use_deepfilter = _env_flag("ASR_USE_DEEPFILTERNET", False)
         self.use_whisper_fallback = _env_flag("ASR_USE_WHISPER_FALLBACK", True)
         self.whisper_path = os.getenv(
@@ -90,6 +95,12 @@ class ASRManager:
         if self.engine == "whisper" or self.model is None or self.processor is None:
             return self._whisper_transcribe(audio_arrays)
 
+        if self.engine == "hybrid":
+            return self._hybrid_transcribe(audio_arrays)
+
+        return self._meralion_transcribe(audio_arrays)
+
+    def _meralion_transcribe(self, audio_arrays: list[np.ndarray]) -> list[str]:
         conversation = [
             [{"role": "user", "content": self.prompt}] for _ in audio_arrays
         ]
@@ -127,6 +138,26 @@ class ASRManager:
                 for index, prediction in enumerate(cleaned)
             ]
         return cleaned
+
+    def _hybrid_transcribe(self, audio_arrays: list[np.ndarray]) -> list[str]:
+        """Use fast Whisper first, then MERaLiON only for suspicious outputs."""
+        whisper_predictions = self._whisper_transcribe(audio_arrays)
+        fallback_indexes = [
+            index
+            for index, prediction in enumerate(whisper_predictions)
+            if self._needs_meralion_fallback(prediction)
+        ]
+
+        if not fallback_indexes:
+            return whisper_predictions
+
+        fallback_audio = [audio_arrays[index] for index in fallback_indexes]
+        meralion_predictions = self._meralion_transcribe(fallback_audio)
+        merged = list(whisper_predictions)
+        for index, prediction in zip(fallback_indexes, meralion_predictions):
+            if prediction:
+                merged[index] = prediction
+        return merged
 
     def _load_whisper(self) -> None:
         try:
@@ -294,3 +325,19 @@ class ASRManager:
             if prediction.lower().startswith(prefix.lower()):
                 return prediction[len(prefix) :].strip()
         return prediction
+
+    def _needs_meralion_fallback(self, prediction: str) -> bool:
+        if len(prediction) < self.hybrid_min_chars:
+            return True
+
+        words = prediction.split()
+        if len(words) < self.hybrid_min_words:
+            return True
+        if len(words) >= 8:
+            counts = {}
+            for word in words:
+                key = word.lower().strip(".,!?;:")
+                counts[key] = counts.get(key, 0) + 1
+            if max(counts.values()) / len(words) > self.hybrid_max_repeat_ratio:
+                return True
+        return False
