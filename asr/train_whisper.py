@@ -69,14 +69,14 @@ class DataCollatorSpeechSeq2SeqWithPadding:
 
 def _audio_field(item: dict[str, Any]) -> str:
     for key in ("audio", "file", "path", "wav"):
-        if item.get(key):
+        if key in item and item[key] is not None:
             return str(item[key])
     raise KeyError(f"No audio path field in item: {item.keys()}")
 
 
 def _transcript_field(item: dict[str, Any]) -> str:
     for key in ("transcript", "text", "sentence"):
-        if item.get(key):
+        if key in item and item[key] is not None:
             return str(item[key])
     raise KeyError(f"No transcript field in item: {item.keys()}")
 
@@ -88,10 +88,13 @@ def load_dataset() -> Dataset:
             if not line.strip():
                 continue
             item = json.loads(line)
+            transcript = _transcript_field(item).strip()
+            if not transcript:
+                continue
             rows.append(
                 {
                     "audio": str(DATA_DIR / _audio_field(item)),
-                    "sentence": _transcript_field(item),
+                    "sentence": transcript,
                     "language": str(item.get("language", "")),
                 }
             )
