@@ -7,10 +7,11 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     HF_HOME=/workspace/.cache/huggingface \
     ASR_ENGINE=whisper \
     MERALION_MODEL_PATH=/workspace/models/MERaLiON-2-3B \
-    WHISPER_MODEL_PATH=/workspace/model/whisper-small-til26 \
-    WHISPER_BASE_MODEL_PATH=/workspace/models/whisper-small \
+    WHISPER_MODEL_PATH=/workspace/models/whisper-large-v3-turbo \
+    WHISPER_BASE_MODEL_PATH=/workspace/models/whisper-large-v3-turbo \
     ASR_USE_DEEPFILTERNET=0 \
-    ASR_USE_WHISPER_FALLBACK=1
+    ASR_USE_WHISPER_FALLBACK=1 \
+    ASR_MAX_NEW_TOKENS=256
 
 WORKDIR /workspace
 
@@ -33,7 +34,7 @@ RUN if [ "${ASR_ENGINE}" != "whisper" ]; then \
     fi
 
 # If no fine-tuned Whisper checkpoint was copied in, bake the base model.
-ARG WHISPER_MODEL_ID=openai/whisper-small
+ARG WHISPER_MODEL_ID=openai/whisper-large-v3-turbo
 RUN if [ ! -f "${WHISPER_MODEL_PATH}/config.json" ]; then \
         python -c "import os; from huggingface_hub import snapshot_download; snapshot_download(repo_id='${WHISPER_MODEL_ID}', local_dir=os.environ['WHISPER_BASE_MODEL_PATH'], local_dir_use_symlinks=False, ignore_patterns=['*.md', '*.png', '*.pdf'])"; \
     fi

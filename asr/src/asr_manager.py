@@ -180,36 +180,34 @@ class ASRManager:
             )
 
     def _whisper_transcribe(self, audio_arrays: list[np.ndarray]) -> list[str]:
-        predictions = []
         if self.whisper_model is None or self.whisper_processor is None:
             return ["" for _ in audio_arrays]
 
         forced_decoder_ids = self.whisper_processor.get_decoder_prompt_ids(
             task="transcribe",
         )
-        for audio in audio_arrays:
-            inputs = self.whisper_processor(
-                audio,
-                sampling_rate=TARGET_SAMPLE_RATE,
-                return_tensors="pt",
-            )
-            input_features = inputs.input_features.to(self.device)
-            if self.device.type == "cuda":
-                input_features = input_features.to(self.torch_dtype)
+        inputs = self.whisper_processor(
+            audio_arrays,
+            sampling_rate=TARGET_SAMPLE_RATE,
+            return_tensors="pt",
+            padding=True,
+        )
+        input_features = inputs.input_features.to(self.device)
+        if self.device.type == "cuda":
+            input_features = input_features.to(self.torch_dtype)
 
-            with self._lock, torch.inference_mode():
-                predicted_ids = self.whisper_model.generate(
-                    input_features,
-                    forced_decoder_ids=forced_decoder_ids,
-                    max_new_tokens=self.max_new_tokens,
-                    do_sample=False,
-                )
-            text = self.whisper_processor.batch_decode(
-                predicted_ids,
-                skip_special_tokens=True,
-            )[0]
-            predictions.append(self._clean_prediction(text))
-        return predictions
+        with self._lock, torch.inference_mode():
+            predicted_ids = self.whisper_model.generate(
+                input_features,
+                forced_decoder_ids=forced_decoder_ids,
+                max_new_tokens=self.max_new_tokens,
+                do_sample=False,
+            )
+        predictions = self.whisper_processor.batch_decode(
+            predicted_ids,
+            skip_special_tokens=True,
+        )
+        return [self._clean_prediction(prediction) for prediction in predictions]
 
     def _prepare_audio(self, audio_bytes: bytes) -> np.ndarray:
         audio, sample_rate = self._read_wav(audio_bytes)
