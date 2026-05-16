@@ -171,6 +171,7 @@ class AEManager:
     def _rule_act(self, observation: dict[str, Any], action_mask: list[int]) -> int:
         location = self._location(observation)
         direction = int(observation.get("direction", 0)) % 4
+        step = int(observation.get("step", self.last_step))
 
         escape = self._escape_danger(location, direction, action_mask)
         if escape is not None:
