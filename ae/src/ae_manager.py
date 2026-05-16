@@ -14,11 +14,11 @@ LOGGER = logging.getLogger(__name__)
 
 GRID_SIZE = int(os.getenv("AE_GRID_SIZE", "16"))
 CHECKPOINT_PATH = os.getenv("AE_CHECKPOINT_PATH", "/app/model/policy.zip")
-BASE_ATTACK_SCORE = float(os.getenv("AE_BASE_ATTACK_SCORE", "95.0"))
-AGENT_ATTACK_SCORE = float(os.getenv("AE_AGENT_ATTACK_SCORE", "25.0"))
-COLLECTIBLE_SCORE_MULT = float(os.getenv("AE_COLLECTIBLE_SCORE_MULT", "24.0"))
-PATH_LENGTH_PENALTY = float(os.getenv("AE_PATH_LENGTH_PENALTY", "1.45"))
-VISIT_PENALTY = float(os.getenv("AE_VISIT_PENALTY", "0.50"))
+BASE_ATTACK_SCORE = float(os.getenv("AE_BASE_ATTACK_SCORE", "140.0"))
+AGENT_ATTACK_SCORE = float(os.getenv("AE_AGENT_ATTACK_SCORE", "40.0"))
+COLLECTIBLE_SCORE_MULT = float(os.getenv("AE_COLLECTIBLE_SCORE_MULT", "18.0"))
+PATH_LENGTH_PENALTY = float(os.getenv("AE_PATH_LENGTH_PENALTY", "1.15"))
+VISIT_PENALTY = float(os.getenv("AE_VISIT_PENALTY", "0.35"))
 
 FORWARD = 0
 BACKWARD = 1
@@ -186,7 +186,6 @@ class AEManager:
             self.stuck_count >= 2
             and self._is_legal(PLACE_BOMB, action_mask)
             and self._adjacent_destructible_wall(location)
-            and self._can_escape_after_bomb(location)
         ):
             return PLACE_BOMB
 
