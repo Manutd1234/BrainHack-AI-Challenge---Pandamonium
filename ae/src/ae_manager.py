@@ -82,6 +82,7 @@ class AEManager:
     def __init__(self) -> None:
         self.policy = None
         self.policy_kind = ""
+        self.policy_mode = os.getenv("AE_POLICY_MODE", "hybrid").strip().lower()
         self._try_load_policy()
         self.reset()
 
@@ -117,7 +118,7 @@ class AEManager:
         if self._is_frozen(observation):
             return self._finish_action(STAY, observation)
 
-        if self.policy is not None:
+        if self.policy is not None and self.policy_mode == "ppo_first":
             action = self._policy_act(observation, action_mask)
             if self._is_legal(action, action_mask):
                 return self._finish_action(action, observation)
@@ -204,7 +205,31 @@ class AEManager:
         ):
             return PLACE_BOMB
 
+        if self.policy is not None and self.policy_mode == "hybrid":
+            action = self._safe_policy_act(observation, action_mask, location, direction)
+            if action is not None:
+                return action
+
         return self._fallback_action(location, direction, action_mask)
+
+    def _safe_policy_act(
+        self,
+        observation: dict[str, Any],
+        action_mask: list[int],
+        location: tuple[int, int],
+        direction: int,
+    ) -> int | None:
+        action = self._policy_act(observation, action_mask)
+        if not self._is_legal(action, action_mask):
+            return None
+        if action == PLACE_BOMB:
+            return action if self._can_escape_after_bomb(location) else None
+        if action in (FORWARD, BACKWARD):
+            destination = self._destination(location, direction, action)
+            return action if not self._dangerous(destination) else None
+        if action == STAY:
+            return action if not self._dangerous(location) else None
+        return action
 
     def _update_memory(self, observation: dict[str, Any]) -> None:
         location = self._location(observation)
