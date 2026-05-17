@@ -26,7 +26,7 @@ COPY model/best.pt /app/model/best.pt
 
 ENV CV_MODEL_PATH=/app/model/best.pt \
     CV_THRESHOLD_CONFIG=/app/src/cv_thresholds.json \
-    CV_USE_SAHI=1 \
+    CV_USE_SAHI=0 \
     CV_SAHI_MIN_SIZE=900 \
     CV_SAHI_SLICE_SIZE=768 \
     CV_SAHI_OVERLAP=0.25 \
