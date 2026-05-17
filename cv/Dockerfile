@@ -27,7 +27,7 @@ COPY model/ /app/model/
 RUN test -f /app/model/best.pt
 
 ENV CV_MODEL_PATH=/app/model/best.pt \
-    CV_MODEL_PATHS=/app/model/best.pt,/app/model/last.pt \
+    CV_MODEL_PATHS=/app/model/best.pt \
     CV_THRESHOLD_CONFIG=/app/src/cv_thresholds.json \
     CV_USE_SAHI=0 \
     CV_SAHI_MIN_SIZE=900 \
