@@ -64,7 +64,20 @@ def make_vec_env(num_envs: int, num_cpus: int):
         num_cpus=num_cpus,
         base_class="stable_baselines3",
     )
-    return VecMonitor(env)
+    return _patch_seed_method(VecMonitor(env))
+
+
+def _patch_seed_method(env):
+    """Add missing seed methods on Supersuit vec-env wrappers for SB3."""
+    current = env
+    while current is not None:
+        if not hasattr(current, "seed"):
+            def seed(seed_value=None, _env=current):
+                return [seed_value] * int(getattr(_env, "num_envs", 1))
+
+            current.seed = seed
+        current = getattr(current, "venv", None)
+    return env
 
 
 def train() -> None:
