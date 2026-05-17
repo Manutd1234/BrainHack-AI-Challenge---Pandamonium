@@ -55,7 +55,7 @@ def _config():
 
 def make_vec_env(num_envs: int, num_cpus: int):
     """Build a vectorized multi-agent self-play environment for SB3."""
-    env = parallel_basic_env(_config(), env_wrappers=[])
+    env = parallel_basic_env(env_wrappers=[], cfg=_config())
     env = ss.black_death_v3(env)
     env = ss.pettingzoo_env_to_vec_env_v1(env)
     env = ss.concat_vec_envs_v1(
