@@ -44,6 +44,10 @@ MAX_DETECTIONS = int(os.getenv("CV_MAX_DETECTIONS", THRESHOLD_CONFIG.get("max_de
 PRED_BATCH_SIZE = int(os.getenv("CV_PRED_BATCH_SIZE", "4"))
 USE_AUGMENT = os.getenv("CV_AUGMENT", "0").strip().lower() in {"1", "true", "yes"}
 FINAL_NMS_IOU = float(os.getenv("CV_FINAL_NMS_IOU", "0.55"))
+USE_WBF = os.getenv("CV_USE_WBF", "1").strip().lower() in {"1", "true", "yes"}
+FALLBACK_FLIP = os.getenv("CV_FALLBACK_FLIP", "0").strip().lower() in {"1", "true", "yes"}
+FALLBACK_MAX_COUNT = int(os.getenv("CV_FALLBACK_MAX_COUNT", "0"))
+FALLBACK_MIN_CONF = float(os.getenv("CV_FALLBACK_MIN_CONF", "0.35"))
 USE_SAHI = os.getenv("CV_USE_SAHI", "0").strip().lower() in {"1", "true", "yes"}
 SAHI_MIN_SIZE = int(os.getenv("CV_SAHI_MIN_SIZE", "640"))
 SAHI_SLICE_SIZE = int(os.getenv("CV_SAHI_SLICE_SIZE", "640"))
@@ -203,6 +207,13 @@ class CVManager:
                     batch_predictions[index].extend(formatted)
                     batch_confidences[index].extend(confidences)
 
+            if FALLBACK_FLIP:
+                for index, image in enumerate(batch):
+                    if self._needs_flip_fallback(batch_predictions[index], batch_confidences[index]):
+                        formatted, confidences = self._predict_horizontal_flip(image)
+                        batch_predictions[index].extend(formatted)
+                        batch_confidences[index].extend(confidences)
+
             predictions.extend(
                 self._postprocess_predictions(single_predictions, single_confidences)
                 for single_predictions, single_confidences in zip(
@@ -210,6 +221,64 @@ class CVManager:
                 )
             )
         return predictions
+
+    def _needs_flip_fallback(
+        self,
+        predictions: list[dict[str, Any]],
+        confidences: list[float],
+    ) -> bool:
+        if len(predictions) <= FALLBACK_MAX_COUNT:
+            return True
+        return bool(confidences and max(confidences) < FALLBACK_MIN_CONF)
+
+    def _predict_horizontal_flip(self, image: np.ndarray) -> tuple[list[dict[str, Any]], list[float]]:
+        flipped = cv2.flip(image, 1)
+        height, width = image.shape[:2]
+        predictions: list[dict[str, Any]] = []
+        kept_confidences: list[float] = []
+
+        for model in self.models:
+            results = model.predict(
+                [flipped],
+                conf=max(0.01, DEFAULT_CONF * 0.75),
+                iou=DEFAULT_IOU,
+                imgsz=DEFAULT_IMGSZ,
+                half=self.device == "cuda",
+                augment=False,
+                max_det=max(MAX_DETECTIONS * 3, MAX_DETECTIONS),
+                verbose=False,
+                device=self.device,
+            )
+            result = results[0]
+            if result.boxes is None or len(result.boxes) == 0:
+                continue
+            boxes_xywh = result.boxes.xywh.detach().cpu().numpy()
+            class_ids = result.boxes.cls.detach().cpu().numpy().astype(int)
+            confidences = result.boxes.conf.detach().cpu().numpy()
+            for xywh, category_id, confidence in zip(boxes_xywh, class_ids, confidences):
+                if category_id < 0 or category_id >= len(CLASS_NAMES):
+                    continue
+                if confidence < CLASS_CONF.get(int(category_id), DEFAULT_CONF):
+                    continue
+                unflipped_xywh = np.array(xywh, dtype=np.float32)
+                unflipped_xywh[0] = float(width) - float(unflipped_xywh[0])
+                left, top, box_width, box_height = self._xywh_to_ltwh(
+                    unflipped_xywh,
+                    width,
+                    height,
+                )
+                if box_width <= 0 or box_height <= 0:
+                    continue
+                predictions.append(
+                    {
+                        "bbox": [left, top, box_width, box_height],
+                        "category_id": int(category_id),
+                        "_confidence": float(confidence),
+                    }
+                )
+                kept_confidences.append(float(confidence))
+
+        return predictions, kept_confidences
 
     def _predict_sahi(self, image: np.ndarray) -> list[dict[str, Any]]:
         from sahi.predict import get_sliced_prediction
@@ -319,6 +388,8 @@ class CVManager:
     ) -> list[dict[str, Any]]:
         if not predictions:
             return []
+        if USE_WBF:
+            return self._classwise_weighted_fusion(predictions, confidences)
 
         kept: list[dict[str, Any]] = []
         by_class: dict[int, list[int]] = {}
@@ -336,6 +407,46 @@ class CVManager:
                     if self._bbox_iou(predictions[current]["bbox"], predictions[other]["bbox"])
                     < FINAL_NMS_IOU
                 ]
+
+        kept.sort(key=lambda prediction: float(prediction.get("_confidence", 1.0)), reverse=True)
+        return kept
+
+    def _classwise_weighted_fusion(
+        self,
+        predictions: list[dict[str, Any]],
+        confidences: list[float],
+    ) -> list[dict[str, Any]]:
+        kept: list[dict[str, Any]] = []
+        by_class: dict[int, list[int]] = {}
+        for index, prediction in enumerate(predictions):
+            by_class.setdefault(int(prediction["category_id"]), []).append(index)
+
+        for category_id, indices in by_class.items():
+            ordered = sorted(indices, key=lambda index: confidences[index], reverse=True)
+            while ordered:
+                current = ordered.pop(0)
+                group = [current]
+                remaining = []
+                for other in ordered:
+                    if self._bbox_iou(predictions[current]["bbox"], predictions[other]["bbox"]) >= FINAL_NMS_IOU:
+                        group.append(other)
+                    else:
+                        remaining.append(other)
+                ordered = remaining
+
+                weights = np.asarray(
+                    [max(1e-6, confidences[index]) for index in group],
+                    dtype=np.float32,
+                )
+                boxes = np.asarray([predictions[index]["bbox"] for index in group], dtype=np.float32)
+                fused_box = np.average(boxes, axis=0, weights=weights).tolist()
+                kept.append(
+                    {
+                        "bbox": [float(value) for value in fused_box],
+                        "category_id": int(category_id),
+                        "_confidence": float(max(confidences[index] for index in group)),
+                    }
+                )
 
         kept.sort(key=lambda prediction: float(prediction.get("_confidence", 1.0)), reverse=True)
         return kept
