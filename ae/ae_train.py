@@ -12,7 +12,9 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+import numpy as np
 import supersuit as ss
+from gymnasium import spaces
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import CheckpointCallback, EvalCallback
 from stable_baselines3.common.vec_env import VecMonitor
@@ -56,6 +58,7 @@ def _config():
 def make_vec_env(num_envs: int, num_cpus: int):
     """Build a vectorized multi-agent self-play environment for SB3."""
     env = parallel_basic_env(env_wrappers=[], cfg=_config())
+    env = _patch_observation_dtypes(env)
     env = ss.pettingzoo_env_to_vec_env_v1(env)
     env = ss.concat_vec_envs_v1(
         env,
@@ -64,6 +67,43 @@ def make_vec_env(num_envs: int, num_cpus: int):
         base_class="stable_baselines3",
     )
     return _patch_seed_method(VecMonitor(env))
+
+
+def _patch_observation_dtypes(env):
+    """Cast env observations to the dtypes declared by their spaces."""
+    original_reset = env.reset
+    original_step = env.step
+
+    def cast_many(observations):
+        return {
+            agent: _cast_to_space(observation, env.observation_space(agent))
+            for agent, observation in observations.items()
+        }
+
+    def reset(*args, **kwargs):
+        observations, infos = original_reset(*args, **kwargs)
+        return cast_many(observations), infos
+
+    def step(actions):
+        observations, rewards, terminations, truncations, infos = original_step(actions)
+        return cast_many(observations), rewards, terminations, truncations, infos
+
+    env.reset = reset
+    env.step = step
+    return env
+
+
+def _cast_to_space(value, space):
+    if isinstance(space, spaces.Dict):
+        return {
+            key: _cast_to_space(value[key], subspace)
+            for key, subspace in space.spaces.items()
+        }
+    if isinstance(space, spaces.Box):
+        return np.asarray(value, dtype=space.dtype)
+    if isinstance(space, spaces.Discrete):
+        return np.asarray(value, dtype=space.dtype)
+    return value
 
 
 def _patch_seed_method(env):
