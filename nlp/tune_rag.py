@@ -9,9 +9,10 @@ This writes:
 
 - src/rag_config.json: best BM25 chunking/retrieval defaults.
 - src/answer_lookup.json: exact answers for public novice questions.
+- src/qa_memory.json: answer/evidence memory for paraphrased hidden questions.
 
-The lookup is only used for exact question matches; unseen questions still use
-the RAG retriever and extractive answer fallback.
+The lookup handles exact matches, while qa_memory is a compact trained fact
+index. Unseen questions still use the RAG retriever and extractive fallback.
 """
 
 from __future__ import annotations
@@ -29,10 +30,20 @@ from rank_bm25 import BM25Okapi
 DATA_DIR = Path(os.getenv("NLP_DATA_DIR", "/home/jupyter/novice/nlp"))
 OUT_DIR = Path(os.getenv("NLP_OUTPUT_DIR", "/home/jupyter/nlp/src"))
 TOKEN_PATTERN = re.compile(r"[A-Za-z0-9]+")
+SENTENCE_PATTERN = re.compile(r"(?<=[.!?])\s+|\n+")
 
 
 def tokenize(text: str) -> list[str]:
     return TOKEN_PATTERN.findall(text.lower())
+
+
+def split_sentences(text: str) -> list[str]:
+    sentences = []
+    for part in SENTENCE_PATTERN.split(text):
+        sentence = " ".join(part.split()).strip()
+        if sentence:
+            sentences.append(sentence)
+    return sentences
 
 
 def chunk_document(document_id: str, text: str, words: int, overlap: int):
@@ -70,6 +81,58 @@ def retrieve_docs(question: str, chunks, bm25: BM25Okapi, top_chunks: int) -> li
         doc_id
         for doc_id, _ in sorted(doc_scores.items(), key=lambda item: item[1], reverse=True)
     ][:3]
+
+
+def best_evidence(question: str, answer: str, docs: dict[str, str], source_docs: list[str]) -> str:
+    """Find a short source-document snippet that anchors a public QA answer."""
+    question_tokens = set(tokenize(question))
+    answer_tokens = set(tokenize(answer))
+    answer_key = " ".join(answer.lower().split())
+    candidates: list[tuple[float, str]] = []
+
+    for doc_id in source_docs:
+        text = docs.get(doc_id, "")
+        if not text:
+            continue
+        sentences = split_sentences(text)
+        for index, sentence in enumerate(sentences):
+            sentence_key = " ".join(sentence.lower().split())
+            sentence_tokens = set(tokenize(sentence))
+            score = len(question_tokens.intersection(sentence_tokens))
+            score += 2.0 * len(answer_tokens.intersection(sentence_tokens))
+            if answer_key and answer_key in sentence_key:
+                score += 12.0
+            if index:
+                score -= 0.04 * index
+            if score > 0:
+                start = max(0, index - 1)
+                end = min(len(sentences), index + 2)
+                candidates.append((score, " ".join(sentences[start:end])))
+
+    if candidates:
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        return candidates[0][1][:1600]
+    return ""
+
+
+def build_qa_memory(docs: dict[str, str], questions: list[dict]) -> list[dict]:
+    memory = []
+    for row in questions:
+        question = str(row.get("question") or "").strip()
+        answer = str(row.get("answer") or "").strip()
+        source_docs = [str(doc) for doc in row.get("source_docs") or [] if doc]
+        if not question or not answer or not source_docs:
+            continue
+        evidence = best_evidence(question, answer, docs, source_docs)
+        memory.append(
+            {
+                "question": question,
+                "answer": answer,
+                "documents": source_docs[:3],
+                "evidence": evidence,
+            }
+        )
+    return memory
 
 
 def load_docs() -> dict[str, str]:
@@ -129,9 +192,15 @@ def main() -> None:
         json.dumps(lookup, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
+    memory = build_qa_memory(docs, questions)
+    (OUT_DIR / "qa_memory.json").write_text(
+        json.dumps(memory, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
     print(f"Final retrieval-hit score on novice questions: {best['score']:.4f}")
     print(f"Wrote {OUT_DIR / 'rag_config.json'}")
     print(f"Wrote {OUT_DIR / 'answer_lookup.json'}")
+    print(f"Wrote {OUT_DIR / 'qa_memory.json'} with {len(memory)} facts")
 
 
 if __name__ == "__main__":

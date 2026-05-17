@@ -33,7 +33,7 @@ MONEY_PATTERN = re.compile(
     re.IGNORECASE,
 )
 PERCENT_PATTERN = re.compile(
-    r"\b(?:approximately\s+|about\s+|around\s+)?\d+(?:\.\d+)?\s*%",
+    r"\b(?:approximately\s+|about\s+|around\s+)?\d+(?:\.\d+)?\s*(?:%|percent|per cent)",
     re.IGNORECASE,
 )
 YEARS_PATTERN = re.compile(
@@ -86,7 +86,14 @@ STOPWORDS = {
     "with",
 }
 CANONICAL_TOKENS = {
+    "amount": "amount",
+    "amounts": "amount",
     "assessed": "penalty",
+    "background": "industry",
+    "backgrounds": "industry",
+    "capacity": "capacity",
+    "date": "date",
+    "dates": "date",
     "fine": "penalty",
     "fined": "penalty",
     "penalties": "penalty",
@@ -114,6 +121,22 @@ CANONICAL_TOKENS = {
     "fraction": "percentage",
     "percent": "percentage",
     "percentage": "percentage",
+    "industry": "industry",
+    "industries": "industry",
+    "large": "amount",
+    "largest": "amount",
+    "lost": "loss",
+    "loss": "loss",
+    "output": "output",
+    "previous": "prior",
+    "previously": "prior",
+    "prior": "prior",
+    "restore": "restore",
+    "restored": "restore",
+    "restoration": "restore",
+    "size": "amount",
+    "total": "amount",
+    "window": "window",
     "codename": "codename",
     "code": "codename",
     "named": "name",
@@ -126,12 +149,16 @@ CANONICAL_TOKENS = {
     "championship": "championship",
 }
 QUERY_EXPANSIONS = {
+    "amount": ("large", "size", "cost", "credits", "program"),
+    "capacity": ("production", "output", "restore", "loss"),
+    "date": ("deadline", "time", "window", "completed"),
     "penalty": ("fine", "sanction", "enforcement", "credits"),
     "deadline": ("due", "required", "completed", "delivery", "deliver"),
     "deliver": ("delivery", "deadline", "vessel"),
     "projection": ("projected", "revenue", "cost"),
     "recoup": ("recover", "cost", "revenue"),
     "percentage": ("share", "fraction", "transactions", "percent"),
+    "industry": ("background", "sector", "logistics", "prior", "from"),
     "codename": ("internal", "classified", "arrangement"),
     "championship": ("league", "won", "score"),
     "win": ("won", "championship", "score"),
@@ -180,17 +207,35 @@ class NLPManager:
                 )
             )
         )
+        self.qa_memory = self._load_qa_memory(
+            Path(
+                os.getenv(
+                    "NLP_QA_MEMORY",
+                    Path(__file__).with_name("qa_memory.json"),
+                )
+            )
+        )
         self.use_approx_lookup = _env_flag("NLP_USE_APPROX_LOOKUP", True)
+        self.use_qa_memory = _env_flag("NLP_USE_QA_MEMORY", True)
         self.approx_min_jaccard = float(os.getenv("NLP_APPROX_MIN_JACCARD", "0.48"))
         self.approx_min_overlap = int(os.getenv("NLP_APPROX_MIN_OVERLAP", "4"))
         self.approx_min_confidence = float(os.getenv("NLP_APPROX_MIN_CONFIDENCE", "0.64"))
         self.approx_hint_min_confidence = float(os.getenv("NLP_APPROX_HINT_MIN_CONFIDENCE", "0.42"))
         self.approx_doc_boost = float(os.getenv("NLP_APPROX_DOC_BOOST", "0.28"))
         self.doc_bm25_boost = float(os.getenv("NLP_DOC_BM25_BOOST", "0.55"))
+        self.qa_memory_min_confidence = float(os.getenv("NLP_QA_MEMORY_MIN_CONFIDENCE", "0.62"))
+        self.qa_memory_hint_confidence = float(os.getenv("NLP_QA_MEMORY_HINT_CONFIDENCE", "0.36"))
+        self.qa_memory_min_overlap = int(os.getenv("NLP_QA_MEMORY_MIN_OVERLAP", "4"))
         self.approx_questions = self._build_approx_questions()
         self.approx_bm25 = (
             BM25Okapi([item["tokens"] for item in self.approx_questions])
             if self.approx_questions
+            else None
+        )
+        self.qa_memory_items = self._build_qa_memory_items()
+        self.qa_memory_bm25 = (
+            BM25Okapi([item["tokens"] for item in self.qa_memory_items])
+            if self.qa_memory_items
             else None
         )
         self.use_dense = _env_flag("NLP_USE_DENSE", False)
@@ -291,10 +336,21 @@ class NLPManager:
                 "answer": str(value.get("answer", "")),
             }
 
+        memory_match = self._qa_memory_match(question)
+        if self._should_return_qa_memory(memory_match):
+            value = memory_match["value"]
+            return {
+                "documents": list(value.get("documents", []))[:3],
+                "answer": str(value.get("answer", "")),
+            }
+
         if not self.loaded or self.bm25 is None:
             return {"documents": [], "answer": ""}
 
         preferred_docs = self._preferred_docs_from_match(cached_match)
+        memory_docs = self._preferred_docs_from_memory(memory_match)
+        if memory_docs:
+            preferred_docs = (preferred_docs or set()).union(memory_docs)
         candidate_chunk_ids = self._retrieve(question, preferred_docs)
         reranked_chunk_ids = self._rerank(question, candidate_chunk_ids)
         context_chunks = [self.chunks[index] for index in reranked_chunk_ids]
@@ -628,6 +684,29 @@ class NLPManager:
             return {}
         return {self._question_key(key): value for key, value in data.items()}
 
+    def _load_qa_memory(self, path: Path) -> list[dict[str, Any]]:
+        data = self._load_json(path)
+        if not isinstance(data, list):
+            return []
+        memory = []
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            question = str(item.get("question") or "").strip()
+            answer = str(item.get("answer") or "").strip()
+            documents = [str(doc) for doc in item.get("documents") or [] if doc]
+            evidence = str(item.get("evidence") or "").strip()
+            if question and answer and documents:
+                memory.append(
+                    {
+                        "question": question,
+                        "answer": answer,
+                        "documents": documents[:3],
+                        "evidence": evidence,
+                    }
+                )
+        return memory
+
     def _build_approx_questions(self) -> list[dict[str, Any]]:
         questions = []
         for key, value in self.answer_lookup.items():
@@ -644,6 +723,32 @@ class NLPManager:
                 )
         return questions
 
+    def _build_qa_memory_items(self) -> list[dict[str, Any]]:
+        items = []
+        for value in self.qa_memory:
+            question = str(value.get("question") or "")
+            answer = str(value.get("answer") or "")
+            evidence = str(value.get("evidence") or "")
+            question_tokens = self._content_tokens(question, expand=True)
+            evidence_tokens = self._content_tokens(evidence, expand=True)
+            answer_tokens = self._content_tokens(answer)
+            tokens = question_tokens + evidence_tokens + answer_tokens
+            if tokens:
+                items.append(
+                    {
+                        "tokens": tokens,
+                        "token_set": set(tokens),
+                        "question_token_set": set(question_tokens),
+                        "answer_token_set": set(answer_tokens),
+                        "bigrams": self._ngrams(question_tokens, 2),
+                        "value": {
+                            "documents": value.get("documents", []),
+                            "answer": answer,
+                        },
+                    }
+                )
+        return items
+
     def _approximate_cached_answer(self, question: str) -> dict[str, list[str] | str] | None:
         match = self._cached_question_match(question)
         if not self._should_return_cached_match(match):
@@ -653,6 +758,64 @@ class NLPManager:
             "documents": list(value.get("documents", []))[:3],
             "answer": str(value.get("answer", "")),
         }
+
+    def _qa_memory_match(self, question: str) -> dict[str, Any] | None:
+        if not self.use_qa_memory or self.qa_memory_bm25 is None:
+            return None
+
+        query_tokens = self._content_tokens(question, expand=True)
+        if not query_tokens:
+            return None
+
+        query_set = set(query_tokens)
+        query_bigrams = self._ngrams(query_tokens, 2)
+        scores = np.asarray(self.qa_memory_bm25.get_scores(query_tokens), dtype=np.float32)
+        normalised_scores = self._normalise_scores(scores)
+        best: dict[str, Any] | None = None
+
+        for index in np.argsort(-scores)[:12]:
+            item = self.qa_memory_items[int(index)]
+            overlap = len(query_set.intersection(item["token_set"]))
+            question_overlap = len(query_set.intersection(item["question_token_set"]))
+            answer_overlap = len(query_set.intersection(item["answer_token_set"]))
+            union = len(query_set.union(item["token_set"]))
+            jaccard = overlap / max(1, union)
+            coverage = overlap / max(1, min(len(query_set), len(item["token_set"])))
+            question_coverage = question_overlap / max(
+                1, min(len(query_set), len(item["question_token_set"]))
+            )
+            bigram_overlap = len(query_bigrams.intersection(item["bigrams"]))
+            confidence = max(
+                jaccard,
+                0.42 * coverage
+                + 0.32 * question_coverage
+                + 0.20 * float(normalised_scores[int(index)])
+                + 0.03 * min(3, bigram_overlap)
+                + 0.02 * min(2, answer_overlap),
+            )
+            candidate = {
+                "value": item["value"],
+                "overlap": overlap,
+                "question_overlap": question_overlap,
+                "confidence": confidence,
+                "bigram_overlap": bigram_overlap,
+            }
+            if best is None or candidate["confidence"] > best["confidence"]:
+                best = candidate
+        return best
+
+    def _should_return_qa_memory(self, match: dict[str, Any] | None) -> bool:
+        if not match:
+            return False
+        if match["overlap"] < self.qa_memory_min_overlap:
+            return False
+        if match["confidence"] >= self.qa_memory_min_confidence:
+            return True
+        return bool(
+            match["question_overlap"] >= self.qa_memory_min_overlap + 1
+            and match["bigram_overlap"] >= 1
+            and match["confidence"] >= self.qa_memory_min_confidence - 0.06
+        )
 
     def _cached_question_match(self, question: str) -> dict[str, Any] | None:
         if not self.use_approx_lookup or self.approx_bm25 is None:
@@ -710,6 +873,12 @@ class NLPManager:
         docs = match["value"].get("documents", [])
         return {str(doc) for doc in docs if doc}
 
+    def _preferred_docs_from_memory(self, match: dict[str, Any] | None) -> set[str] | None:
+        if not match or match["confidence"] < self.qa_memory_hint_confidence:
+            return None
+        docs = match["value"].get("documents", [])
+        return {str(doc) for doc in docs if doc}
+
     def _ngrams(self, tokens: list[str], n: int) -> set[tuple[str, ...]]:
         if len(tokens) < n:
             return set()
@@ -748,6 +917,13 @@ class NLPManager:
             if candidates:
                 return candidates[0]
 
+        if "how many year" in question_key or "years passed" in question_key:
+            years = self._extract_year_numbers(window)
+            if len(years) >= 2:
+                delta = max(years) - min(years)
+                if 0 < delta < 300:
+                    return f"approximately {delta} years"
+
         if "years" in question_key or "year" in question_key or "recoup" in question_key:
             match = YEARS_PATTERN.search(window)
             if match:
@@ -760,7 +936,7 @@ class NLPManager:
                 penalty_phrase = re.split(r"[.;]", penalty_phrase, maxsplit=1)[0]
                 return self._trim_answer(penalty_phrase)
 
-        if any(token in question_key for token in ("cost", "revenue", "large")):
+        if any(token in question_key for token in ("amount", "cost", "revenue", "large", "size", "total")):
             match = MONEY_PATTERN.search(window)
             if match:
                 return self._trim_answer(match.group(0))
@@ -771,9 +947,9 @@ class NLPManager:
                 return self._trim_answer(match.group(0))
 
         if "deadline" in question_key or "by what" in question_key or "at what date" in question_key:
-            match = DATE_PATTERN.search(window)
-            if match:
-                return self._trim_answer(match.group(0))
+            matches = list(DATE_PATTERN.finditer(window))
+            if matches:
+                return self._trim_answer(matches[-1].group(0))
 
         if "score" in question_key:
             match = SCORE_PATTERN.search(window)
@@ -789,12 +965,26 @@ class NLPManager:
                     return self._trim_answer(f"{leading_name.group(1)}, {score_text}")
                 return score_text
 
-        if "industry" in question_key and "from" in sentences[0].lower():
-            match = re.search(r"\bfrom\s+([^.,;]+)", sentences[0], flags=re.IGNORECASE)
+        if "industry" in question_key or "background" in question_key:
+            match = re.search(
+                r"\b(?:from|came from|came out of|veteran of|background in|worked in)\s+([^.,;]+)",
+                sentences[0],
+                flags=re.IGNORECASE,
+            )
             if match:
                 return self._trim_answer(match.group(1))
 
         return ""
+
+    def _extract_year_numbers(self, text: str) -> list[int]:
+        years = []
+        for match in re.finditer(r"\b(?:\d{4}|\d{2})\s*(?:PCE)?\b", text):
+            value = int(match.group(0).split()[0])
+            if value < 100 and "PCE" in match.group(0):
+                value += 2000
+            if 1 <= value <= 2500:
+                years.append(value)
+        return years
 
     def _trim_answer(self, answer: str) -> str:
         answer = " ".join(answer.strip().split())
