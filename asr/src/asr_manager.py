@@ -54,6 +54,8 @@ class ASRManager:
             os.getenv("ASR_HYBRID_MIN_WORDS_PER_SECOND", "0.45")
         )
         self.use_deepfilter = _env_flag("ASR_USE_DEEPFILTERNET", False)
+        self.deepfilter_mode = os.getenv("ASR_DF_MODE", "selective").strip().lower()
+        self.use_df_rescue = _env_flag("ASR_USE_DF_RESCUE", True)
         self.use_whisper_fallback = _env_flag("ASR_USE_WHISPER_FALLBACK", True)
         self.whisper_path = os.getenv(
             "WHISPER_MODEL_PATH",
@@ -162,9 +164,42 @@ class ASRManager:
         if not fallback_indexes:
             return whisper_predictions
 
-        fallback_audio = [audio_arrays[index] for index in fallback_indexes]
-        meralion_predictions = self._meralion_transcribe(fallback_audio)
         merged = list(whisper_predictions)
+
+        if (
+            self.use_df_rescue
+            and self.use_deepfilter
+            and self._df_enhance is not None
+        ):
+            denoised_audio = [
+                self._denoise_to_target(audio_arrays[index])
+                for index in fallback_indexes
+            ]
+            denoised_predictions = self._whisper_transcribe(denoised_audio)
+            remaining_indexes = []
+            remaining_audio = []
+            for index, audio, prediction in zip(
+                fallback_indexes,
+                denoised_audio,
+                denoised_predictions,
+            ):
+                if prediction and not self._needs_meralion_fallback(
+                    prediction,
+                    len(audio) / TARGET_SAMPLE_RATE,
+                ):
+                    merged[index] = prediction
+                else:
+                    remaining_indexes.append(index)
+                    remaining_audio.append(audio)
+            fallback_indexes = remaining_indexes
+            fallback_audio = remaining_audio
+        else:
+            fallback_audio = [audio_arrays[index] for index in fallback_indexes]
+
+        if not fallback_indexes:
+            return merged
+
+        meralion_predictions = self._meralion_transcribe(fallback_audio)
         for index, prediction in zip(fallback_indexes, meralion_predictions):
             if prediction:
                 merged[index] = prediction
@@ -255,7 +290,11 @@ class ASRManager:
         audio, sample_rate = self._read_wav(audio_bytes)
         audio = self._limit_duration(audio, sample_rate)
 
-        if self.use_deepfilter and self._df_enhance is not None:
+        if (
+            self.use_deepfilter
+            and self._df_enhance is not None
+            and self.deepfilter_mode in {"1", "true", "yes", "always", "all"}
+        ):
             audio, sample_rate = self._denoise(audio, sample_rate)
 
         if sample_rate != TARGET_SAMPLE_RATE:
@@ -267,6 +306,17 @@ class ASRManager:
 
         audio = self._limit_duration(audio, TARGET_SAMPLE_RATE)
         return np.ascontiguousarray(audio, dtype=np.float32)
+
+    def _denoise_to_target(self, audio: np.ndarray) -> np.ndarray:
+        enhanced, sample_rate = self._denoise(audio, TARGET_SAMPLE_RATE)
+        if sample_rate != TARGET_SAMPLE_RATE:
+            enhanced = librosa.resample(
+                enhanced,
+                orig_sr=sample_rate,
+                target_sr=TARGET_SAMPLE_RATE,
+            )
+        enhanced = self._limit_duration(enhanced, TARGET_SAMPLE_RATE)
+        return np.ascontiguousarray(enhanced, dtype=np.float32)
 
     def _read_wav(self, audio_bytes: bytes) -> tuple[np.ndarray, int]:
         audio, sample_rate = sf.read(

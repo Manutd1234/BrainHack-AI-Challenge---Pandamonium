@@ -9,7 +9,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     MERALION_MODEL_PATH=/workspace/models/MERaLiON-2-3B \
     WHISPER_MODEL_PATH=/workspace/models/whisper-large-v3-turbo \
     WHISPER_BASE_MODEL_PATH=/workspace/models/whisper-large-v3-turbo \
-    ASR_USE_DEEPFILTERNET=0 \
+    ASR_USE_DEEPFILTERNET=1 \
+    ASR_DF_MODE=selective \
+    ASR_USE_DF_RESCUE=1 \
     ASR_USE_WHISPER_FALLBACK=1 \
     ASR_MAX_NEW_TOKENS=256 \
     ASR_HYBRID_MIN_CHARS=24 \
@@ -23,6 +25,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ffmpeg \
         git \
         libsndfile1 \
+        rustc \
+        cargo \
     && rm -rf /var/lib/apt/lists/*
 
 RUN pip install --upgrade pip setuptools wheel
