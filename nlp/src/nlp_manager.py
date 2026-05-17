@@ -36,6 +36,22 @@ PERCENT_PATTERN = re.compile(
     r"\b(?:approximately\s+|about\s+|around\s+)?\d+(?:\.\d+)?\s*(?:%|percent|per cent)",
     re.IGNORECASE,
 )
+DURATION_PATTERN = re.compile(
+    r"\b(?:approximately\s+|about\s+|around\s+)?"
+    r"(?:one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|\d+)"
+    r"\s+(?:hours?|days?|weeks?|months?)\b",
+    re.IGNORECASE,
+)
+NUMBER_UNIT_PATTERN = re.compile(
+    r"\b(?:approximately\s+|about\s+|around\s+)?"
+    r"(?:\d+(?:,\d{3})*(?:\.\d+)?|one|two|three|four|five|six|seven|eight|nine|ten|"
+    r"eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|"
+    r"twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety|hundred|thousand)"
+    r"(?:[-\s](?:\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|"
+    r"hundred|thousand))*\s+"
+    r"(?:vessels?|ships?|teams?|cells?|kilograms?|kg|points?|credits?|interfaces?|transactions?)\b",
+    re.IGNORECASE,
+)
 YEARS_PATTERN = re.compile(
     r"\b(?:approximately\s+|about\s+|around\s+|less than\s+|more than\s+)?"
     r"(?:one|two|three|four|five|six|seven|eight|nine|ten|\d+)"
@@ -47,6 +63,20 @@ SCORE_PATTERN = re.compile(
     re.IGNORECASE,
 )
 UPPER_TOKEN_PATTERN = re.compile(r"\b[A-Z][A-Z0-9-]{2,}\b")
+ENTITY_PATTERN = re.compile(
+    r"\b[A-Z][A-Za-z0-9'&-]+(?:\s+(?:of|the|and|&|[A-Z][A-Za-z0-9'&-]+)){0,5}\b"
+)
+ACRONYM_EXCLUDE = {
+    "AIS",
+    "CGC",
+    "DOC",
+    "EA",
+    "PCE",
+    "Q1",
+    "Q2",
+    "Q3",
+    "Q4",
+}
 STOPWORDS = {
     "a",
     "an",
@@ -88,10 +118,14 @@ STOPWORDS = {
 CANONICAL_TOKENS = {
     "amount": "amount",
     "amounts": "amount",
+    "announced": "announce",
+    "announcement": "announce",
     "assessed": "penalty",
     "background": "industry",
     "backgrounds": "industry",
     "capacity": "capacity",
+    "companies": "company",
+    "company": "company",
     "date": "date",
     "dates": "date",
     "fine": "penalty",
@@ -123,11 +157,18 @@ CANONICAL_TOKENS = {
     "percentage": "percentage",
     "industry": "industry",
     "industries": "industry",
+    "leader": "person",
+    "leaders": "person",
     "large": "amount",
     "largest": "amount",
     "lost": "loss",
     "loss": "loss",
     "output": "output",
+    "organizations": "organization",
+    "organisation": "organization",
+    "organisations": "organization",
+    "organization": "organization",
+    "person": "person",
     "previous": "prior",
     "previously": "prior",
     "prior": "prior",
@@ -135,6 +176,8 @@ CANONICAL_TOKENS = {
     "restored": "restore",
     "restoration": "restore",
     "size": "amount",
+    "team": "team",
+    "teams": "team",
     "total": "amount",
     "window": "window",
     "codename": "codename",
@@ -150,7 +193,9 @@ CANONICAL_TOKENS = {
 }
 QUERY_EXPANSIONS = {
     "amount": ("large", "size", "cost", "credits", "program"),
+    "announce": ("announced", "revealed", "launched"),
     "capacity": ("production", "output", "restore", "loss"),
+    "company": ("corporation", "enterprise", "contractor", "operator"),
     "date": ("deadline", "time", "window", "completed"),
     "penalty": ("fine", "sanction", "enforcement", "credits"),
     "deadline": ("due", "required", "completed", "delivery", "deliver"),
@@ -159,6 +204,9 @@ QUERY_EXPANSIONS = {
     "recoup": ("recover", "cost", "revenue"),
     "percentage": ("share", "fraction", "transactions", "percent"),
     "industry": ("background", "sector", "logistics", "prior", "from"),
+    "organization": ("company", "agency", "directorate", "network"),
+    "person": ("who", "chairperson", "ceo", "commander", "director"),
+    "team": ("league", "championship", "won", "score"),
     "codename": ("internal", "classified", "arrangement"),
     "championship": ("league", "won", "score"),
     "win": ("won", "championship", "score"),
@@ -1073,9 +1121,20 @@ class NLPManager:
         window = " ".join(sentences[:3])
 
         if "codename" in question_key or "code name" in question_key:
-            candidates = [token for token in UPPER_TOKEN_PATTERN.findall(window) if token != "PCE"]
-            if candidates:
-                return candidates[0]
+            candidate = self._uppercase_answer(question_key, window)
+            if candidate:
+                return candidate
+
+        if (
+            any(token in question_key for token in ("date", "time", "restore", "capacity"))
+            and any(token in question_key for token in ("fraction", "percentage", "percent", "lost", "loss"))
+        ):
+            dates = list(DATE_PATTERN.finditer(window))
+            pct = PERCENT_PATTERN.search(window)
+            if dates and pct:
+                return self._trim_answer(
+                    f"{dates[-1].group(0)}, with {pct.group(0)} of normal output lost"
+                )
 
         if "how many year" in question_key or "years passed" in question_key:
             years = self._extract_year_numbers(window)
@@ -1100,30 +1159,35 @@ class NLPManager:
             match = MONEY_PATTERN.search(window)
             if match:
                 return self._trim_answer(match.group(0))
+            unit_match = NUMBER_UNIT_PATTERN.search(window)
+            if unit_match:
+                return self._trim_answer(unit_match.group(0))
 
         if any(token in question_key for token in ("share", "fraction", "percentage", "percent")):
             match = PERCENT_PATTERN.search(window)
             if match:
                 return self._trim_answer(match.group(0))
 
-        if "deadline" in question_key or "by what" in question_key or "at what date" in question_key:
+        if "how many" in question_key or "how much" in question_key:
+            for pattern in (MONEY_PATTERN, PERCENT_PATTERN, DURATION_PATTERN, NUMBER_UNIT_PATTERN):
+                match = pattern.search(window)
+                if match:
+                    return self._trim_answer(match.group(0))
+
+        if (
+            "deadline" in question_key
+            or "by what" in question_key
+            or "at what date" in question_key
+            or question_key.startswith("when ")
+        ):
             matches = list(DATE_PATTERN.finditer(window))
             if matches:
                 return self._trim_answer(matches[-1].group(0))
 
-        if "score" in question_key:
-            match = SCORE_PATTERN.search(window)
-            if match:
-                score_text = self._trim_answer(match.group(0))
-                sentence = sentences[0]
-                leading_name = re.search(
-                    r"\b([A-Z][A-Za-z0-9'-]+(?:\s+[A-Z][A-Za-z0-9'-]+){0,3})\b.*?"
-                    + re.escape(score_text),
-                    sentence,
-                )
-                if leading_name:
-                    return self._trim_answer(f"{leading_name.group(1)}, {score_text}")
-                return score_text
+        if "score" in question_key or "team" in question_key or "championship" in question_key:
+            score_answer = self._score_answer(question_key, sentences)
+            if score_answer:
+                return score_answer
 
         if "industry" in question_key or "background" in question_key:
             match = re.search(
@@ -1132,8 +1196,90 @@ class NLPManager:
                 flags=re.IGNORECASE,
             )
             if match:
-                return self._trim_answer(match.group(1))
+                answer = re.split(
+                    r"\b(?:before|after|prior to|as|where)\b",
+                    match.group(1),
+                    maxsplit=1,
+                    flags=re.IGNORECASE,
+                )[0]
+                return self._trim_answer(answer)
 
+        if any(token in question_key for token in ("who", "which", "company", "organization", "person")):
+            entity_answer = self._entity_answer(question_key, sentences)
+            if entity_answer:
+                return entity_answer
+
+        return ""
+
+    def _uppercase_answer(self, question_key: str, text: str) -> str:
+        question_upper = set(question_key.upper().split())
+        candidates = []
+        for token in UPPER_TOKEN_PATTERN.findall(text):
+            if token in ACRONYM_EXCLUDE or token in question_upper:
+                continue
+            if len(token) <= 3 and "-" not in token:
+                continue
+            candidates.append(token)
+        if not candidates:
+            return ""
+        candidates.sort(key=lambda token: (-len(token), text.find(token)))
+        return candidates[0]
+
+    def _score_answer(self, question_key: str, sentences: list[str]) -> str:
+        for sentence in sentences[:3]:
+            score_match = SCORE_PATTERN.search(sentence)
+            score_text = self._trim_answer(score_match.group(0)) if score_match else ""
+            winner_match = re.search(
+                r"\b([A-Z][A-Za-z0-9'&-]+(?:\s+[A-Z][A-Za-z0-9'&-]+){0,4})\s+"
+                r"(?:won|defeated|beat|claimed|secured|captured)\b",
+                sentence,
+            )
+            if winner_match and score_text:
+                return self._trim_answer(f"{winner_match.group(1)}, {score_text}")
+            if winner_match and "team" in question_key:
+                return self._trim_answer(winner_match.group(1))
+            if score_text and "score" in question_key:
+                leading_name = re.search(
+                    r"\b([A-Z][A-Za-z0-9'&-]+(?:\s+[A-Z][A-Za-z0-9'&-]+){0,4})\b.*?"
+                    + re.escape(score_text),
+                    sentence,
+                )
+                if leading_name:
+                    return self._trim_answer(f"{leading_name.group(1)}, {score_text}")
+                return score_text
+        return ""
+
+    def _entity_answer(self, question_key: str, sentences: list[str]) -> str:
+        entity_blacklist = {
+            "According",
+            "Article",
+            "Council",
+            "Data",
+            "Document",
+            "Forum",
+            "Project",
+            "The",
+            "This",
+        }
+        for sentence in sentences[:3]:
+            targeted_patterns = [
+                r"\b(?:announced|introduced|ordered|mandated|approved|directed)\s+by\s+([^.,;]+)",
+                r"\b(?:CEO|Chairperson|Commander|Director|Minister)\s+([A-Z][A-Za-z0-9'&-]+(?:\s+[A-Z][A-Za-z0-9'&-]+){0,4})",
+                r"\b([A-Z][A-Za-z0-9'&-]+(?:\s+[A-Z][A-Za-z0-9'&-]+){0,4})\s+"
+                r"(?:announced|introduced|ordered|mandated|approved|directed|won|acquired|operated|contracted)",
+                r"\bagainst\s+([A-Z][A-Za-z0-9'&-]+(?:\s+[A-Z][A-Za-z0-9'&-]+){0,4})",
+            ]
+            for pattern in targeted_patterns:
+                match = re.search(pattern, sentence)
+                if match:
+                    answer = self._trim_answer(match.group(1))
+                    if answer and answer.split()[0] not in entity_blacklist:
+                        return answer
+            for match in ENTITY_PATTERN.finditer(sentence):
+                answer = self._trim_answer(match.group(0))
+                if answer and answer.split()[0] not in entity_blacklist:
+                    if not set(self._content_tokens(answer)).issubset(set(question_key.split())):
+                        return answer
         return ""
 
     def _extract_year_numbers(self, text: str) -> list[int]:
