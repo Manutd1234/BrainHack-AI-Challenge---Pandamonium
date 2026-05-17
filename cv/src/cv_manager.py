@@ -41,6 +41,7 @@ USE_SAHI = os.getenv("CV_USE_SAHI", "0").strip().lower() in {"1", "true", "yes"}
 SAHI_MIN_SIZE = int(os.getenv("CV_SAHI_MIN_SIZE", "640"))
 SAHI_SLICE_SIZE = int(os.getenv("CV_SAHI_SLICE_SIZE", "640"))
 SAHI_OVERLAP = float(os.getenv("CV_SAHI_OVERLAP", "0.20"))
+SAHI_NMS_IOU = float(os.getenv("CV_SAHI_NMS_IOU", "0.50"))
 
 CLASS_NAMES = [
     "cargo aircraft",
@@ -196,12 +197,13 @@ class CVManager:
             overlap_width_ratio=SAHI_OVERLAP,
             perform_standard_pred=True,
             postprocess_type="NMS",
-            postprocess_match_threshold=DEFAULT_IOU,
+            postprocess_match_threshold=SAHI_NMS_IOU,
             postprocess_class_agnostic=False,
             verbose=0,
         )
 
         predictions = []
+        confidences = []
         height, width = image.shape[:2]
         for obj in result.object_prediction_list:
             category_id = int(obj.category.id)
@@ -225,8 +227,9 @@ class CVManager:
                     "category_id": category_id,
                 }
             )
+            confidences.append(float(obj.score.value))
 
-        return self._limit_predictions(predictions)
+        return self._limit_predictions(predictions, confidences)
 
     def _format_yolo_result(
         self,

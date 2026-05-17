@@ -26,8 +26,13 @@ COPY model/best.pt /app/model/best.pt
 
 ENV CV_MODEL_PATH=/app/model/best.pt \
     CV_THRESHOLD_CONFIG=/app/src/cv_thresholds.json \
-    CV_USE_SAHI=0 \
-    CV_PRED_BATCH_SIZE=2 \
+    CV_USE_SAHI=1 \
+    CV_SAHI_MIN_SIZE=900 \
+    CV_SAHI_SLICE_SIZE=768 \
+    CV_SAHI_OVERLAP=0.25 \
+    CV_SAHI_NMS_IOU=0.50 \
+    CV_MAX_DETECTIONS=25 \
+    CV_PRED_BATCH_SIZE=1 \
     NVIDIA_VISIBLE_DEVICES=all \
     NVIDIA_DRIVER_CAPABILITIES=compute,utility
 
