@@ -236,7 +236,7 @@ def main() -> None:
     output = {
         "score": best_score,
         "imgsz": IMGSZ,
-        "iou": 0.50,
+        "iou": PRED_IOU,
         "default_conf": float(np.median(list(best_thresholds.values()))),
         "max_detections": best_max_det,
         "class_conf": {str(key): value for key, value in sorted(best_thresholds.items())},

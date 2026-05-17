@@ -27,7 +27,6 @@ COPY model/best.pt /app/model/best.pt
 ENV CV_MODEL_PATH=/app/model/best.pt \
     CV_THRESHOLD_CONFIG=/app/src/cv_thresholds.json \
     CV_USE_SAHI=0 \
-    CV_IMGSZ=1536 \
     CV_PRED_BATCH_SIZE=2 \
     NVIDIA_VISIBLE_DEVICES=all \
     NVIDIA_DRIVER_CAPABILITIES=compute,utility
