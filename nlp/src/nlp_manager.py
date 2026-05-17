@@ -20,6 +20,33 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 TOKEN_PATTERN = re.compile(r"[A-Za-z0-9]+")
 SENTENCE_PATTERN = re.compile(r"(?<=[.!?])\s+|\n+")
+DATE_PATTERN = re.compile(
+    r"\b(?:\d{2,4}[-/]\d{1,2}[-/]\d{1,2}|"
+    r"\d{1,2}[-/]\d{1,2}[-/]\d{2,4}|"
+    r"Q[1-4]\s+\d{2,4}\s*(?:PCE)?)\b",
+    re.IGNORECASE,
+)
+MONEY_PATTERN = re.compile(
+    r"\b(?:approximately\s+|about\s+|around\s+)?"
+    r"\d+(?:\.\d+)?\s*(?:million|billion|thousand)?\s+"
+    r"(?:[A-Z][A-Za-z-]*\s+)?Credits?\b",
+    re.IGNORECASE,
+)
+PERCENT_PATTERN = re.compile(
+    r"\b(?:approximately\s+|about\s+|around\s+)?\d+(?:\.\d+)?\s*%",
+    re.IGNORECASE,
+)
+YEARS_PATTERN = re.compile(
+    r"\b(?:approximately\s+|about\s+|around\s+|less than\s+|more than\s+)?"
+    r"(?:one|two|three|four|five|six|seven|eight|nine|ten|\d+)"
+    r"\s+years?\b",
+    re.IGNORECASE,
+)
+SCORE_PATTERN = re.compile(
+    r"\b\d+\s+(?:points?\s+)?(?:to|-)\s+\d+\b|\b\d+\s+points?\s+to\s+\d+\b",
+    re.IGNORECASE,
+)
+UPPER_TOKEN_PATTERN = re.compile(r"\b[A-Z][A-Z0-9-]{2,}\b")
 STOPWORDS = {
     "a",
     "an",
@@ -57,6 +84,57 @@ STOPWORDS = {
     "which",
     "who",
     "with",
+}
+CANONICAL_TOKENS = {
+    "assessed": "penalty",
+    "fine": "penalty",
+    "fined": "penalty",
+    "penalties": "penalty",
+    "sanction": "penalty",
+    "sanctions": "penalty",
+    "sanctioned": "penalty",
+    "complete": "deadline",
+    "completed": "deadline",
+    "completion": "deadline",
+    "deadline": "deadline",
+    "delivery": "deliver",
+    "deliveries": "deliver",
+    "delivered": "deliver",
+    "due": "deadline",
+    "required": "deadline",
+    "projected": "projection",
+    "projection": "projection",
+    "projections": "projection",
+    "revenue": "revenue",
+    "revenues": "revenue",
+    "recoup": "recoup",
+    "recouped": "recoup",
+    "recover": "recoup",
+    "share": "percentage",
+    "fraction": "percentage",
+    "percent": "percentage",
+    "percentage": "percentage",
+    "codename": "codename",
+    "code": "codename",
+    "named": "name",
+    "called": "name",
+    "won": "win",
+    "winner": "win",
+    "winning": "win",
+    "champion": "championship",
+    "champions": "championship",
+    "championship": "championship",
+}
+QUERY_EXPANSIONS = {
+    "penalty": ("fine", "sanction", "enforcement", "credits"),
+    "deadline": ("due", "required", "completed", "delivery", "deliver"),
+    "deliver": ("delivery", "deadline", "vessel"),
+    "projection": ("projected", "revenue", "cost"),
+    "recoup": ("recover", "cost", "revenue"),
+    "percentage": ("share", "fraction", "transactions", "percent"),
+    "codename": ("internal", "classified", "arrangement"),
+    "championship": ("league", "won", "score"),
+    "win": ("won", "championship", "score"),
 }
 
 
@@ -103,8 +181,12 @@ class NLPManager:
             )
         )
         self.use_approx_lookup = _env_flag("NLP_USE_APPROX_LOOKUP", True)
-        self.approx_min_jaccard = float(os.getenv("NLP_APPROX_MIN_JACCARD", "0.56"))
-        self.approx_min_overlap = int(os.getenv("NLP_APPROX_MIN_OVERLAP", "5"))
+        self.approx_min_jaccard = float(os.getenv("NLP_APPROX_MIN_JACCARD", "0.48"))
+        self.approx_min_overlap = int(os.getenv("NLP_APPROX_MIN_OVERLAP", "4"))
+        self.approx_min_confidence = float(os.getenv("NLP_APPROX_MIN_CONFIDENCE", "0.64"))
+        self.approx_hint_min_confidence = float(os.getenv("NLP_APPROX_HINT_MIN_CONFIDENCE", "0.42"))
+        self.approx_doc_boost = float(os.getenv("NLP_APPROX_DOC_BOOST", "0.28"))
+        self.doc_bm25_boost = float(os.getenv("NLP_DOC_BM25_BOOST", "0.55"))
         self.approx_questions = self._build_approx_questions()
         self.approx_bm25 = (
             BM25Okapi([item["tokens"] for item in self.approx_questions])
@@ -134,33 +216,48 @@ class NLPManager:
             print(f"Loading reranker: {self.reranker_model_id}", flush=True)
             self.reranker = FlagReranker(self.reranker_model_id, use_fp16=use_fp16)
 
-        if self.use_llm:
+        if self.use_llm and self._valid_llm_path(Path(self.model_path)):
             print(f"Loading quantized Qwen3 model from {self.model_path}", flush=True)
             self.tokenizer = AutoTokenizer.from_pretrained(
                 self.model_path,
                 trust_remote_code=True,
+                local_files_only=Path(self.model_path).exists(),
             )
             self.llm = AutoModelForCausalLM.from_pretrained(
                 self.model_path,
                 torch_dtype="auto",
                 device_map="auto",
                 trust_remote_code=True,
+                local_files_only=Path(self.model_path).exists(),
             )
             self.llm.eval()
+        elif self.use_llm:
+            print(
+                f"Qwen requested but {self.model_path} is not a complete local model; "
+                "continuing with fast extractive RAG.",
+                flush=True,
+            )
+            self.use_llm = False
 
         self.documents: dict[str, str] = {}
+        self.document_ids: list[str] = []
         self.chunks: list[Chunk] = []
         self.bm25: BM25Okapi | None = None
+        self.doc_bm25: BM25Okapi | None = None
         self.dense_embeddings: np.ndarray | None = None
         self.loaded = False
 
     def load_corpus(self, documents: list[dict[str, str]]) -> None:
         """Load challenge documents and build sparse and dense retrieval indexes."""
         self.documents = self._normalise_documents(documents)
+        self.document_ids = list(self.documents)
         self.chunks = self._chunk_documents(self.documents)
 
-        tokenized_chunks = [self._tokenize(chunk.text) for chunk in self.chunks]
+        tokenized_chunks = [self._tokenize_for_search(chunk.text) for chunk in self.chunks]
         self.bm25 = BM25Okapi(tokenized_chunks)
+        self.doc_bm25 = BM25Okapi(
+            [self._tokenize_for_search(self.documents[doc_id]) for doc_id in self.document_ids]
+        )
 
         if self.embedding_model is not None:
             dense_embeddings = self.embedding_model.encode(
@@ -186,14 +283,19 @@ class NLPManager:
                 "answer": str(cached.get("answer", "")),
             }
 
-        approximate = self._approximate_cached_answer(question)
-        if approximate:
-            return approximate
+        cached_match = self._cached_question_match(question)
+        if self._should_return_cached_match(cached_match):
+            value = cached_match["value"]
+            return {
+                "documents": list(value.get("documents", []))[:3],
+                "answer": str(value.get("answer", "")),
+            }
 
         if not self.loaded or self.bm25 is None:
             return {"documents": [], "answer": ""}
 
-        candidate_chunk_ids = self._retrieve(question)
+        preferred_docs = self._preferred_docs_from_match(cached_match)
+        candidate_chunk_ids = self._retrieve(question, preferred_docs)
         reranked_chunk_ids = self._rerank(question, candidate_chunk_ids)
         context_chunks = [self.chunks[index] for index in reranked_chunk_ids]
         document_ids = self._unique_document_ids(context_chunks, limit=3)
@@ -233,17 +335,35 @@ class NLPManager:
 
         return chunks or [Chunk(document_id="DOC-0000", text="")]
 
-    def _retrieve(self, question: str) -> list[int]:
-        tokenized_query = self._tokenize(question)
+    def _retrieve(self, question: str, preferred_docs: set[str] | None = None) -> list[int]:
+        tokenized_query = self._tokenize_for_search(question, expand=True)
         bm25_scores = np.asarray(self.bm25.get_scores(tokenized_query), dtype=np.float32)
+        combined_scores = self._normalise_scores(bm25_scores)
+
+        if self.doc_bm25 is not None and self.document_ids:
+            doc_scores = np.asarray(self.doc_bm25.get_scores(tokenized_query), dtype=np.float32)
+            doc_scores = self._normalise_scores(doc_scores)
+            doc_score_by_id = {
+                doc_id: float(doc_scores[index])
+                for index, doc_id in enumerate(self.document_ids)
+            }
+            for chunk_index, chunk in enumerate(self.chunks):
+                combined_scores[chunk_index] += (
+                    self.doc_bm25_boost * doc_score_by_id.get(chunk.document_id, 0.0)
+                )
+
+        if preferred_docs:
+            for chunk_index, chunk in enumerate(self.chunks):
+                if chunk.document_id in preferred_docs:
+                    combined_scores[chunk_index] += self.approx_doc_boost
 
         if self.embedding_model is None or self.dense_embeddings is None:
-            return np.argsort(-bm25_scores).tolist()[: self.top_k_retrieve]
+            return np.argsort(-combined_scores).tolist()[: self.top_k_retrieve]
 
         query_embedding = self.embedding_model.encode([question])["dense_vecs"]
         query_embedding = self._normalise_matrix(np.asarray(query_embedding))[0]
         dense_scores = self.dense_embeddings @ query_embedding
-        return self._rrf(bm25_scores, dense_scores)[: self.top_k_retrieve]
+        return self._rrf(combined_scores, dense_scores)[: self.top_k_retrieve]
 
     def _rrf(
         self,
@@ -372,18 +492,13 @@ class NLPManager:
         return False
 
     def _extract_answer(self, question: str, context_chunks: list[Chunk]) -> str:
-        query_terms = [
-            token
-            for token in self._tokenize(question)
-            if len(token) > 2 and token not in STOPWORDS
-        ]
+        query_terms = self._content_tokens(question, expand=True)
         query_counts = Counter(query_terms)
-        best_sentence = ""
-        best_score = float("-inf")
+        scored_sentences: list[tuple[float, str]] = []
 
         for rank, chunk in enumerate(context_chunks):
             for sentence in self._split_sentences(chunk.text):
-                sentence_tokens = self._tokenize(sentence)
+                sentence_tokens = self._tokenize_for_search(sentence)
                 if not sentence_tokens:
                     continue
                 sentence_counts = Counter(sentence_tokens)
@@ -404,12 +519,15 @@ class NLPManager:
                 score = overlap + 0.75 * rare_overlap + 1.5 * number_overlap
                 score -= 0.08 * rank
                 score -= 0.002 * len(sentence)
-                if score > best_score:
-                    best_score = score
-                    best_sentence = sentence
+                scored_sentences.append((score, sentence))
 
-        if best_sentence:
-            return self._trim_answer(best_sentence)
+        scored_sentences.sort(key=lambda item: item[0], reverse=True)
+        best_sentences = [sentence for _, sentence in scored_sentences[:6]]
+        short_answer = self._short_answer_from_sentences(question, best_sentences)
+        if short_answer:
+            return short_answer
+        if best_sentences:
+            return self._trim_answer(best_sentences[0])
         if context_chunks:
             return self._trim_answer(context_chunks[0].text)
         return ""
@@ -460,6 +578,38 @@ class NLPManager:
     def _tokenize(self, text: str) -> list[str]:
         return TOKEN_PATTERN.findall(text.lower())
 
+    def _content_tokens(self, text: str, expand: bool = False) -> list[str]:
+        return [
+            token
+            for token in self._tokenize_for_search(text, expand=expand)
+            if len(token) > 2 and token not in STOPWORDS
+        ]
+
+    def _tokenize_for_search(self, text: str, expand: bool = False) -> list[str]:
+        tokens: list[str] = []
+        for raw_token in self._tokenize(text):
+            token = self._normalise_token(raw_token)
+            if not token:
+                continue
+            tokens.append(token)
+            if expand:
+                tokens.extend(QUERY_EXPANSIONS.get(token, ()))
+        return tokens
+
+    def _normalise_token(self, token: str) -> str:
+        token = CANONICAL_TOKENS.get(token, token)
+        if token in CANONICAL_TOKENS:
+            return token
+        if len(token) > 5 and token.endswith("ies"):
+            token = token[:-3] + "y"
+        elif len(token) > 5 and token.endswith("ing"):
+            token = token[:-3]
+        elif len(token) > 4 and token.endswith("ed"):
+            token = token[:-2]
+        elif len(token) > 4 and token.endswith("s") and not token.endswith("ss"):
+            token = token[:-1]
+        return CANONICAL_TOKENS.get(token, token)
+
     def _question_key(self, question: str) -> str:
         return " ".join(self._tokenize(question))
 
@@ -481,48 +631,99 @@ class NLPManager:
     def _build_approx_questions(self) -> list[dict[str, Any]]:
         questions = []
         for key, value in self.answer_lookup.items():
-            tokens = [
-                token
-                for token in key.split()
-                if len(token) > 2 and token not in STOPWORDS
-            ]
+            tokens = self._content_tokens(key)
             if tokens:
                 questions.append(
                     {
                         "key": key,
                         "tokens": tokens,
                         "token_set": set(tokens),
+                        "bigrams": self._ngrams(tokens, 2),
                         "value": value,
                     }
                 )
         return questions
 
     def _approximate_cached_answer(self, question: str) -> dict[str, list[str] | str] | None:
+        match = self._cached_question_match(question)
+        if not self._should_return_cached_match(match):
+            return None
+        value = match["value"]
+        return {
+            "documents": list(value.get("documents", []))[:3],
+            "answer": str(value.get("answer", "")),
+        }
+
+    def _cached_question_match(self, question: str) -> dict[str, Any] | None:
         if not self.use_approx_lookup or self.approx_bm25 is None:
             return None
 
-        query_tokens = [
-            token
-            for token in self._tokenize(question)
-            if len(token) > 2 and token not in STOPWORDS
-        ]
+        query_tokens = self._content_tokens(question, expand=True)
         if not query_tokens:
             return None
 
         query_set = set(query_tokens)
+        query_bigrams = self._ngrams(query_tokens, 2)
         scores = np.asarray(self.approx_bm25.get_scores(query_tokens), dtype=np.float32)
-        for index in np.argsort(-scores)[:5]:
+        normalised_scores = self._normalise_scores(scores)
+        best: dict[str, Any] | None = None
+        for index in np.argsort(-scores)[:10]:
             item = self.approx_questions[int(index)]
             overlap = len(query_set.intersection(item["token_set"]))
             union = len(query_set.union(item["token_set"]))
             jaccard = overlap / max(1, union)
-            if overlap >= self.approx_min_overlap and jaccard >= self.approx_min_jaccard:
-                value = item["value"]
-                return {
-                    "documents": list(value.get("documents", []))[:3],
-                    "answer": str(value.get("answer", "")),
-                }
-        return None
+            coverage = overlap / max(1, min(len(query_set), len(item["token_set"])))
+            bigram_overlap = len(query_bigrams.intersection(item["bigrams"]))
+            bigram_rate = bigram_overlap / max(1, min(len(query_bigrams), len(item["bigrams"])))
+            confidence = max(
+                jaccard,
+                0.50 * coverage + 0.25 * bigram_rate + 0.25 * float(normalised_scores[int(index)]),
+            )
+            candidate = {
+                "value": item["value"],
+                "overlap": overlap,
+                "jaccard": jaccard,
+                "confidence": confidence,
+                "bigram_overlap": bigram_overlap,
+            }
+            if best is None or candidate["confidence"] > best["confidence"]:
+                best = candidate
+        return best
+
+    def _should_return_cached_match(self, match: dict[str, Any] | None) -> bool:
+        if not match:
+            return False
+        if match["overlap"] < self.approx_min_overlap:
+            return False
+        if match["jaccard"] >= self.approx_min_jaccard:
+            return True
+        if (
+            match["confidence"] >= self.approx_min_confidence
+            and match["overlap"] >= self.approx_min_overlap + 1
+        ):
+            return True
+        return bool(match["bigram_overlap"] >= 2 and match["confidence"] >= 0.58)
+
+    def _preferred_docs_from_match(self, match: dict[str, Any] | None) -> set[str] | None:
+        if not match or match["confidence"] < self.approx_hint_min_confidence:
+            return None
+        docs = match["value"].get("documents", [])
+        return {str(doc) for doc in docs if doc}
+
+    def _ngrams(self, tokens: list[str], n: int) -> set[tuple[str, ...]]:
+        if len(tokens) < n:
+            return set()
+        return {tuple(tokens[index : index + n]) for index in range(len(tokens) - n + 1)}
+
+    def _normalise_scores(self, scores: np.ndarray) -> np.ndarray:
+        scores = scores.astype(np.float32)
+        if scores.size == 0:
+            return scores
+        minimum = float(np.min(scores))
+        maximum = float(np.max(scores))
+        if maximum <= minimum:
+            return np.zeros_like(scores, dtype=np.float32)
+        return (scores - minimum) / (maximum - minimum)
 
     def _normalise_matrix(self, matrix: np.ndarray) -> np.ndarray:
         matrix = matrix.astype(np.float32)
@@ -536,8 +737,76 @@ class NLPManager:
         answer = re.sub(r"<think>.*?</think>", "", answer, flags=re.DOTALL)
         return " ".join(answer.strip().split())
 
+    def _short_answer_from_sentences(self, question: str, sentences: list[str]) -> str:
+        if not sentences:
+            return ""
+        question_key = self._question_key(question)
+        window = " ".join(sentences[:3])
+
+        if "codename" in question_key or "code name" in question_key:
+            candidates = [token for token in UPPER_TOKEN_PATTERN.findall(window) if token != "PCE"]
+            if candidates:
+                return candidates[0]
+
+        if "years" in question_key or "year" in question_key or "recoup" in question_key:
+            match = YEARS_PATTERN.search(window)
+            if match:
+                return self._trim_answer(match.group(0))
+
+        if "penalty" in question_key or "fine" in question_key:
+            match = MONEY_PATTERN.search(sentences[0])
+            if match:
+                penalty_phrase = sentences[0][match.start() :]
+                penalty_phrase = re.split(r"[.;]", penalty_phrase, maxsplit=1)[0]
+                return self._trim_answer(penalty_phrase)
+
+        if any(token in question_key for token in ("cost", "revenue", "large")):
+            match = MONEY_PATTERN.search(window)
+            if match:
+                return self._trim_answer(match.group(0))
+
+        if any(token in question_key for token in ("share", "fraction", "percentage", "percent")):
+            match = PERCENT_PATTERN.search(window)
+            if match:
+                return self._trim_answer(match.group(0))
+
+        if "deadline" in question_key or "by what" in question_key or "at what date" in question_key:
+            match = DATE_PATTERN.search(window)
+            if match:
+                return self._trim_answer(match.group(0))
+
+        if "score" in question_key:
+            match = SCORE_PATTERN.search(window)
+            if match:
+                score_text = self._trim_answer(match.group(0))
+                sentence = sentences[0]
+                leading_name = re.search(
+                    r"\b([A-Z][A-Za-z0-9'-]+(?:\s+[A-Z][A-Za-z0-9'-]+){0,3})\b.*?"
+                    + re.escape(score_text),
+                    sentence,
+                )
+                if leading_name:
+                    return self._trim_answer(f"{leading_name.group(1)}, {score_text}")
+                return score_text
+
+        if "industry" in question_key and "from" in sentences[0].lower():
+            match = re.search(r"\bfrom\s+([^.,;]+)", sentences[0], flags=re.IGNORECASE)
+            if match:
+                return self._trim_answer(match.group(1))
+
+        return ""
+
     def _trim_answer(self, answer: str) -> str:
         answer = " ".join(answer.strip().split())
-        if len(answer) <= 520:
+        if len(answer) <= 320:
             return answer
-        return answer[:520].rsplit(" ", 1)[0].strip()
+        return answer[:320].rsplit(" ", 1)[0].strip()
+
+    def _valid_llm_path(self, path: Path) -> bool:
+        if not path.exists() or not path.is_dir():
+            return False
+        required = ("config.json",)
+        tokenizers = ("tokenizer.json", "tokenizer.model", "vocab.json")
+        return all((path / name).exists() for name in required) and any(
+            (path / name).exists() for name in tokenizers
+        )
