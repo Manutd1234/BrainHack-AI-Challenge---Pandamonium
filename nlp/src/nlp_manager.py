@@ -15,7 +15,7 @@ import numpy as np
 import torch
 from FlagEmbedding import BGEM3FlagModel, FlagReranker
 from rank_bm25 import BM25Okapi
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoModelForQuestionAnswering, AutoTokenizer
 
 
 TOKEN_PATTERN = re.compile(r"[A-Za-z0-9]+")
@@ -188,6 +188,7 @@ class NLPManager:
             Path(os.getenv("NLP_RAG_CONFIG", Path(__file__).with_name("rag_config.json")))
         )
         self.model_path = os.getenv("QWEN_MODEL_PATH", "./qwen-quantized")
+        self.qa_reader_path = os.getenv("NLP_QA_READER_MODEL_PATH", "/app/models/qa-reader")
         self.embedding_model_id = os.getenv("NLP_EMBEDDING_MODEL", "BAAI/bge-m3")
         self.reranker_model_id = os.getenv(
             "NLP_RERANKER_MODEL",
@@ -240,6 +241,11 @@ class NLPManager:
         )
         self.use_dense = _env_flag("NLP_USE_DENSE", False)
         self.use_llm = _env_flag("NLP_USE_LLM", False)
+        self.use_qa_reader = _env_flag("NLP_USE_QA_READER", False)
+        self.qa_reader_contexts = int(os.getenv("NLP_QA_READER_CONTEXTS", "5"))
+        self.qa_reader_max_length = int(os.getenv("NLP_QA_READER_MAX_LENGTH", "384"))
+        self.qa_reader_max_answer_tokens = int(os.getenv("NLP_QA_READER_MAX_ANSWER_TOKENS", "24"))
+        self.qa_reader_min_score = float(os.getenv("NLP_QA_READER_MIN_SCORE", "5.0"))
         self.llm_mode = os.getenv("NLP_LLM_MODE", "selective").strip().lower()
         self.enable_thinking = _env_flag("QWEN_ENABLE_THINKING", False)
         self.do_sample = _env_flag("QWEN_DO_SAMPLE", False)
@@ -249,6 +255,9 @@ class NLPManager:
         self.reranker = None
         self.tokenizer = None
         self.llm = None
+        self.qa_tokenizer = None
+        self.qa_reader = None
+        self.qa_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         use_fp16 = torch.cuda.is_available()
         if self.use_dense:
@@ -283,6 +292,25 @@ class NLPManager:
                 flush=True,
             )
             self.use_llm = False
+
+        if self.use_qa_reader and self._valid_qa_reader_path(Path(self.qa_reader_path)):
+            print(f"Loading extractive QA reader from {self.qa_reader_path}", flush=True)
+            self.qa_tokenizer = AutoTokenizer.from_pretrained(
+                self.qa_reader_path,
+                local_files_only=Path(self.qa_reader_path).exists(),
+            )
+            self.qa_reader = AutoModelForQuestionAnswering.from_pretrained(
+                self.qa_reader_path,
+                local_files_only=Path(self.qa_reader_path).exists(),
+            ).to(self.qa_device)
+            self.qa_reader.eval()
+        elif self.use_qa_reader:
+            print(
+                f"QA reader requested but {self.qa_reader_path} is not a complete local model; "
+                "continuing with fast extractive RAG.",
+                flush=True,
+            )
+            self.use_qa_reader = False
 
         self.documents: dict[str, str] = {}
         self.document_ids: list[str] = []
@@ -473,7 +501,12 @@ class NLPManager:
 
     def _generate(self, question: str, context_chunks: list[Chunk]) -> str:
         if self.llm is None or self.tokenizer is None:
-            return self._extract_answer(question, context_chunks)
+            extracted = self._extract_answer(question, context_chunks)
+            if self._should_try_qa_reader(question, extracted):
+                reader_answer, reader_score = self._qa_reader_answer(question, context_chunks)
+                if self._prefer_qa_reader_answer(question, extracted, reader_answer, reader_score):
+                    return reader_answer
+            return extracted
         if self.llm_mode not in {"1", "true", "yes", "always", "all"}:
             extracted = self._extract_answer(question, context_chunks)
             if not self._should_use_llm(question, extracted):
@@ -546,6 +579,131 @@ class NLPManager:
         if len(extracted_answer) > int(os.getenv("NLP_EXTRACTIVE_MAX_CHARS", "260")):
             return True
         return False
+
+    def _should_try_qa_reader(self, question: str, extracted_answer: str) -> bool:
+        if self.qa_reader is None or self.qa_tokenizer is None:
+            return False
+        if not extracted_answer or len(extracted_answer) > 140:
+            return True
+        question_key = self._question_key(question)
+        if self._is_pattern_answer(question_key, extracted_answer):
+            return False
+        return bool(
+            question_key.startswith(("who ", "what ", "which ", "where ", "when "))
+            or " by what " in f" {question_key} "
+            or "how large" in question_key
+            or "how much" in question_key
+        )
+
+    def _qa_reader_answer(self, question: str, context_chunks: list[Chunk]) -> tuple[str, float]:
+        best_answer = ""
+        best_score = float("-inf")
+        contexts = [chunk.text for chunk in context_chunks[: self.qa_reader_contexts]]
+
+        with self.lock, torch.inference_mode():
+            for context in contexts:
+                encoded = self.qa_tokenizer(
+                    question,
+                    context,
+                    return_tensors="pt",
+                    truncation="only_second",
+                    max_length=self.qa_reader_max_length,
+                )
+                sequence_ids = encoded.sequence_ids(0)
+                inputs = {key: value.to(self.qa_device) for key, value in encoded.items()}
+                outputs = self.qa_reader(**inputs)
+                start_logits = outputs.start_logits[0].detach().float().cpu().numpy()
+                end_logits = outputs.end_logits[0].detach().float().cpu().numpy()
+                input_ids = encoded["input_ids"][0]
+                context_indices = [
+                    index for index, segment_id in enumerate(sequence_ids) if segment_id == 1
+                ]
+                if not context_indices:
+                    continue
+
+                top_starts = sorted(
+                    context_indices,
+                    key=lambda index: float(start_logits[index]),
+                    reverse=True,
+                )[:8]
+                top_ends = sorted(
+                    context_indices,
+                    key=lambda index: float(end_logits[index]),
+                    reverse=True,
+                )[:8]
+                for start in top_starts:
+                    for end in top_ends:
+                        if end < start:
+                            continue
+                        if end - start + 1 > self.qa_reader_max_answer_tokens:
+                            continue
+                        score = float(start_logits[start] + end_logits[end])
+                        if score <= best_score:
+                            continue
+                        answer = self.qa_tokenizer.decode(
+                            input_ids[start : end + 1],
+                            skip_special_tokens=True,
+                        )
+                        answer = self._clean_reader_answer(answer)
+                        if self._valid_reader_answer(question, answer):
+                            best_answer = answer
+                            best_score = score
+
+        return best_answer, best_score
+
+    def _prefer_qa_reader_answer(
+        self,
+        question: str,
+        extracted_answer: str,
+        reader_answer: str,
+        reader_score: float,
+    ) -> bool:
+        if not reader_answer or reader_score < self.qa_reader_min_score:
+            return False
+        question_key = self._question_key(question)
+        if self._is_pattern_answer(question_key, extracted_answer):
+            return False
+        if not extracted_answer:
+            return True
+        if len(extracted_answer) > 140:
+            return True
+        if len(reader_answer) < len(extracted_answer) * 0.65 and reader_score >= self.qa_reader_min_score + 2.0:
+            return True
+        return False
+
+    def _is_pattern_answer(self, question_key: str, answer: str) -> bool:
+        if not answer:
+            return False
+        if ("penalty" in question_key or "fine" in question_key) and MONEY_PATTERN.search(answer):
+            return True
+        if any(token in question_key for token in ("share", "fraction", "percentage", "percent")):
+            return bool(PERCENT_PATTERN.search(answer))
+        if "score" in question_key and SCORE_PATTERN.search(answer):
+            return True
+        if "codename" in question_key and UPPER_TOKEN_PATTERN.search(answer):
+            return True
+        if ("deadline" in question_key or "date" in question_key) and DATE_PATTERN.search(answer):
+            return True
+        if ("years" in question_key or "recoup" in question_key) and YEARS_PATTERN.search(answer):
+            return True
+        return False
+
+    def _clean_reader_answer(self, answer: str) -> str:
+        answer = answer.replace(" ##", "").replace("##", "")
+        answer = " ".join(answer.strip(" \t\r\n.,;:").split())
+        return self._trim_answer(answer)
+
+    def _valid_reader_answer(self, question: str, answer: str) -> bool:
+        if not answer or len(answer) < 2 or len(answer) > 180:
+            return False
+        answer_key = self._question_key(answer)
+        question_tokens = set(self._content_tokens(question))
+        answer_tokens = set(self._content_tokens(answer))
+        if answer_key in {"yes", "no", "none", "unknown"}:
+            return False
+        if answer_tokens and answer_tokens.issubset(question_tokens) and len(answer_tokens) <= 3:
+            return False
+        return True
 
     def _extract_answer(self, question: str, context_chunks: list[Chunk]) -> str:
         query_terms = self._content_tokens(question, expand=True)
@@ -1000,3 +1158,12 @@ class NLPManager:
         return all((path / name).exists() for name in required) and any(
             (path / name).exists() for name in tokenizers
         )
+
+    def _valid_qa_reader_path(self, path: Path) -> bool:
+        if not path.exists() or not path.is_dir():
+            return False
+        tokenizers = ("tokenizer.json", "vocab.txt", "vocab.json")
+        weights = ("model.safetensors", "pytorch_model.bin")
+        return (path / "config.json").exists() and any(
+            (path / name).exists() for name in tokenizers
+        ) and any((path / name).exists() for name in weights)
