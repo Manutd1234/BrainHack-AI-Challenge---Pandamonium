@@ -16,6 +16,11 @@ from ultralytics import YOLO
 
 LOGGER = logging.getLogger(__name__)
 MODEL_PATH = os.getenv("CV_MODEL_PATH", "/app/model/best.pt")
+MODEL_PATHS = [
+    path.strip()
+    for path in os.getenv("CV_MODEL_PATHS", MODEL_PATH).split(",")
+    if path.strip()
+]
 THRESHOLD_CONFIG_PATH = Path(
     os.getenv("CV_THRESHOLD_CONFIG", Path(__file__).with_name("cv_thresholds.json"))
 )
@@ -37,6 +42,8 @@ DEFAULT_IOU = float(os.getenv("CV_IOU", THRESHOLD_CONFIG.get("iou", 0.45)))
 DEFAULT_IMGSZ = int(os.getenv("CV_IMGSZ", THRESHOLD_CONFIG.get("imgsz", 1280)))
 MAX_DETECTIONS = int(os.getenv("CV_MAX_DETECTIONS", THRESHOLD_CONFIG.get("max_detections", 20)))
 PRED_BATCH_SIZE = int(os.getenv("CV_PRED_BATCH_SIZE", "4"))
+USE_AUGMENT = os.getenv("CV_AUGMENT", "0").strip().lower() in {"1", "true", "yes"}
+FINAL_NMS_IOU = float(os.getenv("CV_FINAL_NMS_IOU", "0.55"))
 USE_SAHI = os.getenv("CV_USE_SAHI", "0").strip().lower() in {"1", "true", "yes"}
 SAHI_MIN_SIZE = int(os.getenv("CV_SAHI_MIN_SIZE", "640"))
 SAHI_SLICE_SIZE = int(os.getenv("CV_SAHI_SLICE_SIZE", "640"))
@@ -94,26 +101,33 @@ class CVManager:
     """Loads a YOLO26x checkpoint and returns TIL-format detections."""
 
     def __init__(self) -> None:
-        if not os.path.exists(MODEL_PATH):
+        existing_model_paths = [path for path in MODEL_PATHS if os.path.exists(path)]
+        if not existing_model_paths:
             raise FileNotFoundError(
-                f"CV checkpoint not found at {MODEL_PATH}. Run cv_train.py and "
+                f"CV checkpoint not found at {MODEL_PATHS}. Run cv_train.py and "
                 "copy model/best.pt into cv/model/best.pt before building."
             )
 
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        LOGGER.info("Loading YOLO checkpoint from %s on %s", MODEL_PATH, self.device)
-        self.model = YOLO(MODEL_PATH)
-        self.model.to(self.device)
+        self.models = []
+        for model_path in existing_model_paths:
+            LOGGER.info("Loading YOLO checkpoint from %s on %s", model_path, self.device)
+            model = YOLO(model_path)
+            model.to(self.device)
+            self.models.append(model)
+        self.model = self.models[0]
 
         self.sahi_model = self._load_sahi_model() if USE_SAHI else None
-        self.model.predict(
-            np.zeros((640, 640, 3), dtype=np.uint8),
-            imgsz=DEFAULT_IMGSZ,
-            conf=DEFAULT_CONF,
-            iou=DEFAULT_IOU,
-            half=self.device == "cuda",
-            verbose=False,
-        )
+        for model in self.models:
+            model.predict(
+                np.zeros((640, 640, 3), dtype=np.uint8),
+                imgsz=DEFAULT_IMGSZ,
+                conf=DEFAULT_CONF,
+                iou=DEFAULT_IOU,
+                half=self.device == "cuda",
+                augment=USE_AUGMENT,
+                verbose=False,
+            )
         LOGGER.info("CVManager ready")
 
     def cv(self, image: bytes) -> list[dict[str, Any]]:
@@ -169,19 +183,31 @@ class CVManager:
         batch_size = max(1, PRED_BATCH_SIZE)
         for start in range(0, len(images), batch_size):
             batch = images[start : start + batch_size]
-            results = self.model.predict(
-                batch,
-                conf=DEFAULT_CONF,
-                iou=DEFAULT_IOU,
-                imgsz=DEFAULT_IMGSZ,
-                half=self.device == "cuda",
-                max_det=MAX_DETECTIONS,
-                verbose=False,
-                device=self.device,
-            )
+            batch_predictions: list[list[dict[str, Any]]] = [[] for _ in batch]
+            batch_confidences: list[list[float]] = [[] for _ in batch]
+
+            for model in self.models:
+                results = model.predict(
+                    batch,
+                    conf=DEFAULT_CONF,
+                    iou=DEFAULT_IOU,
+                    imgsz=DEFAULT_IMGSZ,
+                    half=self.device == "cuda",
+                    augment=USE_AUGMENT,
+                    max_det=max(MAX_DETECTIONS * 3, MAX_DETECTIONS),
+                    verbose=False,
+                    device=self.device,
+                )
+                for index, (result, image) in enumerate(zip(results, batch)):
+                    formatted, confidences = self._format_yolo_result(result, image.shape)
+                    batch_predictions[index].extend(formatted)
+                    batch_confidences[index].extend(confidences)
+
             predictions.extend(
-                self._format_yolo_result(result, image.shape)
-                for result, image in zip(results, batch)
+                self._postprocess_predictions(single_predictions, single_confidences)
+                for single_predictions, single_confidences in zip(
+                    batch_predictions, batch_confidences
+                )
             )
         return predictions
 
@@ -225,19 +251,20 @@ class CVManager:
                 {
                     "bbox": [left, top, box_width, box_height],
                     "category_id": category_id,
+                    "_confidence": float(obj.score.value),
                 }
             )
             confidences.append(float(obj.score.value))
 
-        return self._limit_predictions(predictions, confidences)
+        return self._postprocess_predictions(predictions, confidences)
 
     def _format_yolo_result(
         self,
         result,
         image_shape: tuple[int, int, int],
-    ) -> list[dict[str, Any]]:
+    ) -> tuple[list[dict[str, Any]], list[float]]:
         if result.boxes is None or len(result.boxes) == 0:
-            return []
+            return [], []
 
         height, width = image_shape[:2]
         boxes_xywh = result.boxes.xywh.detach().cpu().numpy()
@@ -260,23 +287,76 @@ class CVManager:
                 {
                     "bbox": [left, top, box_width, box_height],
                     "category_id": int(category_id),
+                    "_confidence": float(confidence),
                 }
             )
             kept_confidences.append(float(confidence))
 
-        return self._limit_predictions(predictions, kept_confidences)
+        return predictions, kept_confidences
 
-    def _limit_predictions(
+    def _postprocess_predictions(
         self,
         predictions: list[dict[str, Any]],
         confidences: list[float] | None = None,
     ) -> list[dict[str, Any]]:
-        if len(predictions) <= MAX_DETECTIONS:
-            return predictions
         if confidences is None:
-            return predictions[:MAX_DETECTIONS]
-        order = np.argsort(-np.asarray(confidences))[:MAX_DETECTIONS]
-        return [predictions[int(index)] for index in order]
+            confidences = [float(prediction.get("_confidence", 1.0)) for prediction in predictions]
+
+        predictions = self._classwise_nms(predictions, confidences)
+        confidences = [float(prediction.get("_confidence", 1.0)) for prediction in predictions]
+        if len(predictions) > MAX_DETECTIONS:
+            order = np.argsort(-np.asarray(confidences))[:MAX_DETECTIONS]
+            predictions = [predictions[int(index)] for index in order]
+
+        for prediction in predictions:
+            prediction.pop("_confidence", None)
+        return predictions
+
+    def _classwise_nms(
+        self,
+        predictions: list[dict[str, Any]],
+        confidences: list[float],
+    ) -> list[dict[str, Any]]:
+        if not predictions:
+            return []
+
+        kept: list[dict[str, Any]] = []
+        by_class: dict[int, list[int]] = {}
+        for index, prediction in enumerate(predictions):
+            by_class.setdefault(int(prediction["category_id"]), []).append(index)
+
+        for indices in by_class.values():
+            ordered = sorted(indices, key=lambda index: confidences[index], reverse=True)
+            while ordered:
+                current = ordered.pop(0)
+                kept.append(predictions[current])
+                ordered = [
+                    other
+                    for other in ordered
+                    if self._bbox_iou(predictions[current]["bbox"], predictions[other]["bbox"])
+                    < FINAL_NMS_IOU
+                ]
+
+        kept.sort(key=lambda prediction: float(prediction.get("_confidence", 1.0)), reverse=True)
+        return kept
+
+    def _bbox_iou(self, first: list[float], second: list[float]) -> float:
+        first_x1, first_y1, first_w, first_h = first
+        second_x1, second_y1, second_w, second_h = second
+        first_x2 = first_x1 + first_w
+        first_y2 = first_y1 + first_h
+        second_x2 = second_x1 + second_w
+        second_y2 = second_y1 + second_h
+
+        inter_x1 = max(first_x1, second_x1)
+        inter_y1 = max(first_y1, second_y1)
+        inter_x2 = min(first_x2, second_x2)
+        inter_y2 = min(first_y2, second_y2)
+        inter_w = max(0.0, inter_x2 - inter_x1)
+        inter_h = max(0.0, inter_y2 - inter_y1)
+        intersection = inter_w * inter_h
+        union = first_w * first_h + second_w * second_h - intersection
+        return intersection / union if union > 0 else 0.0
 
     def _xywh_to_ltwh(
         self,

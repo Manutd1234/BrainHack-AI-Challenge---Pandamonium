@@ -21,18 +21,23 @@ RUN python -m pip install --no-cache-dir --upgrade pip setuptools wheel \
 ARG YOLO_BASE_WEIGHTS=yolo26x.pt
 RUN python -c "from ultralytics import YOLO; YOLO('${YOLO_BASE_WEIGHTS}')"
 
-# Run cv_train.py first so this checkpoint exists before docker build.
-COPY model/best.pt /app/model/best.pt
+# Run cv_train.py first so at least model/best.pt exists before docker build.
+# Copy the whole model folder so optional candidates like last.pt can be ensembled.
+COPY model/ /app/model/
+RUN test -f /app/model/best.pt
 
 ENV CV_MODEL_PATH=/app/model/best.pt \
+    CV_MODEL_PATHS=/app/model/best.pt,/app/model/last.pt \
     CV_THRESHOLD_CONFIG=/app/src/cv_thresholds.json \
     CV_USE_SAHI=0 \
     CV_SAHI_MIN_SIZE=900 \
     CV_SAHI_SLICE_SIZE=768 \
     CV_SAHI_OVERLAP=0.25 \
     CV_SAHI_NMS_IOU=0.50 \
-    CV_MAX_DETECTIONS=25 \
-    CV_PRED_BATCH_SIZE=1 \
+    CV_MAX_DETECTIONS=12 \
+    CV_PRED_BATCH_SIZE=4 \
+    CV_AUGMENT=0 \
+    CV_FINAL_NMS_IOU=0.55 \
     NVIDIA_VISIBLE_DEVICES=all \
     NVIDIA_DRIVER_CAPABILITIES=compute,utility
 
