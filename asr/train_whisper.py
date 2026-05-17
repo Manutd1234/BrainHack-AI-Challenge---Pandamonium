@@ -40,6 +40,13 @@ EVAL_SIZE = float(os.getenv("ASR_EVAL_SIZE", "0.05"))
 SEED = int(os.getenv("ASR_SEED", "26"))
 
 
+def _env_flag(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
 @dataclass
 class DataCollatorSpeechSeq2SeqWithPadding:
     processor: WhisperProcessor
@@ -146,7 +153,7 @@ def main() -> None:
         learning_rate=float(os.getenv("ASR_LR", "1e-5")),
         warmup_steps=int(os.getenv("ASR_WARMUP_STEPS", "100")),
         max_steps=MAX_STEPS,
-        fp16=torch.cuda.is_available(),
+        fp16=_env_flag("ASR_FP16", torch.cuda.is_available()),
         eval_strategy="steps",
         eval_steps=int(os.getenv("ASR_EVAL_STEPS", "250")),
         save_steps=int(os.getenv("ASR_SAVE_STEPS", "250")),
