@@ -551,6 +551,8 @@ class NLPManager:
     def _should_use_llm(self, question: str, extracted_answer: str) -> bool:
         question_key = self._question_key(question)
         question_tokens = set(question_key.split())
+        if self._is_pattern_answer(question_key, extracted_answer):
+            return False
         reasoning_phrases = {
             "how many",
             "how much",

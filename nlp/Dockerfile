@@ -4,8 +4,9 @@ FROM nvcr.io/nvidia/pytorch:25.11-py3
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_ROOT_USER_ACTION=ignore \
-    QWEN_MODEL_PATH=/app/src/qwen-quantized \
+    QWEN_MODEL_PATH=/app/models/qwen-small \
     QWEN_ENABLE_THINKING=0 \
+    QWEN_DO_SAMPLE=0 \
     NLP_USE_APPROX_LOOKUP=1 \
     NLP_USE_QA_MEMORY=0 \
     NLP_APPROX_MIN_JACCARD=0.48 \
@@ -17,13 +18,13 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     NLP_QA_MEMORY_MIN_OVERLAP=4 \
     NLP_DOC_BM25_BOOST=0.55 \
     NLP_USE_DENSE=0 \
-    NLP_USE_LLM=0 \
+    NLP_USE_LLM=1 \
     NLP_USE_QA_READER=0 \
     NLP_QA_READER_MODEL_PATH=/app/models/qa-reader \
     NLP_QA_READER_CONTEXTS=5 \
     NLP_QA_READER_MIN_SCORE=5.0 \
     NLP_LLM_MODE=selective \
-    NLP_MAX_NEW_TOKENS=96
+    NLP_MAX_NEW_TOKENS=64
 
 WORKDIR /app
 
@@ -36,7 +37,7 @@ RUN python -m pip install --no-cache-dir --upgrade pip setuptools wheel \
     && pip install --no-cache-dir -r requirements.txt \
     && pip install --no-cache-dir --upgrade "transformers>=4.51.0"
 
-RUN python -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='distilbert-base-cased-distilled-squad', local_dir='/app/models/qa-reader', local_dir_use_symlinks=False, ignore_patterns=['*.h5','*.onnx','*.msgpack'])"
+RUN python -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='Qwen/Qwen2.5-0.5B-Instruct', local_dir='/app/models/qwen-small', local_dir_use_symlinks=False, ignore_patterns=['*.h5','*.onnx','*.msgpack'])"
 
 COPY src/ ./src/
 
