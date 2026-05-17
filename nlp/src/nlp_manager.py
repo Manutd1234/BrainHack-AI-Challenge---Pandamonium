@@ -113,6 +113,7 @@ class NLPManager:
         )
         self.use_dense = _env_flag("NLP_USE_DENSE", False)
         self.use_llm = _env_flag("NLP_USE_LLM", False)
+        self.llm_mode = os.getenv("NLP_LLM_MODE", "selective").strip().lower()
         self.enable_thinking = _env_flag("QWEN_ENABLE_THINKING", False)
         self.do_sample = _env_flag("QWEN_DO_SAMPLE", False)
         self.lock = threading.Lock()
@@ -297,12 +298,18 @@ class NLPManager:
     def _generate(self, question: str, context_chunks: list[Chunk]) -> str:
         if self.llm is None or self.tokenizer is None:
             return self._extract_answer(question, context_chunks)
+        if self.llm_mode not in {"1", "true", "yes", "always", "all"}:
+            extracted = self._extract_answer(question, context_chunks)
+            if not self._should_use_llm(question, extracted):
+                return extracted
 
         context = self._format_context(context_chunks)
         prompt = (
-            "Answer the question using only the context below. "
-            "If the context is insufficient, say you do not know. "
-            "Keep the answer concise.\n\n"
+            "Answer the question using only the context below. Return only the final "
+            "short answer, with no explanation, no citations, and no preamble. If a "
+            "calculation is needed, do the calculation silently and return the result. "
+            "If the answer is a name, amount, date, score, duration, percentage, or "
+            "short phrase, output only that value.\n\n"
             f"Context:\n{context}\n\n"
             f"Question: {question}\n\n"
             "Answer:"
@@ -331,6 +338,38 @@ class NLPManager:
         generated_ids = outputs[0][inputs["input_ids"].shape[-1] :]
         answer = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
         return self._strip_thinking(answer)
+
+    def _should_use_llm(self, question: str, extracted_answer: str) -> bool:
+        question_key = self._question_key(question)
+        question_tokens = set(question_key.split())
+        reasoning_phrases = {
+            "how many",
+            "how much",
+            "at what date",
+            "at what time",
+            "by what deadline",
+        }
+        reasoning_tokens = {
+            "calculate",
+            "computed",
+            "difference",
+            "duration",
+            "fraction",
+            "percentage",
+            "recoup",
+            "share",
+            "total",
+            "years",
+        }
+        if any(phrase in question_key for phrase in reasoning_phrases):
+            return True
+        if question_tokens.intersection(reasoning_tokens):
+            return True
+        if question_key.startswith(("given ", "if ")):
+            return True
+        if len(extracted_answer) > int(os.getenv("NLP_EXTRACTIVE_MAX_CHARS", "260")):
+            return True
+        return False
 
     def _extract_answer(self, question: str, context_chunks: list[Chunk]) -> str:
         query_terms = [
