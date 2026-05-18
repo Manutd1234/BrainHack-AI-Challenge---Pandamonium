@@ -27,6 +27,8 @@ TOTAL_STEPS = int(os.getenv("AE_TOTAL_STEPS", "10000000"))
 N_ENVS = int(os.getenv("AE_N_ENVS", "8"))
 N_CPUS = int(os.getenv("AE_N_CPUS", str(N_ENVS)))
 SEED = int(os.getenv("AE_SEED", "88"))
+RESUME_PATH = Path(os.getenv("AE_RESUME_PATH", "model/policy.zip"))
+RESUME = os.getenv("AE_RESUME", "true").lower() in {"1", "true", "yes"}
 
 PPO_CONFIG = {
     "policy": "MultiInputPolicy",
@@ -126,10 +128,18 @@ def train() -> None:
 
     train_env = make_vec_env(N_ENVS, N_CPUS)
     eval_env = make_vec_env(1, 1)
-    model = PPO(env=train_env, seed=SEED, device=os.getenv("AE_DEVICE", "cuda"), **PPO_CONFIG)
+    device = os.getenv("AE_DEVICE", "cuda")
+    if RESUME and RESUME_PATH.exists():
+        print(f"Resuming PPO checkpoint from {RESUME_PATH}")
+        model = PPO.load(RESUME_PATH, env=train_env, seed=SEED, device=device)
+        reset_num_timesteps = False
+    else:
+        model = PPO(env=train_env, seed=SEED, device=device, **PPO_CONFIG)
+        reset_num_timesteps = True
 
     model.learn(
         total_timesteps=TOTAL_STEPS,
+        reset_num_timesteps=reset_num_timesteps,
         progress_bar=True,
         callback=[
             CheckpointCallback(

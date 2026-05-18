@@ -188,8 +188,18 @@ class AEManager:
         if escape is not None:
             return escape
 
+        if self.policy is not None and self.policy_mode == "ppo_safe_first":
+            action = self._safe_policy_act(observation, action_mask, location, direction)
+            if action is not None:
+                return action
+
         if self._is_legal(PLACE_BOMB, action_mask) and self._should_bomb_now(location, step):
             return PLACE_BOMB
+
+        if self.policy is not None and self.policy_mode == "ppo_move_first":
+            action = self._safe_policy_act(observation, action_mask, location, direction)
+            if action is not None and action != PLACE_BOMB:
+                return action
 
         target_path = self._choose_target_path(location)
         if target_path:
