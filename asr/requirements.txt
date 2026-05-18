@@ -11,6 +11,12 @@ numpy>=1.26.0
 librosa>=0.10.0
 soundfile>=0.12.1
 
+# Optional Whisper Turbo fallback for suspicious Parakeet outputs.
+transformers>=4.51.0
+accelerate>=1.6.0,<2
+safetensors>=0.5.3
+sentencepiece>=0.2.0
+
 # Optional neural noise suppression. Disabled by default in Dockerfile because
 # Parakeet is already fast and clean-audio inference is usually stronger.
 deepfilternet>=0.5.6

@@ -7,6 +7,12 @@ ENV DEBIAN_FRONTEND=noninteractive \
     ASR_MODEL_NAME=nvidia/parakeet-tdt-1.1b \
     ASR_MODEL_CACHE=/app/model/parakeet \
     ASR_BATCH_SIZE=8 \
+    ASR_USE_WHISPER_FALLBACK=1 \
+    ASR_WHISPER_MODE=rescue \
+    ASR_WHISPER_MODEL=openai/whisper-large-v3-turbo \
+    ASR_WHISPER_CACHE=/app/model/whisper-large-v3-turbo \
+    ASR_WHISPER_LANGUAGE=en \
+    ASR_WHISPER_MAX_NEW_TOKENS=256 \
     ASR_USE_MEMORY=0 \
     ASR_USE_DOMAIN_CORRECTION=0 \
     ASR_USE_DEEPFILTERNET=0 \
@@ -39,6 +45,10 @@ RUN python3 -m pip install --no-cache-dir --upgrade pip setuptools wheel \
 
 # Bake Parakeet-TDT-1.1B into the image so runtime has zero NGC download latency.
 RUN python3 -c "import os; import nemo.collections.asr as nemo_asr; os.makedirs('/app/model/parakeet', exist_ok=True); model = nemo_asr.models.ASRModel.from_pretrained('nvidia/parakeet-tdt-1.1b'); model.save_to('/app/model/parakeet/parakeet-tdt-1.1b.nemo'); print('Parakeet-TDT-1.1B saved')"
+
+# Bake Whisper Large-v3-Turbo for optional rescue inference. It is only used
+# when ASR_USE_WHISPER_FALLBACK=1 and Parakeet output looks suspicious.
+RUN python3 -c "import os; from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor; cache=os.environ.get('ASR_WHISPER_CACHE', '/app/model/whisper-large-v3-turbo'); model_id=os.environ.get('ASR_WHISPER_MODEL', 'openai/whisper-large-v3-turbo'); os.makedirs(cache, exist_ok=True); AutoProcessor.from_pretrained(model_id).save_pretrained(cache); AutoModelForSpeechSeq2Seq.from_pretrained(model_id, low_cpu_mem_usage=True, use_safetensors=True).save_pretrained(cache); print('Whisper Turbo saved')"
 
 COPY src/ ./src/
 WORKDIR /app/src

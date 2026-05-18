@@ -30,6 +30,8 @@ LOGGER = logging.getLogger(__name__)
 MODEL_NAME = os.getenv("ASR_MODEL_NAME", "nvidia/parakeet-tdt-1.1b")
 MODEL_CACHE = Path(os.getenv("ASR_MODEL_CACHE", "/app/model/parakeet"))
 MODEL_FILE = MODEL_CACHE / "parakeet-tdt-1.1b.nemo"
+WHISPER_MODEL_NAME = os.getenv("ASR_WHISPER_MODEL", "openai/whisper-large-v3-turbo")
+WHISPER_CACHE = Path(os.getenv("ASR_WHISPER_CACHE", "/app/model/whisper-large-v3-turbo"))
 MEMORY_FILE = Path(os.getenv("ASR_MEMORY_FILE", "/app/src/asr_memory.json"))
 TARGET_SAMPLE_RATE = 16_000
 DEEPFILTER_SAMPLE_RATE = 48_000
@@ -50,6 +52,10 @@ class ASRManager:
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.max_seconds = float(os.getenv("ASR_MAX_SECONDS", "35"))
         self.batch_size = max(1, int(os.getenv("ASR_BATCH_SIZE", "8")))
+        self.use_whisper_fallback = _env_flag("ASR_USE_WHISPER_FALLBACK", False)
+        self.whisper_mode = os.getenv("ASR_WHISPER_MODE", "rescue").strip().lower()
+        self.whisper_language = os.getenv("ASR_WHISPER_LANGUAGE", "en").strip() or None
+        self.whisper_max_new_tokens = int(os.getenv("ASR_WHISPER_MAX_NEW_TOKENS", "256"))
         self.use_memory = _env_flag("ASR_USE_MEMORY", False)
         self.use_domain_correction = _env_flag("ASR_USE_DOMAIN_CORRECTION", False)
         self.domain_correction_threshold = float(
@@ -63,6 +69,11 @@ class ASRManager:
         self.domain_term_index = self._build_domain_term_index(self.domain_terms)
 
         self.model = self._load_parakeet()
+        self.whisper_model = None
+        self.whisper_processor = None
+        self.whisper_dtype = torch.float16 if self.device == "cuda" else torch.float32
+        if self.use_whisper_fallback:
+            self._load_whisper()
         self._df_enhance = None
         self._df_model = None
         self._df_state = None
@@ -106,7 +117,8 @@ class ASRManager:
             with self._lock, torch.inference_mode():
                 results = self._transcribe_paths(temp_paths)
             for (index, _audio), result in zip(pending_audio, results):
-                outputs[index] = self._clean_result(result)
+                parakeet_text = self._clean_result(result)
+                outputs[index] = self._maybe_whisper_rescue(_audio, parakeet_text)
             return [text or "" for text in outputs]
         finally:
             for path in temp_paths:
@@ -208,6 +220,37 @@ class ASRManager:
                 pass
         LOGGER.info("Parakeet ready on %s", self.device)
         return model
+
+    def _load_whisper(self) -> None:
+        try:
+            from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor
+        except ImportError as exc:
+            self.use_whisper_fallback = False
+            LOGGER.warning("Transformers unavailable; disabling Whisper fallback: %s", exc)
+            return
+
+        model_source = str(WHISPER_CACHE) if WHISPER_CACHE.exists() else WHISPER_MODEL_NAME
+        local_only = WHISPER_CACHE.exists()
+        try:
+            LOGGER.info("Loading Whisper fallback from %s", model_source)
+            self.whisper_processor = AutoProcessor.from_pretrained(
+                model_source,
+                local_files_only=local_only,
+            )
+            self.whisper_model = AutoModelForSpeechSeq2Seq.from_pretrained(
+                model_source,
+                torch_dtype=self.whisper_dtype,
+                low_cpu_mem_usage=True,
+                use_safetensors=True,
+                local_files_only=local_only,
+            ).to(self.device)
+            self.whisper_model.eval()
+            LOGGER.info("Whisper fallback ready on %s", self.device)
+        except Exception as exc:
+            self.use_whisper_fallback = False
+            self.whisper_processor = None
+            self.whisper_model = None
+            LOGGER.warning("Whisper fallback unavailable; using Parakeet only: %s", exc)
 
     def _load_deepfilter(self) -> None:
         try:
@@ -340,6 +383,77 @@ class ASRManager:
         if self.use_domain_correction and self.domain_term_index:
             text = self._apply_domain_corrections(text)
         return text
+
+    def _maybe_whisper_rescue(self, audio: np.ndarray, parakeet_text: str) -> str:
+        if not self._should_try_whisper(audio, parakeet_text):
+            return parakeet_text
+        whisper_text = self._whisper_transcribe(audio)
+        if not whisper_text:
+            return parakeet_text
+        return self._choose_transcript(parakeet_text, whisper_text)
+
+    def _should_try_whisper(self, audio: np.ndarray, text: str) -> bool:
+        if (
+            not self.use_whisper_fallback
+            or self.whisper_model is None
+            or self.whisper_processor is None
+            or self.whisper_mode in {"0", "false", "off", "none"}
+        ):
+            return False
+        if self.whisper_mode in {"1", "true", "always", "all"}:
+            return True
+
+        words = self._word_tokens(text)
+        duration = max(0.001, float(audio.shape[0]) / TARGET_SAMPLE_RATE)
+        if not text.strip():
+            return True
+        if duration >= 8.0 and len(words) < max(4, int(duration * 0.7)):
+            return True
+        if duration >= 15.0 and len(set(token.lower() for token in words)) <= 3:
+            return True
+        if len(text) < 20 and duration >= 10.0:
+            return True
+        return False
+
+    def _whisper_transcribe(self, audio: np.ndarray) -> str:
+        if self.whisper_model is None or self.whisper_processor is None:
+            return ""
+        try:
+            inputs = self.whisper_processor(
+                audio,
+                sampling_rate=TARGET_SAMPLE_RATE,
+                return_tensors="pt",
+            )
+            input_features = inputs.input_features.to(
+                self.device,
+                dtype=self.whisper_dtype,
+            )
+            generate_kwargs: dict[str, Any] = {
+                "max_new_tokens": self.whisper_max_new_tokens,
+                "num_beams": 1,
+                "do_sample": False,
+            }
+            if self.whisper_language:
+                generate_kwargs["language"] = self.whisper_language
+                generate_kwargs["task"] = "transcribe"
+            predicted_ids = self.whisper_model.generate(input_features, **generate_kwargs)
+            text = self.whisper_processor.batch_decode(
+                predicted_ids,
+                skip_special_tokens=True,
+            )[0]
+            return self._normalize_memory_text(text)
+        except Exception as exc:
+            LOGGER.warning("Whisper fallback failed: %s", exc)
+            return ""
+
+    def _choose_transcript(self, parakeet_text: str, whisper_text: str) -> str:
+        parakeet_words = self._word_tokens(parakeet_text)
+        whisper_words = self._word_tokens(whisper_text)
+        if not parakeet_words:
+            return whisper_text
+        if len(whisper_words) >= max(4, int(len(parakeet_words) * 0.9)):
+            return whisper_text
+        return parakeet_text
 
     def _normalize_memory_text(self, text: Any) -> str:
         return " ".join(str(text).strip().split())
