@@ -1,53 +1,44 @@
-# Dockerfile for the TIL ASR container.
-FROM nvcr.io/nvidia/pytorch:25.11-py3
+FROM nvidia/cuda:12.1.0-cudnn8-runtime-ubuntu22.04
 
-ENV PYTHONDONTWRITEBYTECODE=1 \
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_ROOT_USER_ACTION=ignore \
-    HF_HOME=/workspace/.cache/huggingface \
-    ASR_ENGINE=hybrid \
-    MERALION_MODEL_PATH=/workspace/models/MERaLiON-2-3B \
-    WHISPER_MODEL_PATH=/workspace/model/whisper-large-v3-turbo \
-    WHISPER_BASE_MODEL_PATH=/workspace/models/whisper-large-v3-turbo \
-    ASR_USE_DEEPFILTERNET=1 \
-    ASR_DF_MODE=selective \
-    ASR_USE_DF_RESCUE=1 \
-    ASR_USE_WHISPER_FALLBACK=1 \
-    ASR_MAX_NEW_TOKENS=256 \
-    ASR_HYBRID_MIN_CHARS=24 \
-    ASR_HYBRID_MIN_WORDS=5 \
-    ASR_HYBRID_MIN_CHARS_PER_SECOND=4.0 \
-    ASR_HYBRID_MIN_WORDS_PER_SECOND=0.45
-
-WORKDIR /workspace
+    ASR_MODEL_NAME=nvidia/parakeet-tdt-1.1b \
+    ASR_MODEL_CACHE=/app/model/parakeet \
+    ASR_USE_DEEPFILTERNET=0 \
+    ASR_DF_MODE=off \
+    ASR_MAX_SECONDS=35 \
+    NVIDIA_VISIBLE_DEVICES=all \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3 \
+        python3-pip \
+        python3-dev \
+        build-essential \
+        cargo \
         ffmpeg \
         git \
         libsndfile1 \
+        pkg-config \
         rustc \
-        cargo \
+        sox \
     && rm -rf /var/lib/apt/lists/*
 
-RUN pip install --upgrade pip setuptools wheel
+RUN ln -sf /usr/bin/pip3 /usr/bin/pip
+
+WORKDIR /app
+
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN python3 -m pip install --no-cache-dir --upgrade pip setuptools wheel \
+    && pip install --no-cache-dir -r requirements.txt
 
-COPY model ./model/
+# Bake Parakeet-TDT-1.1B into the image so runtime has zero NGC download latency.
+RUN python3 -c "import os; import nemo.collections.asr as nemo_asr; os.makedirs('/app/model/parakeet', exist_ok=True); model = nemo_asr.models.ASRModel.from_pretrained('nvidia/parakeet-tdt-1.1b'); model.save_to('/app/model/parakeet/parakeet-tdt-1.1b.nemo'); print('Parakeet-TDT-1.1B saved')"
 
-# Bake MERaLiON only when explicitly using it; trained Whisper is the default.
-ARG MERALION_MODEL_ID=MERaLiON/MERaLiON-2-3B
-RUN if [ "${ASR_ENGINE}" != "whisper" ]; then \
-        python -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='${MERALION_MODEL_ID}', local_dir='${MERALION_MODEL_PATH}', local_dir_use_symlinks=False, ignore_patterns=['*.md', '*.png', '*.pdf'])"; \
-    fi
-
-# If no fine-tuned Whisper checkpoint was copied in, bake the base model.
-ARG WHISPER_MODEL_ID=openai/whisper-large-v3-turbo
-RUN if [ ! -f "${WHISPER_MODEL_PATH}/config.json" ]; then \
-        python -c "import os; from huggingface_hub import snapshot_download; snapshot_download(repo_id='${WHISPER_MODEL_ID}', local_dir=os.environ['WHISPER_BASE_MODEL_PATH'], local_dir_use_symlinks=False, ignore_patterns=['*.md', '*.png', '*.pdf'])"; \
-    fi
-
-COPY src .
+COPY src/ ./src/
+WORKDIR /app/src
 
 EXPOSE 5001
 CMD ["uvicorn", "asr_server:app", "--host", "0.0.0.0", "--port", "5001", "--workers", "1"]
