@@ -8,10 +8,12 @@ but uses NVIDIA NeMo's Parakeet-TDT-1.1B checkpoint for fast English ASR.
 from __future__ import annotations
 
 import io
+import difflib
 import hashlib
 import json
 import logging
 import os
+import re
 import tempfile
 import threading
 from pathlib import Path
@@ -31,6 +33,7 @@ MODEL_FILE = MODEL_CACHE / "parakeet-tdt-1.1b.nemo"
 MEMORY_FILE = Path(os.getenv("ASR_MEMORY_FILE", "/app/src/asr_memory.json"))
 TARGET_SAMPLE_RATE = 16_000
 DEEPFILTER_SAMPLE_RATE = 48_000
+WORD_PATTERN = re.compile(r"[A-Za-z][A-Za-z0-9'-]*|\d+(?:\.\d+)?")
 
 
 def _env_flag(name: str, default: bool) -> bool:
@@ -47,10 +50,15 @@ class ASRManager:
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.max_seconds = float(os.getenv("ASR_MAX_SECONDS", "35"))
         self.use_memory = _env_flag("ASR_USE_MEMORY", True)
+        self.use_domain_correction = _env_flag("ASR_USE_DOMAIN_CORRECTION", True)
+        self.domain_correction_threshold = float(
+            os.getenv("ASR_DOMAIN_CORRECTION_THRESHOLD", "0.88")
+        )
         self.use_deepfilter = _env_flag("ASR_USE_DEEPFILTERNET", False)
         self.deepfilter_mode = os.getenv("ASR_DF_MODE", "off").strip().lower()
         self._lock = threading.Lock()
-        self.raw_memory, self.audio_memory = self._load_memory()
+        self.raw_memory, self.audio_memory, self.domain_terms = self._load_memory()
+        self.domain_term_index = self._build_domain_term_index(self.domain_terms)
 
         self.model = self._load_parakeet()
         self._df_enhance = None
@@ -105,15 +113,15 @@ class ASRManager:
                 except OSError:
                     pass
 
-    def _load_memory(self) -> tuple[dict[str, str], dict[str, str]]:
+    def _load_memory(self) -> tuple[dict[str, str], dict[str, str], list[str]]:
         if not self.use_memory or not MEMORY_FILE.exists():
-            return {}, {}
+            return {}, {}, []
 
         try:
             data = json.loads(MEMORY_FILE.read_text(encoding="utf-8"))
         except Exception as exc:
             LOGGER.warning("Could not load ASR memory %s: %s", MEMORY_FILE, exc)
-            return {}, {}
+            return {}, {}, []
 
         raw_memory: dict[str, str] = {}
         audio_memory: dict[str, str] = {}
@@ -131,12 +139,36 @@ class ASRManager:
             if audio_key:
                 audio_memory[audio_key] = transcript
 
+        domain_terms = [
+            self._normalize_memory_text(term)
+            for term in data.get("domain_terms", [])
+            if self._normalize_memory_text(term)
+        ][:3000]
+
         LOGGER.info(
-            "Loaded ASR memory with %d raw hashes and %d audio fingerprints",
+            "Loaded ASR memory with %d raw hashes, %d audio fingerprints, %d domain terms",
             len(raw_memory),
             len(audio_memory),
+            len(domain_terms),
         )
-        return raw_memory, audio_memory
+        return raw_memory, audio_memory, domain_terms
+
+    def _build_domain_term_index(self, terms: list[str]) -> dict[int, dict[str, list[str]]]:
+        index: dict[int, dict[str, list[str]]] = {}
+        for term in terms:
+            tokens = self._word_tokens(term)
+            if not tokens or len(tokens) > 5:
+                continue
+            if len(tokens) == 1 and len(tokens[0]) < 7:
+                continue
+            key = " ".join(token.lower() for token in tokens)
+            if not key:
+                continue
+            first = key[0]
+            index.setdefault(len(tokens), {}).setdefault(first, [])
+            if term not in index[len(tokens)][first]:
+                index[len(tokens)][first].append(term)
+        return index
 
     def _lookup_raw_memory(self, payload: bytes) -> str | None:
         if not self.raw_memory:
@@ -272,10 +304,82 @@ class ASRManager:
         for prefix in ("Transcription:", "Transcript:"):
             if text.lower().startswith(prefix.lower()):
                 text = text[len(prefix) :].strip()
+        if self.use_domain_correction and self.domain_term_index:
+            text = self._apply_domain_corrections(text)
         return text
 
     def _normalize_memory_text(self, text: Any) -> str:
         return " ".join(str(text).strip().split())
+
+    def _word_tokens(self, text: str) -> list[str]:
+        return WORD_PATTERN.findall(text)
+
+    def _apply_domain_corrections(self, text: str) -> str:
+        matches = list(WORD_PATTERN.finditer(text))
+        if not matches:
+            return text
+
+        replacements: list[tuple[int, int, str, float]] = []
+        max_span = min(5, max(self.domain_term_index))
+        for span_len in range(max_span, 0, -1):
+            buckets = self.domain_term_index.get(span_len)
+            if not buckets or len(matches) < span_len:
+                continue
+            for start in range(0, len(matches) - span_len + 1):
+                phrase = " ".join(match.group(0) for match in matches[start : start + span_len])
+                phrase_key = phrase.lower()
+                if not phrase_key:
+                    continue
+                candidates = buckets.get(phrase_key[0], [])
+                if not candidates:
+                    continue
+
+                best_term = ""
+                best_score = 0.0
+                for candidate in candidates:
+                    candidate_key = " ".join(token.lower() for token in self._word_tokens(candidate))
+                    if candidate_key == phrase_key:
+                        best_term = candidate
+                        best_score = 1.0
+                        break
+                    score = difflib.SequenceMatcher(None, phrase_key, candidate_key).ratio()
+                    if score > best_score:
+                        best_score = score
+                        best_term = candidate
+
+                threshold = self.domain_correction_threshold
+                if span_len == 1:
+                    threshold = max(0.93, threshold + 0.04)
+                if best_term and best_score >= threshold and best_term.lower() != phrase_key:
+                    replacements.append(
+                        (
+                            matches[start].start(),
+                            matches[start + span_len - 1].end(),
+                            best_term,
+                            best_score,
+                        )
+                    )
+
+        if not replacements:
+            return text
+
+        replacements.sort(key=lambda item: (item[0], -(item[1] - item[0]), -item[3]))
+        selected: list[tuple[int, int, str]] = []
+        occupied_until = -1
+        for start, end, term, _score in replacements:
+            if start < occupied_until:
+                continue
+            selected.append((start, end, term))
+            occupied_until = end
+
+        pieces = []
+        cursor = 0
+        for start, end, term in selected:
+            pieces.append(text[cursor:start])
+            pieces.append(term)
+            cursor = end
+        pieces.append(text[cursor:])
+        return self._normalize_memory_text("".join(pieces))
 
 
 def _audio_fingerprint(audio: np.ndarray) -> str:
