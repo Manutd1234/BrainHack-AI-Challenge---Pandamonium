@@ -29,6 +29,7 @@ N_ENVS = int(os.getenv("AE_N_ENVS", "8"))
 N_CPUS = int(os.getenv("AE_N_CPUS", str(N_ENVS)))
 SEED = int(os.getenv("AE_SEED", "88"))
 RESUME_PATH = Path(os.getenv("AE_RESUME_PATH", "model/policy.zip"))
+OUTPUT_PATH = Path(os.getenv("AE_OUTPUT_PATH", "model/policy.zip"))
 RESUME = os.getenv("AE_RESUME", "true").lower() in {"1", "true", "yes"}
 FINETUNE = os.getenv("AE_FINETUNE", "true").lower() in {"1", "true", "yes"}
 FINETUNE_LR = float(os.getenv("AE_FINETUNE_LR", "0.0001"))
@@ -170,8 +171,9 @@ def train() -> None:
         ],
     )
 
-    model.save("model/policy")
-    print("Saved PPO checkpoint to model/policy.zip")
+    OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    model.save(str(OUTPUT_PATH))
+    print(f"Saved PPO checkpoint to {OUTPUT_PATH}")
 
 
 if __name__ == "__main__":
