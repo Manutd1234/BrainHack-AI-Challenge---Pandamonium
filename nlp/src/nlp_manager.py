@@ -332,22 +332,7 @@ class NLPManager:
             print(f"Loading reranker: {self.reranker_model_id}", flush=True)
             self.reranker = FlagReranker(self.reranker_model_id, use_fp16=use_fp16)
 
-        if self.use_llm and self._valid_llm_path(Path(self.model_path)):
-            print(f"Loading quantized Qwen3 model from {self.model_path}", flush=True)
-            self.tokenizer = AutoTokenizer.from_pretrained(
-                self.model_path,
-                trust_remote_code=True,
-                local_files_only=Path(self.model_path).exists(),
-            )
-            self.llm = AutoModelForCausalLM.from_pretrained(
-                self.model_path,
-                torch_dtype="auto",
-                device_map="auto",
-                trust_remote_code=True,
-                local_files_only=Path(self.model_path).exists(),
-            )
-            self.llm.eval()
-        elif self.use_llm:
+        if self.use_llm and not self._valid_llm_path(Path(self.model_path)):
             print(
                 f"Qwen requested but {self.model_path} is not a complete local model; "
                 "continuing with fast extractive RAG.",
@@ -562,17 +547,18 @@ class NLPManager:
         return selected
 
     def _generate(self, question: str, context_chunks: list[Chunk]) -> str:
-        if self.llm is None or self.tokenizer is None:
-            extracted = self._extract_answer(question, context_chunks)
-            if self._should_try_qa_reader(question, extracted):
-                reader_answer, reader_score = self._qa_reader_answer(question, context_chunks)
-                if self._prefer_qa_reader_answer(question, extracted, reader_answer, reader_score):
-                    return reader_answer
+        extracted = self._extract_answer(question, context_chunks)
+        if self._should_try_qa_reader(question, extracted):
+            reader_answer, reader_score = self._qa_reader_answer(question, context_chunks)
+            if self._prefer_qa_reader_answer(question, extracted, reader_answer, reader_score):
+                return reader_answer
+        if not self.use_llm:
             return extracted
         if self.llm_mode not in {"1", "true", "yes", "always", "all"}:
-            extracted = self._extract_answer(question, context_chunks)
             if not self._should_use_llm(question, extracted):
                 return extracted
+        if not self._ensure_llm_loaded():
+            return extracted
 
         context = self._format_context(context_chunks, max_chars=self.llm_max_context_chars)
         prompt = (
@@ -609,6 +595,38 @@ class NLPManager:
         generated_ids = outputs[0][inputs["input_ids"].shape[-1] :]
         answer = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
         return self._strip_thinking(answer)
+
+    def _ensure_llm_loaded(self) -> bool:
+        if self.llm is not None and self.tokenizer is not None:
+            return True
+        if not self.use_llm:
+            return False
+        try:
+            print(f"Lazy-loading quantized Qwen3 model from {self.model_path}", flush=True)
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                self.model_path,
+                trust_remote_code=True,
+                local_files_only=Path(self.model_path).exists(),
+            )
+            self.llm = AutoModelForCausalLM.from_pretrained(
+                self.model_path,
+                torch_dtype="auto",
+                device_map="auto",
+                trust_remote_code=True,
+                local_files_only=Path(self.model_path).exists(),
+            )
+            self.llm.eval()
+            return True
+        except Exception as exc:
+            print(
+                f"Qwen load failed ({type(exc).__name__}: {exc}); "
+                "continuing with fast extractive RAG.",
+                flush=True,
+            )
+            self.tokenizer = None
+            self.llm = None
+            self.use_llm = False
+            return False
 
     def _should_use_llm(self, question: str, extracted_answer: str) -> bool:
         if self.llm_mode in {"0", "false", "no", "off", "never", "none"}:
