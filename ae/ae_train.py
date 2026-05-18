@@ -17,6 +17,7 @@ import supersuit as ss
 from gymnasium import spaces
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import CheckpointCallback, EvalCallback
+from stable_baselines3.common.utils import get_schedule_fn
 from stable_baselines3.common.vec_env import VecMonitor
 
 from til_environment.bomberman_env import parallel_basic_env
@@ -29,6 +30,9 @@ N_CPUS = int(os.getenv("AE_N_CPUS", str(N_ENVS)))
 SEED = int(os.getenv("AE_SEED", "88"))
 RESUME_PATH = Path(os.getenv("AE_RESUME_PATH", "model/policy.zip"))
 RESUME = os.getenv("AE_RESUME", "true").lower() in {"1", "true", "yes"}
+FINETUNE = os.getenv("AE_FINETUNE", "true").lower() in {"1", "true", "yes"}
+FINETUNE_LR = float(os.getenv("AE_FINETUNE_LR", "0.0001"))
+FINETUNE_ENT_COEF = float(os.getenv("AE_FINETUNE_ENT_COEF", "0.005"))
 
 PPO_CONFIG = {
     "policy": "MultiInputPolicy",
@@ -132,6 +136,14 @@ def train() -> None:
     if RESUME and RESUME_PATH.exists():
         print(f"Resuming PPO checkpoint from {RESUME_PATH}")
         model = PPO.load(RESUME_PATH, env=train_env, seed=SEED, device=device)
+        if FINETUNE:
+            print(
+                f"Fine-tuning with learning_rate={FINETUNE_LR} "
+                f"ent_coef={FINETUNE_ENT_COEF}"
+            )
+            model.learning_rate = FINETUNE_LR
+            model.lr_schedule = get_schedule_fn(FINETUNE_LR)
+            model.ent_coef = FINETUNE_ENT_COEF
         reset_num_timesteps = False
     else:
         model = PPO(env=train_env, seed=SEED, device=device, **PPO_CONFIG)

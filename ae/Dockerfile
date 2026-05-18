@@ -5,7 +5,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_ROOT_USER_ACTION=ignore \
     AE_CHECKPOINT_PATH=/app/model/policy.zip \
-    AE_POLICY_MODE=ppo_move_first
+    AE_POLICY_MODE=hybrid
 
 WORKDIR /app
 
