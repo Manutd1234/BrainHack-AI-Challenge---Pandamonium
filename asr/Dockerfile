@@ -6,6 +6,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PIP_ROOT_USER_ACTION=ignore \
     ASR_MODEL_NAME=nvidia/parakeet-tdt-1.1b \
     ASR_MODEL_CACHE=/app/model/parakeet \
+    ASR_USE_MEMORY=1 \
     ASR_USE_DEEPFILTERNET=0 \
     ASR_DF_MODE=off \
     ASR_MAX_SECONDS=35 \

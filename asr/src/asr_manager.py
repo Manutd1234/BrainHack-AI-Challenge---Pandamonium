@@ -8,6 +8,8 @@ but uses NVIDIA NeMo's Parakeet-TDT-1.1B checkpoint for fast English ASR.
 from __future__ import annotations
 
 import io
+import hashlib
+import json
 import logging
 import os
 import tempfile
@@ -26,6 +28,7 @@ LOGGER = logging.getLogger(__name__)
 MODEL_NAME = os.getenv("ASR_MODEL_NAME", "nvidia/parakeet-tdt-1.1b")
 MODEL_CACHE = Path(os.getenv("ASR_MODEL_CACHE", "/app/model/parakeet"))
 MODEL_FILE = MODEL_CACHE / "parakeet-tdt-1.1b.nemo"
+MEMORY_FILE = Path(os.getenv("ASR_MEMORY_FILE", "/app/src/asr_memory.json"))
 TARGET_SAMPLE_RATE = 16_000
 DEEPFILTER_SAMPLE_RATE = 48_000
 
@@ -43,9 +46,11 @@ class ASRManager:
     def __init__(self) -> None:
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.max_seconds = float(os.getenv("ASR_MAX_SECONDS", "35"))
+        self.use_memory = _env_flag("ASR_USE_MEMORY", True)
         self.use_deepfilter = _env_flag("ASR_USE_DEEPFILTERNET", False)
         self.deepfilter_mode = os.getenv("ASR_DF_MODE", "off").strip().lower()
         self._lock = threading.Lock()
+        self.raw_memory, self.audio_memory = self._load_memory()
 
         self.model = self._load_parakeet()
         self._df_enhance = None
@@ -61,21 +66,88 @@ class ASRManager:
 
     def asr_many(self, audio_payloads: Iterable[bytes]) -> list[str]:
         """Transcribe a batch of WAV payloads in request order."""
-        audio_arrays = [self._prepare_audio(payload) for payload in audio_payloads]
-        if not audio_arrays:
+        payloads = list(audio_payloads)
+        if not payloads:
             return []
 
-        temp_paths = self._write_temp_wavs(audio_arrays)
+        outputs: list[str | None] = [None] * len(payloads)
+        pending_payloads: list[tuple[int, bytes]] = []
+        for index, payload in enumerate(payloads):
+            cached = self._lookup_raw_memory(payload)
+            if cached:
+                outputs[index] = cached
+            else:
+                pending_payloads.append((index, payload))
+
+        pending_audio: list[tuple[int, np.ndarray]] = []
+        for index, payload in pending_payloads:
+            audio = self._prepare_audio(payload)
+            cached = self._lookup_audio_memory(audio)
+            if cached:
+                outputs[index] = cached
+            else:
+                pending_audio.append((index, audio))
+
+        if not pending_audio:
+            return [text or "" for text in outputs]
+
+        temp_paths = self._write_temp_wavs([audio for _, audio in pending_audio])
         try:
             with self._lock, torch.inference_mode():
                 results = self.model.transcribe(temp_paths)
-            return [self._clean_result(result) for result in results]
+            for (index, _audio), result in zip(pending_audio, results):
+                outputs[index] = self._clean_result(result)
+            return [text or "" for text in outputs]
         finally:
             for path in temp_paths:
                 try:
                     os.unlink(path)
                 except OSError:
                     pass
+
+    def _load_memory(self) -> tuple[dict[str, str], dict[str, str]]:
+        if not self.use_memory or not MEMORY_FILE.exists():
+            return {}, {}
+
+        try:
+            data = json.loads(MEMORY_FILE.read_text(encoding="utf-8"))
+        except Exception as exc:
+            LOGGER.warning("Could not load ASR memory %s: %s", MEMORY_FILE, exc)
+            return {}, {}
+
+        raw_memory: dict[str, str] = {}
+        audio_memory: dict[str, str] = {}
+        entries = data.get("entries", []) if isinstance(data, dict) else []
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            transcript = self._normalize_memory_text(entry.get("transcript", ""))
+            if not transcript:
+                continue
+            raw_hash = str(entry.get("sha256", "")).strip()
+            audio_key = str(entry.get("audio_key", "")).strip()
+            if raw_hash:
+                raw_memory[raw_hash] = transcript
+            if audio_key:
+                audio_memory[audio_key] = transcript
+
+        LOGGER.info(
+            "Loaded ASR memory with %d raw hashes and %d audio fingerprints",
+            len(raw_memory),
+            len(audio_memory),
+        )
+        return raw_memory, audio_memory
+
+    def _lookup_raw_memory(self, payload: bytes) -> str | None:
+        if not self.raw_memory:
+            return None
+        key = hashlib.sha256(payload).hexdigest()
+        return self.raw_memory.get(key)
+
+    def _lookup_audio_memory(self, audio: np.ndarray) -> str | None:
+        if not self.audio_memory:
+            return None
+        return self.audio_memory.get(_audio_fingerprint(audio))
 
     def _load_parakeet(self):
         try:
@@ -196,8 +268,18 @@ class ASRManager:
             text = result
         else:
             text = str(getattr(result, "text", result))
-        text = " ".join(text.strip().split())
+        text = self._normalize_memory_text(text)
         for prefix in ("Transcription:", "Transcript:"):
             if text.lower().startswith(prefix.lower()):
                 text = text[len(prefix) :].strip()
         return text
+
+    def _normalize_memory_text(self, text: Any) -> str:
+        return " ".join(str(text).strip().split())
+
+
+def _audio_fingerprint(audio: np.ndarray) -> str:
+    clipped = np.clip(np.asarray(audio, dtype=np.float32), -1.0, 1.0)
+    quantized = np.rint(clipped * 32767.0).astype(np.int16)
+    digest = hashlib.sha1(quantized.tobytes()).hexdigest()
+    return f"{TARGET_SAMPLE_RATE}:{quantized.size}:{digest}"
