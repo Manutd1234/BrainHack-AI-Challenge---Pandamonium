@@ -49,14 +49,16 @@ class ASRManager:
     def __init__(self) -> None:
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.max_seconds = float(os.getenv("ASR_MAX_SECONDS", "35"))
-        self.use_memory = _env_flag("ASR_USE_MEMORY", True)
-        self.use_domain_correction = _env_flag("ASR_USE_DOMAIN_CORRECTION", True)
+        self.batch_size = max(1, int(os.getenv("ASR_BATCH_SIZE", "8")))
+        self.use_memory = _env_flag("ASR_USE_MEMORY", False)
+        self.use_domain_correction = _env_flag("ASR_USE_DOMAIN_CORRECTION", False)
         self.domain_correction_threshold = float(
             os.getenv("ASR_DOMAIN_CORRECTION_THRESHOLD", "0.88")
         )
         self.use_deepfilter = _env_flag("ASR_USE_DEEPFILTERNET", False)
         self.deepfilter_mode = os.getenv("ASR_DF_MODE", "off").strip().lower()
         self._lock = threading.Lock()
+        self._transcribe_kwargs: dict[str, Any] | None = None
         self.raw_memory, self.audio_memory, self.domain_terms = self._load_memory()
         self.domain_term_index = self._build_domain_term_index(self.domain_terms)
 
@@ -102,7 +104,7 @@ class ASRManager:
         temp_paths = self._write_temp_wavs([audio for _, audio in pending_audio])
         try:
             with self._lock, torch.inference_mode():
-                results = self.model.transcribe(temp_paths)
+                results = self._transcribe_paths(temp_paths)
             for (index, _audio), result in zip(pending_audio, results):
                 outputs[index] = self._clean_result(result)
             return [text or "" for text in outputs]
@@ -199,6 +201,11 @@ class ASRManager:
 
         model = model.to(self.device)
         model.eval()
+        if self.device == "cuda":
+            try:
+                torch.set_float32_matmul_precision("high")
+            except Exception:
+                pass
         LOGGER.info("Parakeet ready on %s", self.device)
         return model
 
@@ -220,7 +227,7 @@ class ASRManager:
         temp_paths = self._write_temp_wavs([dummy])
         try:
             with self._lock, torch.inference_mode():
-                self.model.transcribe(temp_paths)
+                self._transcribe_paths(temp_paths)
             LOGGER.info("ASR warmup complete")
         finally:
             for path in temp_paths:
@@ -294,6 +301,32 @@ class ASRManager:
             sf.write(handle.name, audio, TARGET_SAMPLE_RATE)
             paths.append(handle.name)
         return paths
+
+    def _transcribe_paths(self, paths: list[str]):
+        """Call NeMo transcribe with batch kwargs when this version supports them."""
+        batch_size = min(self.batch_size, max(1, len(paths)))
+        if self._transcribe_kwargs is not None:
+            kwargs = dict(self._transcribe_kwargs)
+            if "batch_size" in kwargs:
+                kwargs["batch_size"] = batch_size
+            return self.model.transcribe(paths, **kwargs)
+
+        kwargs_options = (
+            {"batch_size": batch_size, "verbose": False},
+            {"batch_size": batch_size},
+            {},
+        )
+        last_error: TypeError | None = None
+        for kwargs in kwargs_options:
+            try:
+                results = self.model.transcribe(paths, **kwargs)
+                self._transcribe_kwargs = dict(kwargs)
+                return results
+            except TypeError as exc:
+                last_error = exc
+        if last_error is not None:
+            raise last_error
+        return self.model.transcribe(paths)
 
     def _clean_result(self, result: Any) -> str:
         if isinstance(result, str):
