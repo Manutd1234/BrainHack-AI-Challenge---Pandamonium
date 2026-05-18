@@ -259,6 +259,7 @@ class NLPManager:
         self.top_k_retrieve = int(os.getenv("NLP_TOP_K_RETRIEVE", config.get("top_k_retrieve", 40)))
         self.top_k_rerank = int(os.getenv("NLP_TOP_K_RERANK", config.get("top_k_rerank", 12)))
         self.max_context_chars = int(os.getenv("NLP_MAX_CONTEXT_CHARS", config.get("max_context_chars", 7000)))
+        self.llm_max_context_chars = int(os.getenv("NLP_LLM_MAX_CONTEXT_CHARS", "3600"))
         self.max_new_tokens = int(os.getenv("NLP_MAX_NEW_TOKENS", "256"))
         self.answer_lookup = self._load_answer_lookup(
             Path(
@@ -573,7 +574,7 @@ class NLPManager:
             if not self._should_use_llm(question, extracted):
                 return extracted
 
-        context = self._format_context(context_chunks)
+        context = self._format_context(context_chunks, max_chars=self.llm_max_context_chars)
         prompt = (
             "Answer the question using only the context below. Return only the final "
             "short answer, with no explanation, no citations, and no preamble. If a "
@@ -610,10 +611,14 @@ class NLPManager:
         return self._strip_thinking(answer)
 
     def _should_use_llm(self, question: str, extracted_answer: str) -> bool:
+        if self.llm_mode in {"0", "false", "no", "off", "never", "none"}:
+            return False
         question_key = self._question_key(question)
         question_tokens = set(question_key.split())
         if self._is_pattern_answer(question_key, extracted_answer):
             return False
+        if not extracted_answer:
+            return True
         reasoning_phrases = {
             "how many",
             "how much",
@@ -833,12 +838,13 @@ class NLPManager:
                 add_generation_prompt=True,
             )
 
-    def _format_context(self, chunks: list[Chunk]) -> str:
+    def _format_context(self, chunks: list[Chunk], max_chars: int | None = None) -> str:
         parts = []
         current_length = 0
+        limit = max_chars if max_chars is not None else self.max_context_chars
         for chunk in chunks:
             part = f"[{chunk.document_id}]\n{chunk.text}"
-            if parts and current_length + len(part) > self.max_context_chars:
+            if parts and current_length + len(part) > limit:
                 break
             parts.append(part)
             current_length += len(part)

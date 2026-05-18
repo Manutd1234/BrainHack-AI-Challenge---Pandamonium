@@ -19,13 +19,15 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     NLP_QA_MEMORY_MIN_OVERLAP=4 \
     NLP_DOC_BM25_BOOST=0.55 \
     NLP_USE_DENSE=0 \
-    NLP_USE_LLM=0 \
+    NLP_USE_LLM=1 \
     NLP_USE_QA_READER=0 \
     NLP_QA_READER_MODEL_PATH=/app/models/qa-reader \
     NLP_QA_READER_CONTEXTS=5 \
     NLP_QA_READER_MIN_SCORE=5.0 \
     NLP_LLM_MODE=selective \
-    NLP_MAX_NEW_TOKENS=96
+    NLP_MAX_NEW_TOKENS=80 \
+    NLP_LLM_MAX_CONTEXT_CHARS=3600 \
+    NLP_EXTRACTIVE_MAX_CHARS=190
 
 WORKDIR /app
 
@@ -37,6 +39,8 @@ COPY requirements.txt .
 RUN python -m pip install --no-cache-dir --upgrade pip setuptools wheel \
     && pip install --no-cache-dir -r requirements.txt \
     && pip install --no-cache-dir --upgrade "transformers>=4.51.0"
+
+RUN python -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='Qwen/Qwen3-8B-AWQ', local_dir='/app/src/qwen-quantized', local_dir_use_symlinks=False, ignore_patterns=['*.md','*.png','*.pdf'])"
 
 COPY src/ ./src/
 
