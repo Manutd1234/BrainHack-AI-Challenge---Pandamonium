@@ -174,20 +174,35 @@ def train() -> None:
     resolution = int(os.getenv("RFDETR_RESOLUTION", "800"))
     output_dir = os.getenv("RFDETR_OUTPUT_DIR", "runs/rfdetr_til26")
 
+    model_kwargs = {
+        "num_classes": len(TIL_CLASSES),
+        "resolution": resolution,
+    }
+    pretrain_weights = os.getenv("RFDETR_PRETRAIN_WEIGHTS", "").strip()
+    if pretrain_weights:
+        model_kwargs["pretrain_weights"] = pretrain_weights
+
     try:
-        model = RFDETRLarge(num_classes=len(TIL_CLASSES), pretrained=True)
-    except TypeError:
+        model = RFDETRLarge(**model_kwargs)
+    except Exception as exc:
+        print(f"RFDETRLarge({model_kwargs}) failed: {exc}")
+        print("Retrying with RFDETRLarge() defaults.")
         model = RFDETRLarge()
 
-    model.train(
-        dataset_dir=str(dataset_dir),
-        epochs=epochs,
-        batch_size=batch_size,
-        grad_accumulation_steps=grad_accum,
-        resolution=resolution,
-        output_dir=output_dir,
-        num_workers=int(os.getenv("RFDETR_WORKERS", "4")),
-    )
+    train_kwargs = {
+        "dataset_dir": str(dataset_dir),
+        "epochs": epochs,
+        "batch_size": batch_size,
+        "resolution": resolution,
+        "output_dir": output_dir,
+        "num_workers": int(os.getenv("RFDETR_WORKERS", "4")),
+    }
+    try:
+        model.train(**train_kwargs, grad_accum_steps=grad_accum)
+    except TypeError as exc:
+        if "grad_accum_steps" not in str(exc):
+            raise
+        model.train(**train_kwargs, grad_accumulation_steps=grad_accum)
 
     candidates = [
         Path(output_dir) / "checkpoint_best.pth",
