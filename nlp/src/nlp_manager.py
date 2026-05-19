@@ -17,6 +17,7 @@ import torch
 from FlagEmbedding import BGEM3FlagModel, FlagReranker
 from rank_bm25 import BM25Okapi
 from transformers import AutoModelForCausalLM, AutoModelForQuestionAnswering, AutoTokenizer
+from transformers import pipeline as hf_pipeline
 
 
 TOKEN_PATTERN = re.compile(r"[A-Za-z0-9]+")
@@ -247,7 +248,10 @@ class NLPManager:
         config = self._load_json(
             Path(os.getenv("NLP_RAG_CONFIG", Path(__file__).with_name("rag_config.json")))
         )
-        self.model_path = os.getenv("QWEN_MODEL_PATH", "./qwen-quantized")
+        self.model_path = os.getenv(
+            "GEN_MODEL_PATH",
+            os.getenv("QWEN_MODEL_PATH", "./qwen-quantized"),
+        )
         self.qa_reader_path = os.getenv("NLP_QA_READER_MODEL_PATH", "/app/models/qa-reader")
         self.embedding_model_id = os.getenv("NLP_EMBEDDING_MODEL", "BAAI/bge-m3")
         self.reranker_model_id = os.getenv(
@@ -307,7 +311,8 @@ class NLPManager:
         self.qa_reader_contexts = int(os.getenv("NLP_QA_READER_CONTEXTS", "5"))
         self.qa_reader_max_length = int(os.getenv("NLP_QA_READER_MAX_LENGTH", "384"))
         self.qa_reader_max_answer_tokens = int(os.getenv("NLP_QA_READER_MAX_ANSWER_TOKENS", "24"))
-        self.qa_reader_min_score = float(os.getenv("NLP_QA_READER_MIN_SCORE", "5.0"))
+        self.qa_reader_min_score = float(os.getenv("NLP_QA_READER_MIN_SCORE", "0.70"))
+        self.qa_reader_low_score = float(os.getenv("NLP_QA_READER_LOW_SCORE", "0.20"))
         self.llm_mode = os.getenv("NLP_LLM_MODE", "selective").strip().lower()
         self.enable_thinking = _env_flag("QWEN_ENABLE_THINKING", False)
         self.do_sample = _env_flag("QWEN_DO_SAMPLE", False)
@@ -319,7 +324,9 @@ class NLPManager:
         self.llm = None
         self.qa_tokenizer = None
         self.qa_reader = None
-        self.qa_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.qa_pipeline = None
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.qa_device = torch.device(self.device)
 
         use_fp16 = torch.cuda.is_available()
         if self.use_dense:
@@ -334,23 +341,43 @@ class NLPManager:
 
         if self.use_llm and not self._valid_llm_path(Path(self.model_path)):
             print(
-                f"Qwen requested but {self.model_path} is not a complete local model; "
+                f"Generative model requested but {self.model_path} is not a complete local model; "
                 "continuing with fast extractive RAG.",
                 flush=True,
             )
             self.use_llm = False
 
         if self.use_qa_reader and self._valid_qa_reader_path(Path(self.qa_reader_path)):
-            print(f"Loading extractive QA reader from {self.qa_reader_path}", flush=True)
-            self.qa_tokenizer = AutoTokenizer.from_pretrained(
-                self.qa_reader_path,
-                local_files_only=Path(self.qa_reader_path).exists(),
-            )
-            self.qa_reader = AutoModelForQuestionAnswering.from_pretrained(
-                self.qa_reader_path,
-                local_files_only=Path(self.qa_reader_path).exists(),
-            ).to(self.qa_device)
-            self.qa_reader.eval()
+            try:
+                print(f"Loading extractive QA reader from {self.qa_reader_path}", flush=True)
+                local_reader = Path(self.qa_reader_path).exists()
+                self.qa_tokenizer = AutoTokenizer.from_pretrained(
+                    self.qa_reader_path,
+                    use_fast=True,
+                    local_files_only=local_reader,
+                )
+                self.qa_reader = AutoModelForQuestionAnswering.from_pretrained(
+                    self.qa_reader_path,
+                    torch_dtype=torch.float16 if self.device == "cuda" else torch.float32,
+                    local_files_only=local_reader,
+                )
+                self.qa_reader.to(self.qa_device)
+                self.qa_reader.eval()
+                self.qa_pipeline = hf_pipeline(
+                    "question-answering",
+                    model=self.qa_reader,
+                    tokenizer=self.qa_tokenizer,
+                    device=0 if self.device == "cuda" else -1,
+                )
+                self.qa_pipeline(question="test", context="test context")
+            except Exception as exc:
+                print(
+                    f"QA reader load failed ({type(exc).__name__}: {exc}); "
+                    "continuing with fast extractive RAG.",
+                    flush=True,
+                )
+                self.qa_pipeline = None
+                self.use_qa_reader = False
         elif self.use_qa_reader:
             print(
                 f"QA reader requested but {self.qa_reader_path} is not a complete local model; "
@@ -547,11 +574,12 @@ class NLPManager:
         return selected
 
     def _generate(self, question: str, context_chunks: list[Chunk]) -> str:
-        extracted = self._extract_answer(question, context_chunks)
-        if self._should_try_qa_reader(question, extracted):
+        if self._should_try_qa_reader(question, ""):
             reader_answer, reader_score = self._qa_reader_answer(question, context_chunks)
-            if self._prefer_qa_reader_answer(question, extracted, reader_answer, reader_score):
+            if self._prefer_qa_reader_answer(question, "", reader_answer, reader_score):
                 return reader_answer
+
+        extracted = self._extract_answer(question, context_chunks)
         if not self.use_llm:
             return extracted
         if self.llm_mode not in {"1", "true", "yes", "always", "all"}:
@@ -602,7 +630,7 @@ class NLPManager:
         if not self.use_llm:
             return False
         try:
-            print(f"Lazy-loading quantized Qwen3 model from {self.model_path}", flush=True)
+            print(f"Lazy-loading generative NLP model from {self.model_path}", flush=True)
             self.tokenizer = AutoTokenizer.from_pretrained(
                 self.model_path,
                 trust_remote_code=True,
@@ -619,7 +647,7 @@ class NLPManager:
             return True
         except Exception as exc:
             print(
-                f"Qwen load failed ({type(exc).__name__}: {exc}); "
+                f"Generative model load failed ({type(exc).__name__}: {exc}); "
                 "continuing with fast extractive RAG.",
                 flush=True,
             )
@@ -667,11 +695,23 @@ class NLPManager:
         return False
 
     def _should_try_qa_reader(self, question: str, extracted_answer: str) -> bool:
-        if self.qa_reader is None or self.qa_tokenizer is None:
+        if self.qa_pipeline is None:
+            return False
+        question_key = self._question_key(question)
+        direct_markers = (
+            "who ",
+            "what ",
+            "which ",
+            "where ",
+            "when ",
+            "by what ",
+            "how large",
+            "how much",
+        )
+        if not question_key.startswith(direct_markers) and " by what " not in f" {question_key} ":
             return False
         if not extracted_answer or len(extracted_answer) > 140:
             return True
-        question_key = self._question_key(question)
         if self._is_pattern_answer(question_key, extracted_answer):
             return False
         return bool(
@@ -682,60 +722,31 @@ class NLPManager:
         )
 
     def _qa_reader_answer(self, question: str, context_chunks: list[Chunk]) -> tuple[str, float]:
-        best_answer = ""
-        best_score = float("-inf")
-        contexts = [chunk.text for chunk in context_chunks[: self.qa_reader_contexts]]
-
-        with self.lock, torch.inference_mode():
-            for context in contexts:
-                encoded = self.qa_tokenizer(
-                    question,
-                    context,
-                    return_tensors="pt",
-                    truncation="only_second",
-                    max_length=self.qa_reader_max_length,
+        if self.qa_pipeline is None:
+            return "", 0.0
+        context = "\n\n".join(chunk.text for chunk in context_chunks[: self.qa_reader_contexts])
+        if not context.strip():
+            return "", 0.0
+        try:
+            with self.lock:
+                result = self.qa_pipeline(
+                    question=question,
+                    context=context,
+                    max_answer_len=self.qa_reader_max_answer_tokens,
+                    handle_impossible_answer=True,
+                    max_seq_len=self.qa_reader_max_length,
+                    top_k=1,
                 )
-                sequence_ids = encoded.sequence_ids(0)
-                inputs = {key: value.to(self.qa_device) for key, value in encoded.items()}
-                outputs = self.qa_reader(**inputs)
-                start_logits = outputs.start_logits[0].detach().float().cpu().numpy()
-                end_logits = outputs.end_logits[0].detach().float().cpu().numpy()
-                input_ids = encoded["input_ids"][0]
-                context_indices = [
-                    index for index, segment_id in enumerate(sequence_ids) if segment_id == 1
-                ]
-                if not context_indices:
-                    continue
-
-                top_starts = sorted(
-                    context_indices,
-                    key=lambda index: float(start_logits[index]),
-                    reverse=True,
-                )[:8]
-                top_ends = sorted(
-                    context_indices,
-                    key=lambda index: float(end_logits[index]),
-                    reverse=True,
-                )[:8]
-                for start in top_starts:
-                    for end in top_ends:
-                        if end < start:
-                            continue
-                        if end - start + 1 > self.qa_reader_max_answer_tokens:
-                            continue
-                        score = float(start_logits[start] + end_logits[end])
-                        if score <= best_score:
-                            continue
-                        answer = self.qa_tokenizer.decode(
-                            input_ids[start : end + 1],
-                            skip_special_tokens=True,
-                        )
-                        answer = self._clean_reader_answer(answer)
-                        if self._valid_reader_answer(question, answer):
-                            best_answer = answer
-                            best_score = score
-
-        return best_answer, best_score
+            if isinstance(result, list):
+                result = result[0] if result else {}
+            answer = self._clean_reader_answer(str(result.get("answer", "")))
+            score = float(result.get("score", 0.0))
+            if not self._valid_reader_answer(question, answer):
+                return "", 0.0
+            return answer, score
+        except Exception as exc:
+            print(f"Extractive QA reader error ({type(exc).__name__}: {exc})", flush=True)
+            return "", 0.0
 
     def _prefer_qa_reader_answer(
         self,
@@ -753,7 +764,7 @@ class NLPManager:
             return True
         if len(extracted_answer) > 140:
             return True
-        if len(reader_answer) < len(extracted_answer) * 0.65 and reader_score >= self.qa_reader_min_score + 2.0:
+        if len(reader_answer) < len(extracted_answer) * 0.65 and reader_score >= self.qa_reader_min_score + 0.15:
             return True
         return False
 
@@ -1478,7 +1489,7 @@ class NLPManager:
     def _valid_qa_reader_path(self, path: Path) -> bool:
         if not path.exists() or not path.is_dir():
             return False
-        tokenizers = ("tokenizer.json", "vocab.txt", "vocab.json")
+        tokenizers = ("tokenizer.json", "vocab.txt", "vocab.json", "spm.model")
         weights = ("model.safetensors", "pytorch_model.bin")
         return (path / "config.json").exists() and any(
             (path / name).exists() for name in tokenizers
