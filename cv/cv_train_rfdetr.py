@@ -16,6 +16,7 @@ import json
 import os
 import random
 import shutil
+import time
 from pathlib import Path
 from typing import Any
 
@@ -63,6 +64,34 @@ def link_or_copy(src: Path, dst: Path) -> None:
     shutil.copy2(src, dst)
 
 
+def reset_dir(path: Path) -> None:
+    """Recreate a directory, tolerating slow/stale notebook filesystems."""
+    if path.exists():
+        for attempt in range(3):
+            shutil.rmtree(path, ignore_errors=True)
+            if not path.exists():
+                break
+            time.sleep(0.4 * (attempt + 1))
+
+    if path.exists():
+        # Last resort: clear children one by one. Some mounted filesystems can
+        # report "directory not empty" even after rmtree has walked the tree.
+        for child in sorted(path.rglob("*"), key=lambda p: len(p.parts), reverse=True):
+            try:
+                if child.is_dir() and not child.is_symlink():
+                    child.rmdir()
+                else:
+                    child.unlink()
+            except OSError:
+                pass
+        try:
+            path.rmdir()
+        except OSError:
+            pass
+
+    path.mkdir(parents=True, exist_ok=True)
+
+
 def prepare_dataset() -> Path:
     images_dir = NOVICE_CV_DIR / "images"
     ann_path = NOVICE_CV_DIR / "annotations.json"
@@ -85,9 +114,7 @@ def prepare_dataset() -> Path:
 
     for split in splits:
         split_dir = OUT_DIR / split
-        if split_dir.exists():
-            shutil.rmtree(split_dir)
-        split_dir.mkdir(parents=True, exist_ok=True)
+        reset_dir(split_dir)
 
     for split, split_images in splits.items():
         write_split(split, split_images, images_dir, anns_by_image, cat_to_contiguous)
