@@ -229,7 +229,7 @@ class NLPManager:
         )
         self.use_approx_lookup = _env_flag("NLP_USE_APPROX_LOOKUP", True)
         self.use_qa_memory = _env_flag("NLP_USE_QA_MEMORY", False)
-        self.use_qa_memory_hints = _env_flag("NLP_USE_QA_MEMORY_HINTS", True)
+        self.use_qa_memory_hints = _env_flag("NLP_USE_QA_MEMORY_HINTS", False)
         self.approx_min_jaccard = float(os.getenv("NLP_APPROX_MIN_JACCARD", "0.48"))
         self.approx_min_overlap = int(os.getenv("NLP_APPROX_MIN_OVERLAP", "4"))
         self.approx_min_confidence = float(os.getenv("NLP_APPROX_MIN_CONFIDENCE", "0.64"))
