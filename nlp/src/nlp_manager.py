@@ -17,6 +17,11 @@ from FlagEmbedding import BGEM3FlagModel, FlagReranker
 from rank_bm25 import BM25Okapi
 from transformers import AutoModelForCausalLM, AutoModelForQuestionAnswering, AutoTokenizer
 
+try:
+    from peft import PeftModel
+except Exception:  # pragma: no cover - optional training/runtime dependency
+    PeftModel = None
+
 
 TOKEN_PATTERN = re.compile(r"[A-Za-z0-9]+")
 SENTENCE_PATTERN = re.compile(r"(?<=[.!?])\s+|\n+")
@@ -213,6 +218,8 @@ class NLPManager:
         self.top_k_retrieve = int(os.getenv("NLP_TOP_K_RETRIEVE", config.get("top_k_retrieve", 40)))
         self.top_k_rerank = int(os.getenv("NLP_TOP_K_RERANK", config.get("top_k_rerank", 12)))
         self.max_context_chars = int(os.getenv("NLP_MAX_CONTEXT_CHARS", config.get("max_context_chars", 7000)))
+        self.llm_context_chars = int(os.getenv("NLP_LLM_CONTEXT_CHARS", "3600"))
+        self.max_model_len = int(os.getenv("NLP_MAX_MODEL_LEN", "2048"))
         self.max_new_tokens = int(os.getenv("NLP_MAX_NEW_TOKENS", "256"))
         self.answer_lookup = self._load_answer_lookup(
             Path(
@@ -264,6 +271,8 @@ class NLPManager:
         self.llm_mode = os.getenv("NLP_LLM_MODE", "selective").strip().lower()
         self.enable_thinking = _env_flag("QWEN_ENABLE_THINKING", False)
         self.do_sample = _env_flag("QWEN_DO_SAMPLE", False)
+        self.lora_adapter_path = os.getenv("NLP_LORA_ADAPTER_PATH", "/app/src/lora_adapter")
+        self.max_gpu_memory = os.getenv("NLP_MAX_GPU_MEMORY", "").strip()
         self.lock = threading.Lock()
 
         self.embedding_model = None
@@ -296,9 +305,11 @@ class NLPManager:
                 self.model_path,
                 torch_dtype="auto",
                 device_map="auto",
+                max_memory=self._max_memory_config(),
                 trust_remote_code=True,
                 local_files_only=Path(self.model_path).exists(),
             )
+            self._load_lora_adapter()
             self.llm.eval()
         elif self.use_llm:
             print(
@@ -575,20 +586,27 @@ class NLPManager:
             if not self._should_use_llm(question, extracted):
                 return extracted
 
-        context = self._format_context(context_chunks)
+        context = self._format_context(context_chunks, max_chars=self.llm_context_chars)
+        key_terms = self._prompt_key_terms(question, context_chunks)
         prompt = (
             "Answer the question using only the context below. Return only the final "
             "short answer, with no explanation, no citations, and no preamble. If a "
             "calculation is needed, do the calculation silently and return the result. "
             "If the answer is a name, amount, date, score, duration, percentage, or "
-            "short phrase, output only that value.\n\n"
+            "short phrase, output only that value. Prefer exact spans from the context.\n\n"
+            f"Key terms: {key_terms}\n\n"
             f"Context:\n{context}\n\n"
             f"Question: {question}\n\n"
             "Answer:"
         )
         messages = [{"role": "user", "content": prompt}]
         text = self._apply_chat_template(messages)
-        inputs = self.tokenizer([text], return_tensors="pt").to(self.llm.device)
+        inputs = self.tokenizer(
+            [text],
+            return_tensors="pt",
+            truncation=True,
+            max_length=self.max_model_len,
+        ).to(self.llm.device)
 
         generation_kwargs: dict[str, Any] = {
             "max_new_tokens": self.max_new_tokens,
@@ -858,16 +876,31 @@ class NLPManager:
                 add_generation_prompt=True,
             )
 
-    def _format_context(self, chunks: list[Chunk]) -> str:
+    def _format_context(self, chunks: list[Chunk], max_chars: int | None = None) -> str:
         parts = []
         current_length = 0
+        limit = self.max_context_chars if max_chars is None else max_chars
         for chunk in chunks:
             part = f"[{chunk.document_id}]\n{chunk.text}"
-            if parts and current_length + len(part) > self.max_context_chars:
+            if parts and current_length + len(part) > limit:
                 break
             parts.append(part)
             current_length += len(part)
         return "\n\n".join(parts)
+
+    def _prompt_key_terms(self, question: str, chunks: list[Chunk]) -> str:
+        query_terms = self._content_tokens(question, expand=True)
+        chunk_terms: Counter[str] = Counter()
+        for chunk in chunks[:4]:
+            chunk_terms.update(self._content_tokens(chunk.text))
+        boosted = []
+        for term in query_terms:
+            if term not in boosted:
+                boosted.append(term)
+        for term, _ in chunk_terms.most_common(12):
+            if len(term) >= 4 and term not in boosted:
+                boosted.append(term)
+        return ", ".join(boosted[:24])
 
     def _unique_document_ids(self, chunks: list[Chunk], limit: int) -> list[str]:
         document_ids = []
@@ -1154,6 +1187,24 @@ class NLPManager:
             answer = answer.split("</think>", 1)[1]
         answer = re.sub(r"<think>.*?</think>", "", answer, flags=re.DOTALL)
         return " ".join(answer.strip().split())
+
+    def _max_memory_config(self) -> dict[int | str, str] | None:
+        if not self.max_gpu_memory or not torch.cuda.is_available():
+            return None
+        return {0: self.max_gpu_memory, "cpu": os.getenv("NLP_MAX_CPU_MEMORY", "32GiB")}
+
+    def _load_lora_adapter(self) -> None:
+        adapter_path = Path(self.lora_adapter_path)
+        if not adapter_path.exists():
+            return
+        if PeftModel is None:
+            print(
+                f"LoRA adapter found at {adapter_path}, but peft is not installed; skipping.",
+                flush=True,
+            )
+            return
+        print(f"Loading LoRA adapter from {adapter_path}", flush=True)
+        self.llm = PeftModel.from_pretrained(self.llm, str(adapter_path))
 
     def _short_answer_from_sentences(self, question: str, sentences: list[str]) -> str:
         if not sentences:
