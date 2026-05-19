@@ -2,14 +2,15 @@
 
 The TIL evaluator sends base64 WAV payloads to asr_server.py, which decodes
 them into bytes and calls ASRManager.asr_many(). This manager keeps that API
-but uses NVIDIA NeMo's Parakeet-TDT-1.1B checkpoint for fast English ASR.
+but uses NVIDIA NeMo's Parakeet-TDT checkpoint for fast English ASR.
 """
 
 from __future__ import annotations
 
-import io
 import difflib
+import contextlib
 import hashlib
+import io
 import json
 import logging
 import os
@@ -27,9 +28,10 @@ import torch
 
 LOGGER = logging.getLogger(__name__)
 
-MODEL_NAME = os.getenv("ASR_MODEL_NAME", "nvidia/parakeet-tdt-1.1b")
+MODEL_NAME = os.getenv("ASR_MODEL_NAME", "nvidia/parakeet-tdt-0.6b-v2")
 MODEL_CACHE = Path(os.getenv("ASR_MODEL_CACHE", "/app/model/parakeet"))
-MODEL_FILE = MODEL_CACHE / "parakeet-tdt-1.1b.nemo"
+MODEL_SLUG = re.sub(r"[^A-Za-z0-9_.-]+", "_", MODEL_NAME.split("/")[-1])
+MODEL_FILE = Path(os.getenv("ASR_MODEL_FILE", str(MODEL_CACHE / f"{MODEL_SLUG}.nemo")))
 WHISPER_MODEL_NAME = os.getenv("ASR_WHISPER_MODEL", "openai/whisper-large-v3-turbo")
 WHISPER_CACHE = Path(os.getenv("ASR_WHISPER_CACHE", "/app/model/whisper-large-v3-turbo"))
 MEMORY_FILE = Path(os.getenv("ASR_MEMORY_FILE", "/app/src/asr_memory.json"))
@@ -51,7 +53,9 @@ class ASRManager:
     def __init__(self) -> None:
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.max_seconds = float(os.getenv("ASR_MAX_SECONDS", "35"))
-        self.batch_size = max(1, int(os.getenv("ASR_BATCH_SIZE", "8")))
+        self.batch_size = max(1, int(os.getenv("ASR_BATCH_SIZE", "16")))
+        self.use_autocast = _env_flag("ASR_USE_AUTOCAST", self.device == "cuda")
+        self.use_fp16_weights = _env_flag("ASR_USE_FP16_WEIGHTS", False)
         self.use_whisper_fallback = _env_flag("ASR_USE_WHISPER_FALLBACK", False)
         self.whisper_mode = os.getenv("ASR_WHISPER_MODE", "rescue").strip().lower()
         self.whisper_language = os.getenv("ASR_WHISPER_LANGUAGE", "en").strip() or None
@@ -206,19 +210,30 @@ class ASRManager:
             model = nemo_asr.models.ASRModel.restore_from(str(MODEL_FILE))
         else:
             LOGGER.info("Downloading Parakeet checkpoint %s", MODEL_NAME)
-            MODEL_CACHE.mkdir(parents=True, exist_ok=True)
+            MODEL_FILE.parent.mkdir(parents=True, exist_ok=True)
             model = nemo_asr.models.ASRModel.from_pretrained(MODEL_NAME)
             model.save_to(str(MODEL_FILE))
             LOGGER.info("Saved Parakeet checkpoint to %s", MODEL_FILE)
 
         model = model.to(self.device)
+        if self.device == "cuda" and self.use_fp16_weights:
+            try:
+                model = model.half()
+                LOGGER.info("Using fp16 Parakeet weights")
+            except Exception as exc:
+                LOGGER.warning("Could not convert Parakeet weights to fp16: %s", exc)
         model.eval()
         if self.device == "cuda":
             try:
                 torch.set_float32_matmul_precision("high")
             except Exception:
                 pass
-        LOGGER.info("Parakeet ready on %s", self.device)
+        LOGGER.info(
+            "Parakeet ready on %s with autocast=%s batch_size=%d",
+            self.device,
+            self.use_autocast,
+            self.batch_size,
+        )
         return model
 
     def _load_whisper(self) -> None:
@@ -348,11 +363,18 @@ class ASRManager:
     def _transcribe_paths(self, paths: list[str]):
         """Call NeMo transcribe with batch kwargs when this version supports them."""
         batch_size = min(self.batch_size, max(1, len(paths)))
+
+        def inference_context():
+            if self.device == "cuda" and self.use_autocast:
+                return torch.autocast(device_type="cuda", dtype=torch.float16)
+            return contextlib.nullcontext()
+
         if self._transcribe_kwargs is not None:
             kwargs = dict(self._transcribe_kwargs)
             if "batch_size" in kwargs:
                 kwargs["batch_size"] = batch_size
-            return self.model.transcribe(paths, **kwargs)
+            with inference_context():
+                return self.model.transcribe(paths, **kwargs)
 
         kwargs_options = (
             {"batch_size": batch_size, "verbose": False},
@@ -362,14 +384,16 @@ class ASRManager:
         last_error: TypeError | None = None
         for kwargs in kwargs_options:
             try:
-                results = self.model.transcribe(paths, **kwargs)
+                with inference_context():
+                    results = self.model.transcribe(paths, **kwargs)
                 self._transcribe_kwargs = dict(kwargs)
                 return results
             except TypeError as exc:
                 last_error = exc
         if last_error is not None:
             raise last_error
-        return self.model.transcribe(paths)
+        with inference_context():
+            return self.model.transcribe(paths)
 
     def _clean_result(self, result: Any) -> str:
         if isinstance(result, str):
