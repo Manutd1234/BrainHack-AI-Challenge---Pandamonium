@@ -6,6 +6,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PIP_ROOT_USER_ACTION=ignore \
     ASR_MODEL_NAME=nvidia/parakeet-tdt-0.6b-v2 \
     ASR_MODEL_CACHE=/app/model/parakeet \
+    ASR_MODEL_LOAD_MAP_LOCATION=cpu \
     ASR_BATCH_SIZE=16 \
     ASR_USE_AUTOCAST=1 \
     ASR_USE_FP16_WEIGHTS=0 \
@@ -20,6 +21,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     ASR_USE_DEEPFILTERNET=0 \
     ASR_DF_MODE=off \
     ASR_MAX_SECONDS=35 \
+    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
     NVIDIA_VISIBLE_DEVICES=all \
     NVIDIA_DRIVER_CAPABILITIES=compute,utility
 

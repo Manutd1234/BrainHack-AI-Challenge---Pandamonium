@@ -32,6 +32,7 @@ MODEL_NAME = os.getenv("ASR_MODEL_NAME", "nvidia/parakeet-tdt-0.6b-v2")
 MODEL_CACHE = Path(os.getenv("ASR_MODEL_CACHE", "/app/model/parakeet"))
 MODEL_SLUG = re.sub(r"[^A-Za-z0-9_.-]+", "_", MODEL_NAME.split("/")[-1])
 MODEL_FILE = Path(os.getenv("ASR_MODEL_FILE", str(MODEL_CACHE / f"{MODEL_SLUG}.nemo")))
+MODEL_LOAD_MAP_LOCATION = os.getenv("ASR_MODEL_LOAD_MAP_LOCATION", "cpu").strip() or "cpu"
 WHISPER_MODEL_NAME = os.getenv("ASR_WHISPER_MODEL", "openai/whisper-large-v3-turbo")
 WHISPER_CACHE = Path(os.getenv("ASR_WHISPER_CACHE", "/app/model/whisper-large-v3-turbo"))
 MEMORY_FILE = Path(os.getenv("ASR_MEMORY_FILE", "/app/src/asr_memory.json"))
@@ -207,11 +208,20 @@ class ASRManager:
 
         if MODEL_FILE.exists():
             LOGGER.info("Restoring Parakeet checkpoint from %s", MODEL_FILE)
-            model = nemo_asr.models.ASRModel.restore_from(str(MODEL_FILE))
+            model = nemo_asr.models.ASRModel.restore_from(
+                str(MODEL_FILE),
+                map_location=MODEL_LOAD_MAP_LOCATION,
+            )
         else:
             LOGGER.info("Downloading Parakeet checkpoint %s", MODEL_NAME)
             MODEL_FILE.parent.mkdir(parents=True, exist_ok=True)
-            model = nemo_asr.models.ASRModel.from_pretrained(MODEL_NAME)
+            try:
+                model = nemo_asr.models.ASRModel.from_pretrained(
+                    MODEL_NAME,
+                    map_location=MODEL_LOAD_MAP_LOCATION,
+                )
+            except TypeError:
+                model = nemo_asr.models.ASRModel.from_pretrained(MODEL_NAME)
             model.save_to(str(MODEL_FILE))
             LOGGER.info("Saved Parakeet checkpoint to %s", MODEL_FILE)
 
