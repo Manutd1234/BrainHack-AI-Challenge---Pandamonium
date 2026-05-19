@@ -28,6 +28,11 @@ RUN test -f /app/model/best.pt
 
 ENV CV_MODEL_PATH=/app/model/best.pt \
     CV_MODEL_PATHS=/app/model/best.pt \
+    CV_RFDETR_PATH=/app/model/rfdetr_best.pt \
+    CV_USE_RFDETR=1 \
+    CV_RFDETR_CONF=0.12 \
+    CV_RFDETR_CONF_WEIGHT=0.85 \
+    CV_RFDETR_EMPTY_ONLY=0 \
     CV_THRESHOLD_CONFIG=/app/src/cv_thresholds.json \
     CV_USE_SAHI=0 \
     CV_SAHI_MIN_SIZE=900 \

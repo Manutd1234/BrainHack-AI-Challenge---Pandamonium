@@ -21,6 +21,7 @@ MODEL_PATHS = [
     for path in os.getenv("CV_MODEL_PATHS", MODEL_PATH).split(",")
     if path.strip()
 ]
+RFDETR_PATH = os.getenv("CV_RFDETR_PATH", "/app/model/rfdetr_best.pt")
 THRESHOLD_CONFIG_PATH = Path(
     os.getenv("CV_THRESHOLD_CONFIG", Path(__file__).with_name("cv_thresholds.json"))
 )
@@ -46,6 +47,10 @@ PRED_BATCH_SIZE = int(os.getenv("CV_PRED_BATCH_SIZE", "4"))
 USE_AUGMENT = os.getenv("CV_AUGMENT", "0").strip().lower() in {"1", "true", "yes"}
 FINAL_NMS_IOU = float(os.getenv("CV_FINAL_NMS_IOU", "0.55"))
 USE_WBF = os.getenv("CV_USE_WBF", "1").strip().lower() in {"1", "true", "yes"}
+USE_RFDETR = os.getenv("CV_USE_RFDETR", "1").strip().lower() in {"1", "true", "yes"}
+RFDETR_CONF = float(os.getenv("CV_RFDETR_CONF", "0.12"))
+RFDETR_CONF_WEIGHT = float(os.getenv("CV_RFDETR_CONF_WEIGHT", "0.85"))
+RFDETR_EMPTY_ONLY = os.getenv("CV_RFDETR_EMPTY_ONLY", "0").strip().lower() in {"1", "true", "yes"}
 FALLBACK_FLIP = os.getenv("CV_FALLBACK_FLIP", "0").strip().lower() in {"1", "true", "yes"}
 FALLBACK_MAX_COUNT = int(os.getenv("CV_FALLBACK_MAX_COUNT", "0"))
 FALLBACK_MIN_CONF = float(os.getenv("CV_FALLBACK_MIN_CONF", "0.35"))
@@ -127,6 +132,7 @@ class CVManager:
             self.models.append(model)
         self.model = self.models[0]
 
+        self.rfdetr_model = self._load_rfdetr_model() if USE_RFDETR else None
         self.sahi_model = self._load_sahi_model() if USE_SAHI else None
         for model in self.models:
             model.predict(
@@ -138,6 +144,8 @@ class CVManager:
                 augment=USE_AUGMENT,
                 verbose=False,
             )
+        if self.rfdetr_model is not None:
+            LOGGER.info("RF-DETR optional ensemble path enabled")
         LOGGER.info("CVManager ready")
 
     def cv(self, image: bytes) -> list[dict[str, Any]]:
@@ -178,6 +186,31 @@ class CVManager:
             LOGGER.warning("SAHI unavailable, falling back to full-image inference: %s", exc)
             return None
 
+    def _load_rfdetr_model(self):
+        if not os.path.exists(RFDETR_PATH):
+            LOGGER.info("RF-DETR checkpoint not found at %s; using YOLO-only CV path", RFDETR_PATH)
+            return None
+
+        try:
+            from rfdetr import RFDETRLarge
+
+            LOGGER.info("Loading RF-DETR checkpoint from %s on %s", RFDETR_PATH, self.device)
+            try:
+                model = RFDETRLarge(pretrain_weights=RFDETR_PATH)
+            except TypeError:
+                model = RFDETRLarge()
+                if hasattr(model, "load"):
+                    model.load(RFDETR_PATH)
+
+            torch_model = getattr(model, "model", None)
+            if torch_model is not None:
+                torch_model.to(self.device)
+                torch_model.eval()
+            return model
+        except Exception as exc:
+            LOGGER.warning("RF-DETR unavailable, keeping YOLO-only CV path: %s", exc)
+            return None
+
     def _decode(self, image_bytes: bytes) -> np.ndarray:
         buffer = np.frombuffer(image_bytes, dtype=np.uint8)
         image = cv2.imdecode(buffer, cv2.IMREAD_COLOR)
@@ -210,6 +243,14 @@ class CVManager:
                 )
                 for index, (result, image) in enumerate(zip(results, batch)):
                     formatted, confidences = self._format_yolo_result(result, image.shape)
+                    batch_predictions[index].extend(formatted)
+                    batch_confidences[index].extend(confidences)
+
+            if self.rfdetr_model is not None:
+                for index, image in enumerate(batch):
+                    if RFDETR_EMPTY_ONLY and batch_predictions[index]:
+                        continue
+                    formatted, confidences = self._predict_rfdetr(image)
                     batch_predictions[index].extend(formatted)
                     batch_confidences[index].extend(confidences)
 
@@ -274,6 +315,100 @@ class CVManager:
             kept_confidences.extend(confidences)
 
         return predictions, kept_confidences
+
+    def _predict_rfdetr(self, image: np.ndarray) -> tuple[list[dict[str, Any]], list[float]]:
+        if self.rfdetr_model is None:
+            return [], []
+
+        try:
+            from PIL import Image
+
+            rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            pil_image = Image.fromarray(rgb)
+            detections = self.rfdetr_model.predict(pil_image, threshold=RFDETR_CONF)
+        except Exception as exc:
+            LOGGER.warning("RF-DETR inference failed; skipping this image: %s", exc)
+            return [], []
+
+        height, width = image.shape[:2]
+        boxes_xyxy, class_ids, confidences = self._normalise_rfdetr_output(detections)
+        predictions: list[dict[str, Any]] = []
+        kept_confidences: list[float] = []
+
+        for xyxy, category_id, confidence in zip(boxes_xyxy, class_ids, confidences):
+            category_id = int(category_id)
+            confidence = float(confidence)
+            if category_id < 0 or category_id >= len(CLASS_NAMES):
+                continue
+            if confidence < CLASS_CONF.get(category_id, DEFAULT_CONF):
+                continue
+
+            x1, y1, x2, y2 = [float(value) for value in xyxy]
+            if max(abs(x1), abs(y1), abs(x2), abs(y2)) <= 1.5:
+                x1 *= width
+                x2 *= width
+                y1 *= height
+                y2 *= height
+
+            left = max(0.0, min(x1, float(width - 1)))
+            top = max(0.0, min(y1, float(height - 1)))
+            right = max(0.0, min(x2, float(width)))
+            bottom = max(0.0, min(y2, float(height)))
+            box_width = right - left
+            box_height = bottom - top
+            if box_width <= 0 or box_height <= 0:
+                continue
+
+            predictions.append(
+                {
+                    "bbox": [left, top, box_width, box_height],
+                    "category_id": category_id,
+                    "_confidence": confidence,
+                }
+            )
+            kept_confidences.append(confidence * RFDETR_CONF_WEIGHT)
+
+        return predictions, kept_confidences
+
+    def _normalise_rfdetr_output(self, detections) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        def as_numpy(value) -> np.ndarray:
+            if value is None:
+                return np.asarray([])
+            if hasattr(value, "detach"):
+                value = value.detach().cpu()
+            return np.asarray(value)
+
+        boxes = as_numpy(getattr(detections, "xyxy", None))
+        class_ids = as_numpy(
+            getattr(
+                detections,
+                "class_id",
+                getattr(detections, "class_ids", getattr(detections, "labels", None)),
+            )
+        )
+        confidences = as_numpy(
+            getattr(
+                detections,
+                "confidence",
+                getattr(detections, "confidences", getattr(detections, "scores", None)),
+            )
+        )
+
+        if boxes.size == 0 and isinstance(detections, (list, tuple)):
+            rows = detections
+            boxes = as_numpy([row.get("xyxy") or row.get("bbox") for row in rows])
+            class_ids = as_numpy([row.get("class_id", row.get("category_id", 0)) for row in rows])
+            confidences = as_numpy([row.get("confidence", row.get("score", 0.0)) for row in rows])
+
+        boxes = boxes.reshape((-1, 4)) if boxes.size else np.empty((0, 4), dtype=np.float32)
+        class_ids = class_ids.reshape((-1,)).astype(int) if class_ids.size else np.empty((0,), dtype=int)
+        confidences = (
+            confidences.reshape((-1,)).astype(float)
+            if confidences.size
+            else np.empty((0,), dtype=float)
+        )
+        count = min(len(boxes), len(class_ids), len(confidences))
+        return boxes[:count], class_ids[:count], confidences[:count]
 
     def _predict_horizontal_flip(self, image: np.ndarray) -> tuple[list[dict[str, Any]], list[float]]:
         flipped = cv2.flip(image, 1)
