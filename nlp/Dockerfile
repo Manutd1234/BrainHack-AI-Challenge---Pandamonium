@@ -4,10 +4,8 @@ FROM nvcr.io/nvidia/pytorch:25.11-py3
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_ROOT_USER_ACTION=ignore \
-    GEN_MODEL_PATH=/app/models/phi4-mini \
-    QWEN_MODEL_PATH=/app/models/phi4-mini \
+    QWEN_MODEL_PATH=/app/src/qwen-quantized \
     QWEN_ENABLE_THINKING=0 \
-    QWEN_DO_SAMPLE=0 \
     NLP_USE_APPROX_LOOKUP=1 \
     NLP_USE_QA_MEMORY=0 \
     NLP_USE_QA_MEMORY_HINTS=1 \
@@ -20,16 +18,13 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     NLP_QA_MEMORY_MIN_OVERLAP=4 \
     NLP_DOC_BM25_BOOST=0.55 \
     NLP_USE_DENSE=0 \
-    NLP_USE_LLM=1 \
-    NLP_USE_QA_READER=1 \
-    NLP_QA_READER_MODEL_PATH=/app/models/deberta-reader \
-    NLP_QA_READER_CONTEXTS=3 \
-    NLP_QA_READER_MIN_SCORE=0.70 \
-    NLP_QA_READER_LOW_SCORE=0.20 \
+    NLP_USE_LLM=0 \
+    NLP_USE_QA_READER=0 \
+    NLP_QA_READER_MODEL_PATH=/app/models/qa-reader \
+    NLP_QA_READER_CONTEXTS=5 \
+    NLP_QA_READER_MIN_SCORE=5.0 \
     NLP_LLM_MODE=selective \
-    NLP_MAX_NEW_TOKENS=96 \
-    NLP_LLM_MAX_CONTEXT_CHARS=3600 \
-    NLP_EXTRACTIVE_MAX_CHARS=190
+    NLP_MAX_NEW_TOKENS=96
 
 WORKDIR /app
 
@@ -41,8 +36,6 @@ COPY requirements.txt .
 RUN python -m pip install --no-cache-dir --upgrade pip setuptools wheel \
     && pip install --no-cache-dir -r requirements.txt \
     && pip install --no-cache-dir --upgrade "transformers>=4.51.0"
-
-RUN python -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='deepset/deberta-v3-large-squad2', local_dir='/app/models/deberta-reader', local_dir_use_symlinks=False, ignore_patterns=['*.h5','*.onnx','*.msgpack','*.md','*.png','*.pdf']); snapshot_download(repo_id='microsoft/Phi-4-mini-instruct', local_dir='/app/models/phi4-mini', local_dir_use_symlinks=False, ignore_patterns=['*.h5','*.onnx','*.msgpack','*.md','*.png','*.pdf'])"
 
 COPY src/ ./src/
 

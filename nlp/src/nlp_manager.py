@@ -6,7 +6,6 @@ import os
 import json
 import re
 import threading
-from datetime import date, timedelta
 from dataclasses import dataclass
 from collections import Counter
 from pathlib import Path
@@ -17,7 +16,6 @@ import torch
 from FlagEmbedding import BGEM3FlagModel, FlagReranker
 from rank_bm25 import BM25Okapi
 from transformers import AutoModelForCausalLM, AutoModelForQuestionAnswering, AutoTokenizer
-from transformers import pipeline as hf_pipeline
 
 
 TOKEN_PATTERN = re.compile(r"[A-Za-z0-9]+")
@@ -34,35 +32,8 @@ MONEY_PATTERN = re.compile(
     r"(?:[A-Z][A-Za-z-]*\s+)?Credits?\b",
     re.IGNORECASE,
 )
-MONEY_VALUE_PATTERN = re.compile(
-    r"\b(?P<num>\d+(?:\.\d+)?)\s*(?P<scale>million|billion|thousand)?\s+"
-    r"(?:[A-Z][A-Za-z-]*\s+)?Credits?\b",
-    re.IGNORECASE,
-)
 PERCENT_PATTERN = re.compile(
     r"\b(?:approximately\s+|about\s+|around\s+)?\d+(?:\.\d+)?\s*(?:%|percent|per cent)",
-    re.IGNORECASE,
-)
-DATE_YMD_PATTERN = re.compile(r"\b(?P<year>\d{2,4})-(?P<month>\d{1,2})-(?P<day>\d{1,2})\b")
-DAYS_PATTERN = re.compile(
-    r"\b(?P<num>one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|\d+)\s+"
-    r"(?P<unit>hours?|days?)\b",
-    re.IGNORECASE,
-)
-DURATION_PATTERN = re.compile(
-    r"\b(?:approximately\s+|about\s+|around\s+)?"
-    r"(?:one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|\d+)"
-    r"\s+(?:hours?|days?|weeks?|months?)\b",
-    re.IGNORECASE,
-)
-NUMBER_UNIT_PATTERN = re.compile(
-    r"\b(?:approximately\s+|about\s+|around\s+)?"
-    r"(?:\d+(?:,\d{3})*(?:\.\d+)?|one|two|three|four|five|six|seven|eight|nine|ten|"
-    r"eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|"
-    r"twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety|hundred|thousand)"
-    r"(?:[-\s](?:\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|"
-    r"hundred|thousand))*\s+"
-    r"(?:vessels?|ships?|teams?|cells?|kilograms?|kg|points?|credits?|interfaces?|transactions?)\b",
     re.IGNORECASE,
 )
 YEARS_PATTERN = re.compile(
@@ -76,20 +47,6 @@ SCORE_PATTERN = re.compile(
     re.IGNORECASE,
 )
 UPPER_TOKEN_PATTERN = re.compile(r"\b[A-Z][A-Z0-9-]{2,}\b")
-ENTITY_PATTERN = re.compile(
-    r"\b[A-Z][A-Za-z0-9'&-]+(?:\s+(?:of|the|and|&|[A-Z][A-Za-z0-9'&-]+)){0,5}\b"
-)
-ACRONYM_EXCLUDE = {
-    "AIS",
-    "CGC",
-    "DOC",
-    "EA",
-    "PCE",
-    "Q1",
-    "Q2",
-    "Q3",
-    "Q4",
-}
 STOPWORDS = {
     "a",
     "an",
@@ -131,14 +88,10 @@ STOPWORDS = {
 CANONICAL_TOKENS = {
     "amount": "amount",
     "amounts": "amount",
-    "announced": "announce",
-    "announcement": "announce",
     "assessed": "penalty",
     "background": "industry",
     "backgrounds": "industry",
     "capacity": "capacity",
-    "companies": "company",
-    "company": "company",
     "date": "date",
     "dates": "date",
     "fine": "penalty",
@@ -170,18 +123,11 @@ CANONICAL_TOKENS = {
     "percentage": "percentage",
     "industry": "industry",
     "industries": "industry",
-    "leader": "person",
-    "leaders": "person",
     "large": "amount",
     "largest": "amount",
     "lost": "loss",
     "loss": "loss",
     "output": "output",
-    "organizations": "organization",
-    "organisation": "organization",
-    "organisations": "organization",
-    "organization": "organization",
-    "person": "person",
     "previous": "prior",
     "previously": "prior",
     "prior": "prior",
@@ -189,8 +135,6 @@ CANONICAL_TOKENS = {
     "restored": "restore",
     "restoration": "restore",
     "size": "amount",
-    "team": "team",
-    "teams": "team",
     "total": "amount",
     "window": "window",
     "codename": "codename",
@@ -206,9 +150,7 @@ CANONICAL_TOKENS = {
 }
 QUERY_EXPANSIONS = {
     "amount": ("large", "size", "cost", "credits", "program"),
-    "announce": ("announced", "revealed", "launched"),
     "capacity": ("production", "output", "restore", "loss"),
-    "company": ("corporation", "enterprise", "contractor", "operator"),
     "date": ("deadline", "time", "window", "completed"),
     "penalty": ("fine", "sanction", "enforcement", "credits"),
     "deadline": ("due", "required", "completed", "delivery", "deliver"),
@@ -217,9 +159,6 @@ QUERY_EXPANSIONS = {
     "recoup": ("recover", "cost", "revenue"),
     "percentage": ("share", "fraction", "transactions", "percent"),
     "industry": ("background", "sector", "logistics", "prior", "from"),
-    "organization": ("company", "agency", "directorate", "network"),
-    "person": ("who", "chairperson", "ceo", "commander", "director"),
-    "team": ("league", "championship", "won", "score"),
     "codename": ("internal", "classified", "arrangement"),
     "championship": ("league", "won", "score"),
     "win": ("won", "championship", "score"),
@@ -248,10 +187,7 @@ class NLPManager:
         config = self._load_json(
             Path(os.getenv("NLP_RAG_CONFIG", Path(__file__).with_name("rag_config.json")))
         )
-        self.model_path = os.getenv(
-            "GEN_MODEL_PATH",
-            os.getenv("QWEN_MODEL_PATH", "./qwen-quantized"),
-        )
+        self.model_path = os.getenv("QWEN_MODEL_PATH", "./qwen-quantized")
         self.qa_reader_path = os.getenv("NLP_QA_READER_MODEL_PATH", "/app/models/qa-reader")
         self.embedding_model_id = os.getenv("NLP_EMBEDDING_MODEL", "BAAI/bge-m3")
         self.reranker_model_id = os.getenv(
@@ -263,7 +199,6 @@ class NLPManager:
         self.top_k_retrieve = int(os.getenv("NLP_TOP_K_RETRIEVE", config.get("top_k_retrieve", 40)))
         self.top_k_rerank = int(os.getenv("NLP_TOP_K_RERANK", config.get("top_k_rerank", 12)))
         self.max_context_chars = int(os.getenv("NLP_MAX_CONTEXT_CHARS", config.get("max_context_chars", 7000)))
-        self.llm_max_context_chars = int(os.getenv("NLP_LLM_MAX_CONTEXT_CHARS", "3600"))
         self.max_new_tokens = int(os.getenv("NLP_MAX_NEW_TOKENS", "256"))
         self.answer_lookup = self._load_answer_lookup(
             Path(
@@ -311,8 +246,7 @@ class NLPManager:
         self.qa_reader_contexts = int(os.getenv("NLP_QA_READER_CONTEXTS", "5"))
         self.qa_reader_max_length = int(os.getenv("NLP_QA_READER_MAX_LENGTH", "384"))
         self.qa_reader_max_answer_tokens = int(os.getenv("NLP_QA_READER_MAX_ANSWER_TOKENS", "24"))
-        self.qa_reader_min_score = float(os.getenv("NLP_QA_READER_MIN_SCORE", "0.70"))
-        self.qa_reader_low_score = float(os.getenv("NLP_QA_READER_LOW_SCORE", "0.20"))
+        self.qa_reader_min_score = float(os.getenv("NLP_QA_READER_MIN_SCORE", "5.0"))
         self.llm_mode = os.getenv("NLP_LLM_MODE", "selective").strip().lower()
         self.enable_thinking = _env_flag("QWEN_ENABLE_THINKING", False)
         self.do_sample = _env_flag("QWEN_DO_SAMPLE", False)
@@ -324,9 +258,7 @@ class NLPManager:
         self.llm = None
         self.qa_tokenizer = None
         self.qa_reader = None
-        self.qa_pipeline = None
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.qa_device = torch.device(self.device)
+        self.qa_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         use_fp16 = torch.cuda.is_available()
         if self.use_dense:
@@ -339,45 +271,40 @@ class NLPManager:
             print(f"Loading reranker: {self.reranker_model_id}", flush=True)
             self.reranker = FlagReranker(self.reranker_model_id, use_fp16=use_fp16)
 
-        if self.use_llm and not self._valid_llm_path(Path(self.model_path)):
+        if self.use_llm and self._valid_llm_path(Path(self.model_path)):
+            print(f"Loading quantized Qwen3 model from {self.model_path}", flush=True)
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                self.model_path,
+                trust_remote_code=True,
+                local_files_only=Path(self.model_path).exists(),
+            )
+            self.llm = AutoModelForCausalLM.from_pretrained(
+                self.model_path,
+                torch_dtype="auto",
+                device_map="auto",
+                trust_remote_code=True,
+                local_files_only=Path(self.model_path).exists(),
+            )
+            self.llm.eval()
+        elif self.use_llm:
             print(
-                f"Generative model requested but {self.model_path} is not a complete local model; "
+                f"Qwen requested but {self.model_path} is not a complete local model; "
                 "continuing with fast extractive RAG.",
                 flush=True,
             )
             self.use_llm = False
 
         if self.use_qa_reader and self._valid_qa_reader_path(Path(self.qa_reader_path)):
-            try:
-                print(f"Loading extractive QA reader from {self.qa_reader_path}", flush=True)
-                local_reader = Path(self.qa_reader_path).exists()
-                self.qa_tokenizer = AutoTokenizer.from_pretrained(
-                    self.qa_reader_path,
-                    use_fast=True,
-                    local_files_only=local_reader,
-                )
-                self.qa_reader = AutoModelForQuestionAnswering.from_pretrained(
-                    self.qa_reader_path,
-                    torch_dtype=torch.float16 if self.device == "cuda" else torch.float32,
-                    local_files_only=local_reader,
-                )
-                self.qa_reader.to(self.qa_device)
-                self.qa_reader.eval()
-                self.qa_pipeline = hf_pipeline(
-                    "question-answering",
-                    model=self.qa_reader,
-                    tokenizer=self.qa_tokenizer,
-                    device=0 if self.device == "cuda" else -1,
-                )
-                self.qa_pipeline(question="test", context="test context")
-            except Exception as exc:
-                print(
-                    f"QA reader load failed ({type(exc).__name__}: {exc}); "
-                    "continuing with fast extractive RAG.",
-                    flush=True,
-                )
-                self.qa_pipeline = None
-                self.use_qa_reader = False
+            print(f"Loading extractive QA reader from {self.qa_reader_path}", flush=True)
+            self.qa_tokenizer = AutoTokenizer.from_pretrained(
+                self.qa_reader_path,
+                local_files_only=Path(self.qa_reader_path).exists(),
+            )
+            self.qa_reader = AutoModelForQuestionAnswering.from_pretrained(
+                self.qa_reader_path,
+                local_files_only=Path(self.qa_reader_path).exists(),
+            ).to(self.qa_device)
+            self.qa_reader.eval()
         elif self.use_qa_reader:
             print(
                 f"QA reader requested but {self.qa_reader_path} is not a complete local model; "
@@ -574,21 +501,19 @@ class NLPManager:
         return selected
 
     def _generate(self, question: str, context_chunks: list[Chunk]) -> str:
-        if self._should_try_qa_reader(question, ""):
-            reader_answer, reader_score = self._qa_reader_answer(question, context_chunks)
-            if self._prefer_qa_reader_answer(question, "", reader_answer, reader_score):
-                return reader_answer
-
-        extracted = self._extract_answer(question, context_chunks)
-        if not self.use_llm:
+        if self.llm is None or self.tokenizer is None:
+            extracted = self._extract_answer(question, context_chunks)
+            if self._should_try_qa_reader(question, extracted):
+                reader_answer, reader_score = self._qa_reader_answer(question, context_chunks)
+                if self._prefer_qa_reader_answer(question, extracted, reader_answer, reader_score):
+                    return reader_answer
             return extracted
         if self.llm_mode not in {"1", "true", "yes", "always", "all"}:
+            extracted = self._extract_answer(question, context_chunks)
             if not self._should_use_llm(question, extracted):
                 return extracted
-        if not self._ensure_llm_loaded():
-            return extracted
 
-        context = self._format_context(context_chunks, max_chars=self.llm_max_context_chars)
+        context = self._format_context(context_chunks)
         prompt = (
             "Answer the question using only the context below. Return only the final "
             "short answer, with no explanation, no citations, and no preamble. If a "
@@ -624,47 +549,9 @@ class NLPManager:
         answer = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
         return self._strip_thinking(answer)
 
-    def _ensure_llm_loaded(self) -> bool:
-        if self.llm is not None and self.tokenizer is not None:
-            return True
-        if not self.use_llm:
-            return False
-        try:
-            print(f"Lazy-loading generative NLP model from {self.model_path}", flush=True)
-            self.tokenizer = AutoTokenizer.from_pretrained(
-                self.model_path,
-                trust_remote_code=True,
-                local_files_only=Path(self.model_path).exists(),
-            )
-            self.llm = AutoModelForCausalLM.from_pretrained(
-                self.model_path,
-                torch_dtype="auto",
-                device_map="auto",
-                trust_remote_code=True,
-                local_files_only=Path(self.model_path).exists(),
-            )
-            self.llm.eval()
-            return True
-        except Exception as exc:
-            print(
-                f"Generative model load failed ({type(exc).__name__}: {exc}); "
-                "continuing with fast extractive RAG.",
-                flush=True,
-            )
-            self.tokenizer = None
-            self.llm = None
-            self.use_llm = False
-            return False
-
     def _should_use_llm(self, question: str, extracted_answer: str) -> bool:
-        if self.llm_mode in {"0", "false", "no", "off", "never", "none"}:
-            return False
         question_key = self._question_key(question)
         question_tokens = set(question_key.split())
-        if self._is_pattern_answer(question_key, extracted_answer):
-            return False
-        if not extracted_answer:
-            return True
         reasoning_phrases = {
             "how many",
             "how much",
@@ -695,23 +582,11 @@ class NLPManager:
         return False
 
     def _should_try_qa_reader(self, question: str, extracted_answer: str) -> bool:
-        if self.qa_pipeline is None:
-            return False
-        question_key = self._question_key(question)
-        direct_markers = (
-            "who ",
-            "what ",
-            "which ",
-            "where ",
-            "when ",
-            "by what ",
-            "how large",
-            "how much",
-        )
-        if not question_key.startswith(direct_markers) and " by what " not in f" {question_key} ":
+        if self.qa_reader is None or self.qa_tokenizer is None:
             return False
         if not extracted_answer or len(extracted_answer) > 140:
             return True
+        question_key = self._question_key(question)
         if self._is_pattern_answer(question_key, extracted_answer):
             return False
         return bool(
@@ -722,31 +597,60 @@ class NLPManager:
         )
 
     def _qa_reader_answer(self, question: str, context_chunks: list[Chunk]) -> tuple[str, float]:
-        if self.qa_pipeline is None:
-            return "", 0.0
-        context = "\n\n".join(chunk.text for chunk in context_chunks[: self.qa_reader_contexts])
-        if not context.strip():
-            return "", 0.0
-        try:
-            with self.lock:
-                result = self.qa_pipeline(
-                    question=question,
-                    context=context,
-                    max_answer_len=self.qa_reader_max_answer_tokens,
-                    handle_impossible_answer=True,
-                    max_seq_len=self.qa_reader_max_length,
-                    top_k=1,
+        best_answer = ""
+        best_score = float("-inf")
+        contexts = [chunk.text for chunk in context_chunks[: self.qa_reader_contexts]]
+
+        with self.lock, torch.inference_mode():
+            for context in contexts:
+                encoded = self.qa_tokenizer(
+                    question,
+                    context,
+                    return_tensors="pt",
+                    truncation="only_second",
+                    max_length=self.qa_reader_max_length,
                 )
-            if isinstance(result, list):
-                result = result[0] if result else {}
-            answer = self._clean_reader_answer(str(result.get("answer", "")))
-            score = float(result.get("score", 0.0))
-            if not self._valid_reader_answer(question, answer):
-                return "", 0.0
-            return answer, score
-        except Exception as exc:
-            print(f"Extractive QA reader error ({type(exc).__name__}: {exc})", flush=True)
-            return "", 0.0
+                sequence_ids = encoded.sequence_ids(0)
+                inputs = {key: value.to(self.qa_device) for key, value in encoded.items()}
+                outputs = self.qa_reader(**inputs)
+                start_logits = outputs.start_logits[0].detach().float().cpu().numpy()
+                end_logits = outputs.end_logits[0].detach().float().cpu().numpy()
+                input_ids = encoded["input_ids"][0]
+                context_indices = [
+                    index for index, segment_id in enumerate(sequence_ids) if segment_id == 1
+                ]
+                if not context_indices:
+                    continue
+
+                top_starts = sorted(
+                    context_indices,
+                    key=lambda index: float(start_logits[index]),
+                    reverse=True,
+                )[:8]
+                top_ends = sorted(
+                    context_indices,
+                    key=lambda index: float(end_logits[index]),
+                    reverse=True,
+                )[:8]
+                for start in top_starts:
+                    for end in top_ends:
+                        if end < start:
+                            continue
+                        if end - start + 1 > self.qa_reader_max_answer_tokens:
+                            continue
+                        score = float(start_logits[start] + end_logits[end])
+                        if score <= best_score:
+                            continue
+                        answer = self.qa_tokenizer.decode(
+                            input_ids[start : end + 1],
+                            skip_special_tokens=True,
+                        )
+                        answer = self._clean_reader_answer(answer)
+                        if self._valid_reader_answer(question, answer):
+                            best_answer = answer
+                            best_score = score
+
+        return best_answer, best_score
 
     def _prefer_qa_reader_answer(
         self,
@@ -764,7 +668,7 @@ class NLPManager:
             return True
         if len(extracted_answer) > 140:
             return True
-        if len(reader_answer) < len(extracted_answer) * 0.65 and reader_score >= self.qa_reader_min_score + 0.15:
+        if len(reader_answer) < len(extracted_answer) * 0.65 and reader_score >= self.qa_reader_min_score + 2.0:
             return True
         return False
 
@@ -828,7 +732,6 @@ class NLPManager:
                     if token.isdigit() and sentence_counts.get(token, 0)
                 )
                 score = overlap + 0.75 * rare_overlap + 1.5 * number_overlap
-                score += self._sentence_pattern_bonus(question, sentence)
                 score -= 0.08 * rank
                 score -= 0.002 * len(sentence)
                 scored_sentences.append((score, sentence))
@@ -867,13 +770,12 @@ class NLPManager:
                 add_generation_prompt=True,
             )
 
-    def _format_context(self, chunks: list[Chunk], max_chars: int | None = None) -> str:
+    def _format_context(self, chunks: list[Chunk]) -> str:
         parts = []
         current_length = 0
-        limit = max_chars if max_chars is not None else self.max_context_chars
         for chunk in chunks:
             part = f"[{chunk.document_id}]\n{chunk.text}"
-            if parts and current_length + len(part) > limit:
+            if parts and current_length + len(part) > self.max_context_chars:
                 break
             parts.append(part)
             current_length += len(part)
@@ -1172,28 +1074,9 @@ class NLPManager:
         window = " ".join(sentences[:3])
 
         if "codename" in question_key or "code name" in question_key:
-            candidate = self._uppercase_answer(question_key, window)
-            if candidate:
-                return candidate
-
-        if (
-            any(token in question_key for token in ("date", "time", "restore", "capacity"))
-            and any(token in question_key for token in ("fraction", "percentage", "percent", "lost", "loss"))
-        ):
-            calculated = self._restore_loss_answer(window)
-            if calculated:
-                return calculated
-            dates = list(DATE_PATTERN.finditer(window))
-            pct = PERCENT_PATTERN.search(window)
-            if dates and pct:
-                return self._trim_answer(
-                    f"{dates[-1].group(0)}, with {pct.group(0)} of normal output lost"
-                )
-
-        if "recoup" in question_key:
-            recoup_answer = self._recoup_answer(window)
-            if recoup_answer:
-                return recoup_answer
+            candidates = [token for token in UPPER_TOKEN_PATTERN.findall(window) if token != "PCE"]
+            if candidates:
+                return candidates[0]
 
         if "how many year" in question_key or "years passed" in question_key:
             years = self._extract_year_numbers(window)
@@ -1218,35 +1101,30 @@ class NLPManager:
             match = MONEY_PATTERN.search(window)
             if match:
                 return self._trim_answer(match.group(0))
-            unit_match = NUMBER_UNIT_PATTERN.search(window)
-            if unit_match:
-                return self._trim_answer(unit_match.group(0))
 
         if any(token in question_key for token in ("share", "fraction", "percentage", "percent")):
             match = PERCENT_PATTERN.search(window)
             if match:
                 return self._trim_answer(match.group(0))
 
-        if "how many" in question_key or "how much" in question_key:
-            for pattern in (MONEY_PATTERN, PERCENT_PATTERN, DURATION_PATTERN, NUMBER_UNIT_PATTERN):
-                match = pattern.search(window)
-                if match:
-                    return self._trim_answer(match.group(0))
-
-        if (
-            "deadline" in question_key
-            or "by what" in question_key
-            or "at what date" in question_key
-            or question_key.startswith("when ")
-        ):
+        if "deadline" in question_key or "by what" in question_key or "at what date" in question_key:
             matches = list(DATE_PATTERN.finditer(window))
             if matches:
                 return self._trim_answer(matches[-1].group(0))
 
-        if "score" in question_key or "team" in question_key or "championship" in question_key:
-            score_answer = self._score_answer(question_key, sentences)
-            if score_answer:
-                return score_answer
+        if "score" in question_key:
+            match = SCORE_PATTERN.search(window)
+            if match:
+                score_text = self._trim_answer(match.group(0))
+                sentence = sentences[0]
+                leading_name = re.search(
+                    r"\b([A-Z][A-Za-z0-9'-]+(?:\s+[A-Z][A-Za-z0-9'-]+){0,3})\b.*?"
+                    + re.escape(score_text),
+                    sentence,
+                )
+                if leading_name:
+                    return self._trim_answer(f"{leading_name.group(1)}, {score_text}")
+                return score_text
 
         if "industry" in question_key or "background" in question_key:
             match = re.search(
@@ -1255,210 +1133,8 @@ class NLPManager:
                 flags=re.IGNORECASE,
             )
             if match:
-                answer = re.split(
-                    r"\b(?:before|after|prior to|as|where)\b",
-                    match.group(1),
-                    maxsplit=1,
-                    flags=re.IGNORECASE,
-                )[0]
-                return self._trim_answer(answer)
+                return self._trim_answer(match.group(1))
 
-        if any(token in question_key for token in ("who", "which", "company", "organization", "person")):
-            entity_answer = self._entity_answer(question_key, sentences)
-            if entity_answer:
-                return entity_answer
-
-        return ""
-
-    def _sentence_pattern_bonus(self, question: str, sentence: str) -> float:
-        question_key = self._question_key(question)
-        bonus = 0.0
-        if ("penalty" in question_key or "fine" in question_key) and MONEY_PATTERN.search(sentence):
-            bonus += 5.0
-        if any(token in question_key for token in ("share", "fraction", "percentage", "percent")) and PERCENT_PATTERN.search(sentence):
-            bonus += 5.0
-        if ("deadline" in question_key or "date" in question_key or "when" in question_key) and DATE_PATTERN.search(sentence):
-            bonus += 4.0
-        if ("score" in question_key or "championship" in question_key) and SCORE_PATTERN.search(sentence):
-            bonus += 5.0
-        if ("codename" in question_key or "code name" in question_key) and UPPER_TOKEN_PATTERN.search(sentence):
-            bonus += 4.0
-        if "recoup" in question_key and MONEY_VALUE_PATTERN.search(sentence):
-            bonus += 4.0
-        if any(token in question_key for token in ("who", "which", "company", "organization", "person")) and ENTITY_PATTERN.search(sentence):
-            bonus += 2.0
-        return bonus
-
-    def _recoup_answer(self, text: str) -> str:
-        amounts = []
-        for match in MONEY_VALUE_PATTERN.finditer(text):
-            value = float(match.group("num"))
-            scale = (match.group("scale") or "").lower()
-            if scale == "billion":
-                value *= 1000.0
-            elif scale == "thousand":
-                value /= 1000.0
-            amounts.append((value, match.start(), match.end()))
-        if len(amounts) < 2:
-            return ""
-
-        cost = self._amount_near(text, amounts, ("cost", "development", "investment", "initial"))
-        revenue = self._amount_near(text, amounts, ("revenue", "annual", "projection", "projected", "recurring"))
-        if cost is None or revenue is None or revenue <= 0:
-            values = sorted(value for value, _, _ in amounts)
-            cost, revenue = values[0], values[-1]
-        if cost <= 0 or revenue <= 0:
-            return ""
-        years = cost / revenue
-        if years < 1.0:
-            return "less than one year"
-        if years < 1.5:
-            return "approximately one year"
-        return f"approximately {years:.1f} years"
-
-    def _amount_near(
-        self,
-        text: str,
-        amounts: list[tuple[float, int, int]],
-        keywords: tuple[str, ...],
-    ) -> float | None:
-        lowered = text.lower()
-        best_value: float | None = None
-        best_distance = 10_000
-        for value, start, end in amounts:
-            window_start = max(0, start - 80)
-            window_end = min(len(text), end + 80)
-            window = lowered[window_start:window_end]
-            keyword_positions = [window.find(keyword) for keyword in keywords if keyword in window]
-            if not keyword_positions:
-                continue
-            distance = min(abs((window_start + pos) - start) for pos in keyword_positions)
-            if distance < best_distance:
-                best_distance = distance
-                best_value = value
-        return best_value
-
-    def _restore_loss_answer(self, text: str) -> str:
-        pct = PERCENT_PATTERN.search(text)
-        date_match = DATE_YMD_PATTERN.search(text)
-        duration = DAYS_PATTERN.search(text)
-        if not pct or not date_match or not duration:
-            return ""
-        count = self._small_number(duration.group("num"))
-        if count <= 0:
-            return ""
-        unit = duration.group("unit").lower()
-        days = count if unit.startswith("day") else max(1, int(round(count / 24)))
-        year_text = date_match.group("year")
-        year = int(year_text)
-        display_two_digit = len(year_text) == 2
-        real_year = 2000 + year if display_two_digit else year
-        try:
-            restored = date(
-                real_year,
-                int(date_match.group("month")),
-                int(date_match.group("day")),
-            ) + timedelta(days=days)
-        except ValueError:
-            return ""
-        if display_two_digit:
-            date_text = f"{restored.year % 100:02d}-{restored.month:02d}-{restored.day:02d}"
-        else:
-            date_text = restored.isoformat()
-        return self._trim_answer(f"{date_text}, with {pct.group(0)} of normal output lost")
-
-    def _small_number(self, text: str) -> int:
-        words = {
-            "one": 1,
-            "two": 2,
-            "three": 3,
-            "four": 4,
-            "five": 5,
-            "six": 6,
-            "seven": 7,
-            "eight": 8,
-            "nine": 9,
-            "ten": 10,
-            "eleven": 11,
-            "twelve": 12,
-        }
-        lowered = text.lower()
-        if lowered in words:
-            return words[lowered]
-        try:
-            return int(lowered)
-        except ValueError:
-            return 0
-
-    def _uppercase_answer(self, question_key: str, text: str) -> str:
-        question_upper = set(question_key.upper().split())
-        candidates = []
-        for token in UPPER_TOKEN_PATTERN.findall(text):
-            if token in ACRONYM_EXCLUDE or token in question_upper:
-                continue
-            if len(token) <= 3 and "-" not in token:
-                continue
-            candidates.append(token)
-        if not candidates:
-            return ""
-        candidates.sort(key=lambda token: (-len(token), text.find(token)))
-        return candidates[0]
-
-    def _score_answer(self, question_key: str, sentences: list[str]) -> str:
-        for sentence in sentences[:3]:
-            score_match = SCORE_PATTERN.search(sentence)
-            score_text = self._trim_answer(score_match.group(0)) if score_match else ""
-            winner_match = re.search(
-                r"\b([A-Z][A-Za-z0-9'&-]+(?:\s+[A-Z][A-Za-z0-9'&-]+){0,4})\s+"
-                r"(?:won|defeated|beat|claimed|secured|captured)\b",
-                sentence,
-            )
-            if winner_match and score_text:
-                return self._trim_answer(f"{winner_match.group(1)}, {score_text}")
-            if winner_match and "team" in question_key:
-                return self._trim_answer(winner_match.group(1))
-            if score_text and "score" in question_key:
-                leading_name = re.search(
-                    r"\b([A-Z][A-Za-z0-9'&-]+(?:\s+[A-Z][A-Za-z0-9'&-]+){0,4})\b.*?"
-                    + re.escape(score_text),
-                    sentence,
-                )
-                if leading_name:
-                    return self._trim_answer(f"{leading_name.group(1)}, {score_text}")
-                return score_text
-        return ""
-
-    def _entity_answer(self, question_key: str, sentences: list[str]) -> str:
-        entity_blacklist = {
-            "According",
-            "Article",
-            "Council",
-            "Data",
-            "Document",
-            "Forum",
-            "Project",
-            "The",
-            "This",
-        }
-        for sentence in sentences[:3]:
-            targeted_patterns = [
-                r"\b(?:announced|introduced|ordered|mandated|approved|directed)\s+by\s+([^.,;]+)",
-                r"\b(?:CEO|Chairperson|Commander|Director|Minister)\s+([A-Z][A-Za-z0-9'&-]+(?:\s+[A-Z][A-Za-z0-9'&-]+){0,4})",
-                r"\b([A-Z][A-Za-z0-9'&-]+(?:\s+[A-Z][A-Za-z0-9'&-]+){0,4})\s+"
-                r"(?:announced|introduced|ordered|mandated|approved|directed|won|acquired|operated|contracted)",
-                r"\bagainst\s+([A-Z][A-Za-z0-9'&-]+(?:\s+[A-Z][A-Za-z0-9'&-]+){0,4})",
-            ]
-            for pattern in targeted_patterns:
-                match = re.search(pattern, sentence)
-                if match:
-                    answer = self._trim_answer(match.group(1))
-                    if answer and answer.split()[0] not in entity_blacklist:
-                        return answer
-            for match in ENTITY_PATTERN.finditer(sentence):
-                answer = self._trim_answer(match.group(0))
-                if answer and answer.split()[0] not in entity_blacklist:
-                    if not set(self._content_tokens(answer)).issubset(set(question_key.split())):
-                        return answer
         return ""
 
     def _extract_year_numbers(self, text: str) -> list[int]:
@@ -1489,7 +1165,7 @@ class NLPManager:
     def _valid_qa_reader_path(self, path: Path) -> bool:
         if not path.exists() or not path.is_dir():
             return False
-        tokenizers = ("tokenizer.json", "vocab.txt", "vocab.json", "spm.model")
+        tokenizers = ("tokenizer.json", "vocab.txt", "vocab.json")
         weights = ("model.safetensors", "pytorch_model.bin")
         return (path / "config.json").exists() and any(
             (path / name).exists() for name in tokenizers
