@@ -41,6 +41,7 @@ DEFAULT_CONF = float(os.getenv("CV_DEFAULT_CONF", THRESHOLD_CONFIG.get("default_
 DEFAULT_IOU = float(os.getenv("CV_IOU", THRESHOLD_CONFIG.get("iou", 0.45)))
 DEFAULT_IMGSZ = int(os.getenv("CV_IMGSZ", THRESHOLD_CONFIG.get("imgsz", 1280)))
 MAX_DETECTIONS = int(os.getenv("CV_MAX_DETECTIONS", THRESHOLD_CONFIG.get("max_detections", 20)))
+RAW_MAX_DETECTIONS = int(os.getenv("CV_RAW_MAX_DETECTIONS", max(MAX_DETECTIONS * 4, 50)))
 PRED_BATCH_SIZE = int(os.getenv("CV_PRED_BATCH_SIZE", "4"))
 USE_AUGMENT = os.getenv("CV_AUGMENT", "0").strip().lower() in {"1", "true", "yes"}
 FINAL_NMS_IOU = float(os.getenv("CV_FINAL_NMS_IOU", "0.55"))
@@ -48,6 +49,10 @@ USE_WBF = os.getenv("CV_USE_WBF", "1").strip().lower() in {"1", "true", "yes"}
 FALLBACK_FLIP = os.getenv("CV_FALLBACK_FLIP", "0").strip().lower() in {"1", "true", "yes"}
 FALLBACK_MAX_COUNT = int(os.getenv("CV_FALLBACK_MAX_COUNT", "0"))
 FALLBACK_MIN_CONF = float(os.getenv("CV_FALLBACK_MIN_CONF", "0.35"))
+HIGHRES_FALLBACK = os.getenv("CV_HIGHRES_FALLBACK", "1").strip().lower() in {"1", "true", "yes"}
+HIGHRES_IMGSZ = int(os.getenv("CV_HIGHRES_IMGSZ", "1536"))
+HIGHRES_MAX_COUNT = int(os.getenv("CV_HIGHRES_MAX_COUNT", "0"))
+HIGHRES_MIN_CONF = float(os.getenv("CV_HIGHRES_MIN_CONF", "0.45"))
 USE_SAHI = os.getenv("CV_USE_SAHI", "0").strip().lower() in {"1", "true", "yes"}
 SAHI_MIN_SIZE = int(os.getenv("CV_SAHI_MIN_SIZE", "640"))
 SAHI_SLICE_SIZE = int(os.getenv("CV_SAHI_SLICE_SIZE", "640"))
@@ -99,6 +104,7 @@ CLASS_CONF = {
     int(category_id): float(confidence)
     for category_id, confidence in THRESHOLD_CONFIG.get("class_conf", DEFAULT_CLASS_CONF).items()
 }
+PREDICT_CONF = float(os.getenv("CV_MODEL_CONF", min([DEFAULT_CONF, *CLASS_CONF.values()])))
 
 
 class CVManager:
@@ -126,7 +132,7 @@ class CVManager:
             model.predict(
                 np.zeros((640, 640, 3), dtype=np.uint8),
                 imgsz=DEFAULT_IMGSZ,
-                conf=DEFAULT_CONF,
+                conf=PREDICT_CONF,
                 iou=DEFAULT_IOU,
                 half=self.device == "cuda",
                 augment=USE_AUGMENT,
@@ -193,12 +199,12 @@ class CVManager:
             for model in self.models:
                 results = model.predict(
                     batch,
-                    conf=DEFAULT_CONF,
+                    conf=PREDICT_CONF,
                     iou=DEFAULT_IOU,
                     imgsz=DEFAULT_IMGSZ,
                     half=self.device == "cuda",
                     augment=USE_AUGMENT,
-                    max_det=max(MAX_DETECTIONS * 3, MAX_DETECTIONS),
+                    max_det=RAW_MAX_DETECTIONS,
                     verbose=False,
                     device=self.device,
                 )
@@ -211,6 +217,13 @@ class CVManager:
                 for index, image in enumerate(batch):
                     if self._needs_flip_fallback(batch_predictions[index], batch_confidences[index]):
                         formatted, confidences = self._predict_horizontal_flip(image)
+                        batch_predictions[index].extend(formatted)
+                        batch_confidences[index].extend(confidences)
+
+            if HIGHRES_FALLBACK and HIGHRES_IMGSZ > DEFAULT_IMGSZ:
+                for index, image in enumerate(batch):
+                    if self._needs_highres_fallback(batch_predictions[index], batch_confidences[index]):
+                        formatted, confidences = self._predict_highres(image)
                         batch_predictions[index].extend(formatted)
                         batch_confidences[index].extend(confidences)
 
@@ -231,6 +244,37 @@ class CVManager:
             return True
         return bool(confidences and max(confidences) < FALLBACK_MIN_CONF)
 
+    def _needs_highres_fallback(
+        self,
+        predictions: list[dict[str, Any]],
+        confidences: list[float],
+    ) -> bool:
+        if len(predictions) <= HIGHRES_MAX_COUNT:
+            return True
+        return bool(confidences and max(confidences) < HIGHRES_MIN_CONF)
+
+    def _predict_highres(self, image: np.ndarray) -> tuple[list[dict[str, Any]], list[float]]:
+        predictions: list[dict[str, Any]] = []
+        kept_confidences: list[float] = []
+
+        for model in self.models:
+            results = model.predict(
+                [image],
+                conf=PREDICT_CONF,
+                iou=DEFAULT_IOU,
+                imgsz=HIGHRES_IMGSZ,
+                half=self.device == "cuda",
+                augment=False,
+                max_det=RAW_MAX_DETECTIONS,
+                verbose=False,
+                device=self.device,
+            )
+            formatted, confidences = self._format_yolo_result(results[0], image.shape)
+            predictions.extend(formatted)
+            kept_confidences.extend(confidences)
+
+        return predictions, kept_confidences
+
     def _predict_horizontal_flip(self, image: np.ndarray) -> tuple[list[dict[str, Any]], list[float]]:
         flipped = cv2.flip(image, 1)
         height, width = image.shape[:2]
@@ -240,12 +284,12 @@ class CVManager:
         for model in self.models:
             results = model.predict(
                 [flipped],
-                conf=max(0.01, DEFAULT_CONF * 0.75),
+                conf=max(0.01, PREDICT_CONF * 0.75),
                 iou=DEFAULT_IOU,
                 imgsz=DEFAULT_IMGSZ,
                 half=self.device == "cuda",
                 augment=False,
-                max_det=max(MAX_DETECTIONS * 3, MAX_DETECTIONS),
+                max_det=RAW_MAX_DETECTIONS,
                 verbose=False,
                 device=self.device,
             )
