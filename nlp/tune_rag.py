@@ -46,27 +46,103 @@ def split_sentences(text: str) -> list[str]:
     return sentences
 
 
-def chunk_document(document_id: str, text: str, words: int, overlap: int):
-    tokens = text.split()
-    if len(tokens) <= words:
-        return [(document_id, text)]
+def dedupe_chunks(chunks):
+    unique = []
+    seen = set()
+    for doc_id, text in chunks:
+        key = re.sub(r"\W+", " ", text.lower()).strip()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        unique.append((doc_id, text))
+    return unique
 
-    step = max(1, words - overlap)
+
+def sentence_window_chunks(
+    document_id: str,
+    text: str,
+    window_size: int,
+    stride: int,
+):
+    if window_size <= 0:
+        return []
+    sentences = split_sentences(text)
+    if len(sentences) <= 1:
+        return []
+
     chunks = []
-    for start in range(0, len(tokens), step):
-        window = tokens[start : start + words]
+    stride = max(1, stride)
+    for start in range(0, len(sentences), stride):
+        window = sentences[start : start + window_size]
         if not window:
             continue
-        chunks.append((document_id, " ".join(window)))
-        if start + words >= len(tokens):
+        chunk_text = " ".join(window).strip()
+        if len(chunk_text.split()) >= 12:
+            chunks.append((document_id, chunk_text))
+        if start + window_size >= len(sentences):
             break
     return chunks
 
 
-def build_index(docs: dict[str, str], words: int, overlap: int):
+def chunk_document(
+    document_id: str,
+    text: str,
+    words: int,
+    overlap: int,
+    sentence_window: int,
+    sentence_stride: int,
+    max_doc_chunks: int,
+):
+    tokens = text.split()
+    word_chunks = []
+    if len(tokens) <= words:
+        word_chunks.append((document_id, text))
+    else:
+        step = max(1, words - overlap)
+        for start in range(0, len(tokens), step):
+            window = tokens[start : start + words]
+            if not window:
+                continue
+            word_chunks.append((document_id, " ".join(window)))
+            if start + words >= len(tokens):
+                break
+
+    sentence_chunks = sentence_window_chunks(
+        document_id,
+        text,
+        sentence_window,
+        sentence_stride,
+    )
+    combined = []
+    for index in range(max(len(word_chunks), len(sentence_chunks))):
+        if index < len(word_chunks):
+            combined.append(word_chunks[index])
+        if index < len(sentence_chunks):
+            combined.append(sentence_chunks[index])
+    return dedupe_chunks(combined)[:max_doc_chunks]
+
+
+def build_index(
+    docs: dict[str, str],
+    words: int,
+    overlap: int,
+    sentence_window: int,
+    sentence_stride: int,
+    max_doc_chunks: int,
+):
     chunks = []
     for doc_id, text in docs.items():
-        chunks.extend(chunk_document(doc_id, text, words, overlap))
+        chunks.extend(
+            chunk_document(
+                doc_id,
+                text,
+                words,
+                overlap,
+                sentence_window,
+                sentence_stride,
+                max_doc_chunks,
+            )
+        )
     bm25 = BM25Okapi([tokenize(text) for _, text in chunks])
     return chunks, bm25
 
@@ -153,28 +229,40 @@ def main() -> None:
     OUT_DIR.mkdir(parents=True, exist_ok=True)
 
     best = {"score": -1.0}
-    for words in (100, 140, 180, 240, 320, 480):
-        for overlap in (20, 40, 80):
+    for words in (180, 320, 480):
+        for overlap in (40, 80):
             if overlap >= words:
                 continue
-            chunks, bm25 = build_index(docs, words, overlap)
-            for top_chunks in (12, 24, 40, 64, 96):
-                hits = 0
-                for row in questions:
-                    predicted = set(retrieve_docs(row["question"], chunks, bm25, top_chunks))
-                    truth = set(row.get("source_docs") or [])
-                    hits += bool(predicted.intersection(truth))
-                score = hits / max(1, len(questions))
-                if score > best["score"]:
-                    best = {
-                        "score": score,
-                        "chunk_words": words,
-                        "chunk_overlap": overlap,
-                        "top_k_retrieve": top_chunks,
-                        "top_k_rerank": 12,
-                        "max_context_chars": 9000,
-                    }
-                    print("best", best, flush=True)
+            for sentence_window, sentence_stride in ((0, 1), (3, 2), (4, 2)):
+                for max_doc_chunks in (18, 24):
+                    chunks, bm25 = build_index(
+                        docs,
+                        words,
+                        overlap,
+                        sentence_window,
+                        sentence_stride,
+                        max_doc_chunks,
+                    )
+                    for top_chunks in (40, 64, 96):
+                        hits = 0
+                        for row in questions:
+                            predicted = set(retrieve_docs(row["question"], chunks, bm25, top_chunks))
+                            truth = set(row.get("source_docs") or [])
+                            hits += bool(predicted.intersection(truth))
+                        score = hits / max(1, len(questions))
+                        if score > best["score"]:
+                            best = {
+                                "score": score,
+                                "chunk_words": words,
+                                "chunk_overlap": overlap,
+                                "sentence_window": sentence_window,
+                                "sentence_stride": sentence_stride,
+                                "max_doc_chunks": max_doc_chunks,
+                                "top_k_retrieve": top_chunks,
+                                "top_k_rerank": 12,
+                                "max_context_chars": 9000,
+                            }
+                            print("best", best, "chunks", len(chunks), flush=True)
 
     (OUT_DIR / "rag_config.json").write_text(
         json.dumps({k: v for k, v in best.items() if k != "score"}, indent=2),

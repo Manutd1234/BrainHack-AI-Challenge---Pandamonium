@@ -207,6 +207,9 @@ class NLPManager:
         )
         self.chunk_words = int(os.getenv("NLP_CHUNK_WORDS", config.get("chunk_words", 360)))
         self.chunk_overlap = int(os.getenv("NLP_CHUNK_OVERLAP", config.get("chunk_overlap", 60)))
+        self.sentence_window = int(os.getenv("NLP_SENTENCE_WINDOW", config.get("sentence_window", 3)))
+        self.sentence_stride = int(os.getenv("NLP_SENTENCE_STRIDE", config.get("sentence_stride", 2)))
+        self.max_doc_chunks = int(os.getenv("NLP_MAX_DOC_CHUNKS", config.get("max_doc_chunks", 18)))
         self.top_k_retrieve = int(os.getenv("NLP_TOP_K_RETRIEVE", config.get("top_k_retrieve", 40)))
         self.top_k_rerank = int(os.getenv("NLP_TOP_K_RERANK", config.get("top_k_rerank", 12)))
         self.max_context_chars = int(os.getenv("NLP_MAX_CONTEXT_CHARS", config.get("max_context_chars", 7000)))
@@ -412,24 +415,72 @@ class NLPManager:
         step = max(1, self.chunk_words - self.chunk_overlap)
 
         for document_id, text in documents.items():
+            word_chunks: list[Chunk] = []
             words = text.split()
             if not words:
                 continue
             if len(words) <= self.chunk_words:
-                chunks.append(Chunk(document_id=document_id, text=text))
-                continue
+                word_chunks.append(Chunk(document_id=document_id, text=text))
+            else:
+                for start in range(0, len(words), step):
+                    window = words[start : start + self.chunk_words]
+                    if not window:
+                        continue
+                    word_chunks.append(
+                        Chunk(document_id=document_id, text=" ".join(window).strip())
+                    )
+                    if start + self.chunk_words >= len(words):
+                        break
 
-            for start in range(0, len(words), step):
-                window = words[start : start + self.chunk_words]
-                if not window:
-                    continue
-                chunks.append(
-                    Chunk(document_id=document_id, text=" ".join(window).strip())
-                )
-                if start + self.chunk_words >= len(words):
-                    break
+            sentence_chunks = self._sentence_window_chunks(document_id, text)
+            chunks.extend(self._bounded_doc_chunks(word_chunks, sentence_chunks))
 
         return chunks or [Chunk(document_id="DOC-0000", text="")]
+
+    def _bounded_doc_chunks(
+        self,
+        word_chunks: list[Chunk],
+        sentence_chunks: list[Chunk],
+    ) -> list[Chunk]:
+        combined: list[Chunk] = []
+        for index in range(max(len(word_chunks), len(sentence_chunks))):
+            if index < len(word_chunks):
+                combined.append(word_chunks[index])
+            if index < len(sentence_chunks):
+                combined.append(sentence_chunks[index])
+        return self._dedupe_chunks(combined)[: self.max_doc_chunks]
+
+    def _sentence_window_chunks(self, document_id: str, text: str) -> list[Chunk]:
+        if self.sentence_window <= 0:
+            return []
+        sentences = self._split_sentences(text)
+        if len(sentences) <= 1:
+            return []
+
+        chunks = []
+        stride = max(1, self.sentence_stride)
+        window_size = max(1, self.sentence_window)
+        for start in range(0, len(sentences), stride):
+            window = sentences[start : start + window_size]
+            if not window:
+                continue
+            chunk_text = " ".join(window).strip()
+            if len(chunk_text.split()) >= 12:
+                chunks.append(Chunk(document_id=document_id, text=chunk_text))
+            if start + window_size >= len(sentences):
+                break
+        return chunks
+
+    def _dedupe_chunks(self, chunks: list[Chunk]) -> list[Chunk]:
+        unique = []
+        seen = set()
+        for chunk in chunks:
+            key = re.sub(r"\W+", " ", chunk.text.lower()).strip()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            unique.append(chunk)
+        return unique
 
     def _retrieve(self, question: str, preferred_docs: set[str] | None = None) -> list[int]:
         tokenized_query = self._tokenize_for_search(question, expand=True)
