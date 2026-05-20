@@ -19,4 +19,3 @@ sentencepiece>=0.2.0
 
 # Optional neural noise suppression. Disabled by default in Dockerfile because
 # Parakeet is already fast and clean-audio inference is usually stronger.
-deepfilternet>=0.5.6

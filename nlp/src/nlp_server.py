@@ -85,29 +85,35 @@ async def _start_load(raw_documents: list[Any]) -> dict[str, str]:
 
 
 @app.post("/nlp")
-async def nlp(request: Request) -> dict[str, list[dict[str, Any]]]:
+async def nlp(request: Request) -> dict[str, list[Any]]:
     """Load the corpus or answer TIL-formatted NLP questions."""
     inputs_json = await request.json()
     instances = inputs_json["instances"]
     first = instances[0]
 
     if first.get("documents") is not None:
-        status = await _start_load(first["documents"])
-        return {"predictions": [status]}
+        await _start_load(first["documents"])
+        return {"predictions": ["loading"]}
 
     if first.get("poll") is not None:
-        result = {"status": load_state.status}
-        if load_state.error:
-            result["error"] = load_state.error
-        return {"predictions": [result]}
+        status = load_state.status
+        if status == "failed":
+            status = "error"
+        return {"predictions": [status]}
 
     if load_state.status != "loaded":
         raise HTTPException(status_code=400, detail=f"Corpus status: {load_state.status}")
 
-    predictions = [
+    raw_predictions = [
         await asyncio.to_thread(manager.qa, instance["question"])
         for instance in instances
     ]
+    predictions = []
+    for pred in raw_predictions:
+        if isinstance(pred, dict):
+            predictions.append(pred.get("answer", ""))
+        else:
+            predictions.append(str(pred))
     return {"predictions": predictions}
 
 
