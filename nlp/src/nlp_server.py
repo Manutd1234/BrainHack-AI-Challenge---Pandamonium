@@ -111,9 +111,9 @@ async def nlp(request: Request) -> dict[str, list[Any]]:
     predictions = []
     for pred in raw_predictions:
         if isinstance(pred, dict):
-            predictions.append(pred.get("answer", ""))
+            predictions.append(pred)
         else:
-            predictions.append(str(pred))
+            predictions.append({"documents": [], "answer": str(pred)})
     return {"predictions": predictions}
 
 
