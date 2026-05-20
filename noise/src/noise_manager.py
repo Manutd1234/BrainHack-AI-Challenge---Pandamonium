@@ -19,13 +19,13 @@ from ultralytics import YOLO
 LOGGER = logging.getLogger(__name__)
 
 SURROGATE_PATH = os.getenv("CV_MODEL_PATH", "/app/model/best.pt")
-EPSILON = float(os.getenv("NOISE_EPSILON", str(8 / 255.0)))
-ALPHA = float(os.getenv("NOISE_ALPHA", str(2 / 255.0)))
-PGD_STEPS = int(os.getenv("NOISE_PGD_STEPS", "20"))
+EPSILON = float(os.getenv("NOISE_EPSILON", str(10 / 255.0)))
+ALPHA = float(os.getenv("NOISE_ALPHA", str(3 / 255.0)))
+PGD_STEPS = int(os.getenv("NOISE_PGD_STEPS", "7"))
 SSIM_MIN = float(os.getenv("NOISE_SSIM_MIN", "0.85"))
-BISECT_ITERS = int(os.getenv("NOISE_BISECT_ITERS", "24"))
+BISECT_ITERS = int(os.getenv("NOISE_BISECT_ITERS", "8"))
 JPEG_QUALITY = int(os.getenv("NOISE_JPEG_QUALITY", "95"))
-MAX_SIDE = int(os.getenv("NOISE_MAX_SIDE", "1280"))
+MAX_SIDE = int(os.getenv("NOISE_MAX_SIDE", "640"))
 
 
 class NoiseManager:
@@ -135,9 +135,14 @@ class NoiseManager:
         x = original.detach() + torch.empty_like(original).uniform_(-EPSILON, EPSILON)
         x = x.clamp(0.0, 1.0)
 
+        use_amp = self.device == "cuda"
         for _ in range(PGD_STEPS):
             x = x.detach().requires_grad_(True)
-            loss = self._detection_loss(x)
+            if use_amp:
+                with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
+                    loss = self._detection_loss(x)
+            else:
+                loss = self._detection_loss(x)
             loss.backward()
 
             with torch.no_grad():
@@ -246,7 +251,7 @@ class NoiseManager:
             )
             return float(max(0.0, 1.0 - mse / (255.0**2)))
 
-        win_size = min(7, min_side if min_side % 2 == 1 else min_side - 1)
+        win_size = min(3, min_side if min_side % 2 == 1 else min_side - 1)
         return float(
             ssim_metric(
                 original_bgr,
