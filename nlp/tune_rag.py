@@ -28,7 +28,7 @@ from rank_bm25 import BM25Okapi
 
 
 DATA_DIR = Path(os.getenv("NLP_DATA_DIR", "/home/jupyter/novice/nlp"))
-OUT_DIR = Path(os.getenv("NLP_OUTPUT_DIR", "/home/jupyter/nlp/src"))
+OUT_DIR = Path(os.getenv("NLP_OUTPUT_DIR", Path(__file__).parent / "src"))
 TOKEN_PATTERN = re.compile(r"[A-Za-z0-9]+")
 SENTENCE_PATTERN = re.compile(r"(?<=[.!?])\s+|\n+")
 

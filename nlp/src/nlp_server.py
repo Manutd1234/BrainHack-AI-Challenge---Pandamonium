@@ -93,13 +93,13 @@ async def nlp(request: Request) -> dict[str, list[Any]]:
 
     if first.get("documents") is not None:
         await _start_load(first["documents"])
-        return {"predictions": [{"documents": [], "answer": "loading"}]}
+        return {"predictions": ["loading"]}
 
     if first.get("poll") is not None:
         status = load_state.status
         if status == "failed":
             status = "error"
-        return {"predictions": [{"documents": [], "answer": status}]}
+        return {"predictions": [status]}
 
     if load_state.status != "loaded":
         raise HTTPException(status_code=400, detail=f"Corpus status: {load_state.status}")
@@ -111,9 +111,9 @@ async def nlp(request: Request) -> dict[str, list[Any]]:
     predictions = []
     for pred in raw_predictions:
         if isinstance(pred, dict):
-            predictions.append(pred)
+            predictions.append(str(pred.get("answer") or ""))
         else:
-            predictions.append({"documents": [], "answer": str(pred)})
+            predictions.append(str(pred))
     return {"predictions": predictions}
 
 

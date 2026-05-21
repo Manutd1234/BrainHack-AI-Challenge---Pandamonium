@@ -32,7 +32,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     NLP_QA_READER_MIN_SCORE=5.0 \
     NLP_LLM_MODE=selective \
     NLP_MAX_NEW_TOKENS=96 \
-    HF_HOME=/app/.cache/huggingface
+    HF_HOME=/app/.cache/huggingface \
+    HF_HUB_OFFLINE=1 \
+    TRANSFORMERS_OFFLINE=1
 
 WORKDIR /app
 
@@ -46,7 +48,8 @@ RUN python -m pip install --no-cache-dir --upgrade pip setuptools wheel \
     && pip install --no-cache-dir --upgrade "transformers>=4.51.0"
 
 # Pre-download BGE models to cache them for offline runtime evaluation.
-RUN python -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='BAAI/bge-m3'); snapshot_download(repo_id='BAAI/bge-reranker-large')"
+RUN python -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='BAAI/bge-m3'); snapshot_download(repo_id='BAAI/bge-reranker-large')" \
+    && chmod -R 777 /app/.cache
 
 COPY src/ ./src/
 
