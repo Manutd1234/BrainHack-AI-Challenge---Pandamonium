@@ -1,10 +1,5 @@
 """Runs the ASR server."""
 
-# Unless you want to do something special with the server, you shouldn't need
-# to change anything in this file.
-
-
-import asyncio
 import base64
 
 from asr_manager import ASRManager
@@ -29,15 +24,10 @@ async def asr(request: Request) -> dict[str, list[str]]:
 
     inputs_json = await request.json()
 
-    predictions = []
-    for instance in inputs_json["instances"]:
-
-        # Reads the base-64 encoded audio and decodes it into bytes.
-        audio_bytes = base64.b64decode(instance["b64"])
-
-        # Performs ASR and appends the result.
-        transcription = await asyncio.to_thread(manager.asr, audio_bytes)
-        predictions.append(transcription)
+    audio_payloads = [
+        base64.b64decode(instance["b64"]) for instance in inputs_json["instances"]
+    ]
+    predictions = manager.asr_many(audio_payloads)
 
     return {"predictions": predictions}
 

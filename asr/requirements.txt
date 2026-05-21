@@ -1,6 +1,21 @@
-# Dependencies for the ASR container.
+# Runtime dependencies for the Parakeet ASR container.
+fastapi>=0.111.0
+uvicorn[standard]>=0.30.0
+pydantic>=2.7.0
 
-fastapi==0.115.12
-uvicorn[standard]==0.34.2
-faster-whisper
-huggingface-hub
+# NVIDIA NeMo ASR stack for Parakeet-TDT.
+nemo_toolkit[asr]>=2.0.0
+
+# Audio I/O and preprocessing.
+numpy>=1.26.0
+librosa>=0.10.0
+soundfile>=0.12.1
+
+# Optional Whisper Turbo fallback for suspicious Parakeet outputs.
+transformers>=4.51.0
+accelerate>=1.6.0,<2
+safetensors>=0.5.3
+sentencepiece>=0.2.0
+
+# Optional neural noise suppression. Disabled by default in Dockerfile because
+# Parakeet is already fast and clean-audio inference is usually stronger.

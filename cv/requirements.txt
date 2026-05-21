@@ -1,8 +1,13 @@
-# Dependencies for the CV container.
-
+# Runtime dependencies for the CV container.
 fastapi==0.115.12
 uvicorn[standard]==0.34.2
-ultralytics
-sahi
-pillow
-pycocotools
+
+# YOLO26 support starts in recent Ultralytics releases.
+ultralytics>=8.4.0,<9
+sahi>=0.11.23,<0.12
+rfdetr>=0.3.0
+Pillow>=10.3.0,<13
+
+# Image decoding and training utilities.
+opencv-python-headless>=4.10,<5
+pyyaml>=6.0.2,<7
