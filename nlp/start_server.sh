@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+
 : "${ENABLE_LOCAL_VLLM:=1}"
 : "${QWEN_MODEL:=Qwen/Qwen3.6-27B}"
 : "${QWEN_PORT:=8000}"

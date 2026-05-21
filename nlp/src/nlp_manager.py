@@ -13,7 +13,7 @@ from collections import defaultdict
 import logging
 import os
 import re
-from typing import Optional
+from typing import Optional, Any
 
 import numpy as np
 
@@ -121,14 +121,26 @@ class NLPManager:
                 break
         return chunks
 
-    def load_corpus(self, documents: list[str]) -> None:
+    def load_corpus(self, documents: list[Any]) -> None:
         """Loads and indexes the corpus of documents for RAG QA."""
         logger.info("Loading corpus of %d documents...", len(documents))
 
+        self.doc_ids = []
         self.chunks = []
         self.chunk_sources = []
         for doc_id, doc in enumerate(documents):
-            for chunk_text, source_id in self._chunk_text(doc, doc_id):
+            if isinstance(doc, str):
+                doc_text = doc
+                doc_uuid = f"DOC-{doc_id + 1:04d}"
+            elif isinstance(doc, dict):
+                doc_text = str(doc.get("document") or doc.get("text") or "")
+                doc_uuid = str(doc.get("id") or f"DOC-{doc_id + 1:04d}")
+            else:
+                doc_text = str(doc)
+                doc_uuid = f"DOC-{doc_id + 1:04d}"
+
+            self.doc_ids.append(doc_uuid)
+            for chunk_text, source_id in self._chunk_text(doc_text, doc_id):
                 self.chunks.append(chunk_text)
                 self.chunk_sources.append(source_id)
 
@@ -361,21 +373,35 @@ class NLPManager:
         )
         return re.sub(r"\s+", " ", answer).strip()[:800]
 
-    def qa(self, question: str) -> str:
+    def qa(self, question: str) -> dict[str, list[str] | str]:
         """Performs question answering using hybrid retrieval + Qwen3.6."""
         if not self.loaded:
-            return ""
+            return {"documents": [], "answer": ""}
 
         dense_results = self._retrieve_dense(question, self.top_k_retrieve)
         bm25_results = self._retrieve_bm25(question, self.top_k_retrieve)
         candidate_indices = self._fuse_results(dense_results, bm25_results)
 
         if not candidate_indices:
-            return ""
+            return {"documents": [], "answer": ""}
 
         candidate_indices = self._rerank(question, candidate_indices)
         context = self._build_context(candidate_indices)
+        
+        # Get retrieved document IDs
+        retrieved_doc_ids = []
+        for idx in candidate_indices:
+            if idx < len(self.chunk_sources):
+                doc_idx = self.chunk_sources[idx]
+                if doc_idx < len(self.doc_ids):
+                    doc_id = self.doc_ids[doc_idx]
+                    if doc_id not in retrieved_doc_ids:
+                        retrieved_doc_ids.append(doc_id)
+            if len(retrieved_doc_ids) >= 3:
+                break
+
         answer = self._call_llm(question, context)
-        if answer is not None:
-            return answer
-        return self._extract_answer(question, context)
+        if answer is None:
+            answer = self._extract_answer(question, context)
+            
+        return {"documents": retrieved_doc_ids, "answer": answer}

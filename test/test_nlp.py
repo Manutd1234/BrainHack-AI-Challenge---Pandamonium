@@ -261,11 +261,12 @@ def sample_generator(
         yield {"question": instance["question"]}
 
 
-def score_nlp(preds: Sequence[str], ground_truth: Sequence[Mapping[str, Any]]) -> float:
+def score_nlp(preds: Sequence[Any], ground_truth: Sequence[Mapping[str, Any]]) -> float:
     triples = []
     for pred, gt in zip(preds, ground_truth):
+        pred_answer = pred.get("answer") if isinstance(pred, dict) else pred
         triples.append(
-            (gt["question"], gt["answer"] if gt["answer"] is not None else "", pred)
+            (gt["question"], gt["answer"] if gt["answer"] is not None else "", pred_answer)
         )
 
     results = evaluator.batch_evaluate(triples)

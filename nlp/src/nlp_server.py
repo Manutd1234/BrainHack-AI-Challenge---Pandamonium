@@ -2,7 +2,7 @@
 
 import asyncio
 import logging
-from typing import Optional
+from typing import Optional, Any
 
 from fastapi import FastAPI, Request
 from nlp_manager import NLPManager
@@ -42,12 +42,12 @@ async def _load_task(documents) -> None:
 
 
 @app.post("/nlp")
-async def nlp(request: Request) -> dict[str, list[str]]:
+async def nlp(request: Request) -> dict[str, list[Any]]:
     inputs_json = await request.json()
-    first = inputs_json["instances"][0]
+    instances = inputs_json["instances"]
+    first = instances[0]
 
     # Corpus loading: the first request with "documents" triggers the load.
-    # Per spec, must return {"predictions": ["loaded"]} when complete.
     if first.get("documents") is not None:
         async with load_state.lock:
             if load_state.status in ("idle", "failed"):
@@ -55,26 +55,33 @@ async def nlp(request: Request) -> dict[str, list[str]]:
                 load_state.task = asyncio.create_task(
                     _load_task(first["documents"])
                 )
-
-        # Wait for loading to complete (spec expects "loaded" response)
-        if load_state.task is not None:
-            try:
-                await asyncio.wait_for(load_state.task, timeout=600)
-            except asyncio.TimeoutError:
-                load_state.status = "failed"
-                load_state.error = "Corpus load timed out"
-
-        return {"predictions": [load_state.status]}
+        return {"predictions": ["loading"]}
 
     # Poll: returns current status (subsequent polls).
     if first.get("poll") is not None:
-        return {"predictions": [load_state.status]}
+        status = load_state.status
+        if status == "failed":
+            status = "error"
+        return {"predictions": [status]}
 
     # QA: answer questions using RAG pipeline.
-    predictions = [
+    raw_predictions = [
         await asyncio.to_thread(manager.qa, instance["question"])
-        for instance in inputs_json["instances"]
+        for instance in instances
     ]
+    
+    predictions = []
+    for pred in raw_predictions:
+        if isinstance(pred, dict):
+            predictions.append({
+                "documents": list(pred.get("documents") or []),
+                "answer": str(pred.get("answer") or "")
+            })
+        else:
+            predictions.append({
+                "documents": [],
+                "answer": str(pred)
+            })
 
     return {"predictions": predictions}
 
