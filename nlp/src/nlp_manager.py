@@ -13,7 +13,12 @@ from typing import Any
 
 import numpy as np
 import torch
-from FlagEmbedding import BGEM3FlagModel, FlagReranker
+try:
+    from FlagEmbedding import BGEM3FlagModel, FlagReranker
+except Exception as e:
+    print(f"Warning: Could not import FlagEmbedding ({e}). Dense retrieval will be disabled.", flush=True)
+    BGEM3FlagModel = None
+    FlagReranker = None
 from rank_bm25 import BM25Okapi
 from transformers import AutoModelForCausalLM, AutoModelForQuestionAnswering, AutoTokenizer
 
@@ -285,14 +290,28 @@ class NLPManager:
 
         use_fp16 = torch.cuda.is_available()
         if self.use_dense:
-            print(f"Loading embedding model: {self.embedding_model_id}", flush=True)
-            self.embedding_model = BGEM3FlagModel(
-                self.embedding_model_id,
-                use_fp16=use_fp16,
-            )
+            if BGEM3FlagModel is not None:
+                try:
+                    print(f"Loading embedding model: {self.embedding_model_id}", flush=True)
+                    self.embedding_model = BGEM3FlagModel(
+                        self.embedding_model_id,
+                        use_fp16=use_fp16,
+                    )
+                except Exception as e:
+                    print(f"Warning: Failed to load embedding model BGE-M3 ({e}). Falling back to BM25 only.", flush=True)
+                    self.embedding_model = None
+            else:
+                self.embedding_model = None
 
-            print(f"Loading reranker: {self.reranker_model_id}", flush=True)
-            self.reranker = FlagReranker(self.reranker_model_id, use_fp16=use_fp16)
+            if FlagReranker is not None:
+                try:
+                    print(f"Loading reranker: {self.reranker_model_id}", flush=True)
+                    self.reranker = FlagReranker(self.reranker_model_id, use_fp16=use_fp16)
+                except Exception as e:
+                    print(f"Warning: Failed to load reranker BGE-Reranker ({e}). Skipping reranking.", flush=True)
+                    self.reranker = None
+            else:
+                self.reranker = None
 
         if self.use_llm and self._valid_llm_path(Path(self.model_path)):
             print(f"Loading quantized Qwen3 model from {self.model_path}", flush=True)
@@ -358,12 +377,16 @@ class NLPManager:
             [self._tokenize_for_search(self.documents[doc_id]) for doc_id in self.document_ids]
         )
 
-        if self.embedding_model is not None:
-            dense_embeddings = self.embedding_model.encode(
-                [chunk.text for chunk in self.chunks],
-                batch_size=int(os.getenv("NLP_EMBED_BATCH_SIZE", "12")),
-            )["dense_vecs"]
-            self.dense_embeddings = self._normalise_matrix(np.asarray(dense_embeddings))
+        if self.embedding_model is not None and self.chunks:
+            try:
+                dense_embeddings = self.embedding_model.encode(
+                    [chunk.text for chunk in self.chunks],
+                    batch_size=int(os.getenv("NLP_EMBED_BATCH_SIZE", "12")),
+                )["dense_vecs"]
+                self.dense_embeddings = self._normalise_matrix(np.asarray(dense_embeddings))
+            except Exception as e:
+                print(f"Warning: Failed to encode corpus chunks ({e}). Falling back to BM25 only.", flush=True)
+                self.dense_embeddings = None
         else:
             self.dense_embeddings = None
 
@@ -518,10 +541,14 @@ class NLPManager:
         if self.embedding_model is None or self.dense_embeddings is None:
             return np.argsort(-combined_scores).tolist()[: self.top_k_retrieve]
 
-        query_embedding = self.embedding_model.encode([question])["dense_vecs"]
-        query_embedding = self._normalise_matrix(np.asarray(query_embedding))[0]
-        dense_scores = self.dense_embeddings @ query_embedding
-        return self._rrf(combined_scores, dense_scores)[: self.top_k_retrieve]
+        try:
+            query_embedding = self.embedding_model.encode([question])["dense_vecs"]
+            query_embedding = self._normalise_matrix(np.asarray(query_embedding))[0]
+            dense_scores = self.dense_embeddings @ query_embedding
+            return self._rrf(combined_scores, dense_scores)[: self.top_k_retrieve]
+        except Exception as e:
+            print(f"Warning: Dense retrieval failed ({e}). Falling back to BM25 only.", flush=True)
+            return np.argsort(-combined_scores).tolist()[: self.top_k_retrieve]
 
     def _rrf(
         self,
@@ -542,17 +569,21 @@ class NLPManager:
         if self.reranker is None:
             return self._diversify_chunks(candidate_chunk_ids)
 
-        pairs = [[question, self.chunks[index].text] for index in candidate_chunk_ids]
-        scores = self.reranker.compute_score(pairs)
-        if isinstance(scores, (float, int)):
-            scores = [float(scores)]
+        try:
+            pairs = [[question, self.chunks[index].text] for index in candidate_chunk_ids]
+            scores = self.reranker.compute_score(pairs)
+            if isinstance(scores, (float, int)):
+                scores = [float(scores)]
 
-        scored = sorted(
-            zip(candidate_chunk_ids, scores),
-            key=lambda item: float(item[1]),
-            reverse=True,
-        )
-        return [chunk_id for chunk_id, _ in scored[: self.top_k_rerank]]
+            scored = sorted(
+                zip(candidate_chunk_ids, scores),
+                key=lambda item: float(item[1]),
+                reverse=True,
+            )
+            return [chunk_id for chunk_id, _ in scored[: self.top_k_rerank]]
+        except Exception as e:
+            print(f"Warning: Reranking failed ({e}). Falling back to diversify chunks.", flush=True)
+            return self._diversify_chunks(candidate_chunk_ids)
 
     def _diversify_chunks(self, candidate_chunk_ids: list[int]) -> list[int]:
         selected = []

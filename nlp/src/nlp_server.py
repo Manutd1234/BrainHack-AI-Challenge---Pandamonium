@@ -93,13 +93,13 @@ async def nlp(request: Request) -> dict[str, list[Any]]:
 
     if first.get("documents") is not None:
         await _start_load(first["documents"])
-        return {"predictions": ["loading"]}
+        return {"predictions": [{"documents": [], "answer": "loading"}]}
 
     if first.get("poll") is not None:
         status = load_state.status
         if status == "failed":
             status = "error"
-        return {"predictions": [status]}
+        return {"predictions": [{"documents": [], "answer": status}]}
 
     if load_state.status != "loaded":
         raise HTTPException(status_code=400, detail=f"Corpus status: {load_state.status}")
