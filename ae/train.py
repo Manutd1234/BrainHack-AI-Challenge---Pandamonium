@@ -1,375 +1,281 @@
-"""Train the AE agent with discrete Soft Actor-Critic.
+"""
+AE Training — TIL-AI 2026
+═══════════════════════════════════════════════════════════════════════
+Phase 1 — RecurrentPPO with LSTM (10M steps)
+  Uses sb3-contrib RecurrentPPO so the policy maintains hidden state
+  across the 200-step episode. Solves partial observability (viewcone
+  only shows what's directly ahead — LSTM remembers the rest).
 
-Stable-Baselines3 SAC only supports continuous action spaces, while TIL-26 AE
-uses six discrete actions. This script implements the discrete SAC update
-directly and reuses the ResNet-bottleneck policy shipped in ``ae/src``.
+Phase 2 — Self-play fine-tune (5M steps)
+  Opponents drawn from rolling pool of past checkpoints.
+  PoolUpdateCallback adds live policy to pool every 500K steps.
+
+Curriculum:
+  Shaped reward ramps from exploration-heavy (+0.1 new cell) in Phase 1
+  to competition-realistic (+0.05 new cell) in Phase 2, forcing the
+  agent to learn challenge activation and opponent interaction.
+
+Output: model/policy.zip (RecurrentPPO LSTM checkpoint)
+Install:
+    pip install stable-baselines3[extra] sb3-contrib tensorboard
+    pip install -e /path/to/til-26/
 """
 
-from __future__ import annotations
-
-import argparse
-from collections import deque
-from dataclasses import dataclass
-from pathlib import Path
+import glob
+import logging
+import os
 import random
-import sys
-from typing import Any
+import shutil
 
 import numpy as np
-import torch
-from torch import nn
-import torch.nn.functional as F
 
-SRC_DIR = Path(__file__).resolve().parent / "src"
-sys.path.insert(0, str(SRC_DIR))
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger(__name__)
 
-from ae_model import (  # noqa: E402
-    NUM_ACTIONS,
-    SACCriticNetwork,
-    SACPolicyNetwork,
-    batch_encode_observations,
-    masked_logits,
+try:
+    from sb3_contrib import RecurrentPPO
+    USE_RECURRENT = True
+    logger.info("Using RecurrentPPO (LSTM policy)")
+except ImportError:
+    from stable_baselines3 import PPO as RecurrentPPO
+    USE_RECURRENT = False
+    logger.warning("sb3-contrib not found — falling back to standard PPO (no LSTM)")
+
+from stable_baselines3.common.callbacks import BaseCallback, CheckpointCallback, EvalCallback
+from stable_baselines3.common.env_util import make_vec_env
+from stable_baselines3.common.vec_env import SubprocVecEnv, VecMonitor
+
+try:
+    from til_environment.env import TILEnvironment
+except ImportError:
+    raise ImportError("pip install -e /path/to/til-26/")
+
+# ── Config ─────────────────────────────────────────────────────────────────
+N_ENVS          = 8
+PHASE1_STEPS    = 10_000_000
+PHASE2_STEPS    = 5_000_000
+POOL_SIZE       = 8
+POOL_UPDATE_FREQ = 500_000
+
+BASE_PATH      = "model/policy_base"
+SELFPLAY_PATH  = "model/policy_selfplay"
+POOL_DIR       = "model/pool"
+LOG_DIR        = "logs"
+
+PPO_CONFIG = dict(
+    learning_rate  = 3e-4,
+    n_steps        = 2048,
+    batch_size     = 512,
+    n_epochs       = 10,
+    gamma          = 0.99,
+    gae_lambda     = 0.95,
+    clip_range     = 0.2,
+    ent_coef       = 0.01,
+    vf_coef        = 0.5,
+    max_grad_norm  = 0.5,
+    verbose        = 1,
+    tensorboard_log= LOG_DIR,
+)
+
+LSTM_CONFIG = dict(
+    **PPO_CONFIG,
+    # RecurrentPPO extra params
+    lstm_hidden_size = 256,
+    n_lstm_layers    = 1,
+    shared_lstm      = False,
+    enable_critic_lstm = True,
 )
 
 
-@dataclass
-class Transition:
-    obs: dict[str, Any]
-    action: int
-    reward: float
-    next_obs: dict[str, Any]
-    done: bool
+# ── Environments ───────────────────────────────────────────────────────────
+
+class ExplorationEnv(TILEnvironment):
+    """Phase 1: heavy exploration shaping."""
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self._visited: set = set()
+
+    def reset(self, **kw):
+        self._visited.clear()
+        return super().reset(**kw)
+
+    def step(self, action):
+        obs, rew, term, trunc, info = super().step(action)
+        loc = tuple(obs.get("location", [0, 0]))
+        if loc not in self._visited:
+            self._visited.add(loc)
+            rew += 0.10   # strong exploration bonus in Phase 1
+        return obs, rew, term, trunc, info
 
 
-class ReplayBuffer:
-    def __init__(self, capacity: int):
-        self.buffer: deque[Transition] = deque(maxlen=capacity)
+class SelfPlayEnv(TILEnvironment):
+    """Phase 2: exploration shaping + pool opponent."""
+    def __init__(self, pool_dir: str, *a, **kw):
+        super().__init__(*a, **kw)
+        self.pool_dir    = pool_dir
+        self._opp        = None
+        self._opp_path   = None
+        self._visited: set = set()
 
-    def add(self, transition: Transition) -> None:
-        self.buffer.append(transition)
+    def reset(self, **kw):
+        self._visited.clear()
+        # Sample new opponent from pool
+        files = glob.glob(os.path.join(self.pool_dir, "*.zip"))
+        if files:
+            path = random.choice(files)
+            if path != self._opp_path:
+                try:
+                    self._opp = RecurrentPPO.load(path, device="cpu")
+                    self._opp_path = path
+                except Exception:
+                    self._opp = None
+        return super().reset(**kw)
 
-    def sample(self, batch_size: int) -> list[Transition]:
-        return random.sample(self.buffer, batch_size)
-
-    def __len__(self) -> int:
-        return len(self.buffer)
-
-
-def make_env(mode: str, seed: int):
-    import til_environment
-
-    if hasattr(til_environment, "make"):
-        return til_environment.make(mode=mode, seed=seed)
-
-    from til_environment import bomberman_env
-    from til_environment.config import default_config
-
-    config = default_config()
-    config.env.novice = mode == "novice"
-    return bomberman_env.basic_env(env_wrappers=[], cfg=config)
-
-
-def as_plain_obs(observation: dict[str, Any]) -> dict[str, Any]:
-    if observation is None:
-        return {}
-    plain = {}
-    for key, value in observation.items():
-        if hasattr(value, "tolist"):
-            plain[key] = value.tolist()
-        else:
-            plain[key] = value
-    return plain
+    def step(self, action):
+        obs, rew, term, trunc, info = super().step(action)
+        loc = tuple(obs.get("location", [0, 0]))
+        if loc not in self._visited:
+            self._visited.add(loc)
+            rew += 0.05   # lighter shaping in Phase 2
+        return obs, rew, term, trunc, info
 
 
-@torch.no_grad()
-def select_action(
-    actor: SACPolicyNetwork,
-    observation: dict[str, Any],
-    epsilon: float,
-    device: torch.device,
-) -> int:
-    mask = observation.get("action_mask", [1] * NUM_ACTIONS)
-    valid = [idx for idx, allowed in enumerate(mask) if allowed == 1]
-    if not valid:
-        return NUM_ACTIONS - 1
-    if random.random() < epsilon:
-        return random.choice(valid)
+# ── Pool management ────────────────────────────────────────────────────────
 
-    agent_view, base_view, scalars, action_mask = batch_encode_observations(
-        [observation],
-        device,
+class OpponentPool:
+    def __init__(self, pool_dir: str, max_size: int = POOL_SIZE):
+        self.pool_dir = pool_dir
+        self.max_size = max_size
+        os.makedirs(pool_dir, exist_ok=True)
+
+    def add(self, model, step: int):
+        path = os.path.join(self.pool_dir, f"opp_{step:010d}")
+        model.save(path)
+        logger.info(f"Pool: added opp at step {step:,}")
+        files = sorted(glob.glob(os.path.join(self.pool_dir, "*.zip")))
+        while len(files) > self.max_size:
+            os.remove(files.pop(0))
+
+    def __len__(self):
+        return len(glob.glob(os.path.join(self.pool_dir, "*.zip")))
+
+
+class PoolUpdateCallback(BaseCallback):
+    def __init__(self, pool: OpponentPool, freq: int = POOL_UPDATE_FREQ):
+        super().__init__()
+        self.pool = pool
+        self.freq = freq
+        self._last = 0
+
+    def _on_step(self) -> bool:
+        if self.num_timesteps - self._last >= self.freq:
+            self.pool.add(self.model, self.num_timesteps)
+            self._last = self.num_timesteps
+        return True
+
+
+# ── Training ───────────────────────────────────────────────────────────────
+
+def make_phase1_env(seed=0):
+    return lambda: ExplorationEnv(seed=seed)
+
+def make_phase2_env(pool_dir, seed=0):
+    return lambda: SelfPlayEnv(pool_dir=pool_dir, seed=seed)
+
+
+def phase1():
+    os.makedirs("model", exist_ok=True)
+    os.makedirs(LOG_DIR,  exist_ok=True)
+
+    if os.path.exists(f"{BASE_PATH}.zip"):
+        logger.info(f"Phase 1 checkpoint found — skipping Phase 1")
+        return RecurrentPPO.load(BASE_PATH, device="cuda")
+
+    logger.info("=" * 60)
+    logger.info("PHASE 1 — RecurrentPPO LSTM (10M steps, exploration shaping)")
+    logger.info("=" * 60)
+
+    envs = SubprocVecEnv([make_phase1_env(i) for i in range(N_ENVS)])
+    envs = VecMonitor(envs)
+    eval_env = make_vec_env(TILEnvironment, n_envs=1)
+
+    policy = "MlpLstmPolicy" if USE_RECURRENT else "MultiInputPolicy"
+    config  = LSTM_CONFIG    if USE_RECURRENT else PPO_CONFIG
+
+    model = RecurrentPPO(policy=policy, env=envs, device="cuda", **{
+        k: v for k, v in config.items()
+        if k not in ("policy",)
+    })
+
+    model.learn(
+        total_timesteps=PHASE1_STEPS,
+        progress_bar=True,
+        callback=[
+            CheckpointCallback(
+                save_freq=500_000 // N_ENVS,
+                save_path="model/ckpts_p1/",
+                name_prefix="p1",
+            ),
+            EvalCallback(
+                eval_env, eval_freq=200_000 // N_ENVS,
+                n_eval_episodes=10, deterministic=True,
+                best_model_save_path="model/best_p1/",
+            ),
+        ],
     )
-    logits = actor(agent_view, base_view, scalars)
-    logits = masked_logits(logits, action_mask)
-    probs = F.softmax(logits, dim=-1)
-    return int(torch.distributions.Categorical(probs=probs).sample().item())
+    model.save(BASE_PATH)
+    logger.info(f"Phase 1 done → {BASE_PATH}.zip")
+    return model
 
 
-def update_sac(
-    actor: SACPolicyNetwork,
-    critic1: SACCriticNetwork,
-    critic2: SACCriticNetwork,
-    target1: SACCriticNetwork,
-    target2: SACCriticNetwork,
-    actor_opt: torch.optim.Optimizer,
-    critic_opt: torch.optim.Optimizer,
-    replay: ReplayBuffer,
-    batch_size: int,
-    gamma: float,
-    alpha: float,
-    tau: float,
-    device: torch.device,
-) -> dict[str, float]:
-    batch = replay.sample(batch_size)
-    observations = [transition.obs for transition in batch]
-    next_observations = [transition.next_obs for transition in batch]
-    actions = torch.tensor([t.action for t in batch], dtype=torch.long, device=device)
-    rewards = torch.tensor([t.reward for t in batch], dtype=torch.float32, device=device)
-    dones = torch.tensor([t.done for t in batch], dtype=torch.float32, device=device)
+def phase2(base_model):
+    logger.info("=" * 60)
+    logger.info("PHASE 2 — Self-play fine-tune (5M steps)")
+    logger.info("=" * 60)
 
-    agent, base, scalars, masks = batch_encode_observations(observations, device)
-    next_agent, next_base, next_scalars, next_masks = batch_encode_observations(
-        next_observations,
-        device,
+    pool = OpponentPool(POOL_DIR)
+    pool.add(base_model, step=0)
+
+    envs = SubprocVecEnv([make_phase2_env(POOL_DIR, i) for i in range(N_ENVS)])
+    envs = VecMonitor(envs)
+    eval_env = make_vec_env(TILEnvironment, n_envs=1)
+
+    policy = "MlpLstmPolicy" if USE_RECURRENT else "MultiInputPolicy"
+    config  = {**LSTM_CONFIG, "learning_rate": 1e-4, "ent_coef": 0.005} \
+              if USE_RECURRENT else \
+              {**PPO_CONFIG, "learning_rate": 1e-4, "ent_coef": 0.005}
+
+    model = RecurrentPPO(policy=policy, env=envs, device="cuda", **{
+        k: v for k, v in config.items()
+        if k not in ("policy",)
+    })
+    model.set_parameters(base_model.get_parameters())
+
+    model.learn(
+        total_timesteps=PHASE2_STEPS,
+        progress_bar=True,
+        reset_num_timesteps=True,
+        callback=[
+            PoolUpdateCallback(pool),
+            CheckpointCallback(
+                save_freq=500_000 // N_ENVS,
+                save_path="model/ckpts_p2/",
+                name_prefix="p2",
+            ),
+            EvalCallback(
+                eval_env, eval_freq=200_000 // N_ENVS,
+                n_eval_episodes=10, deterministic=True,
+                best_model_save_path="model/best_p2/",
+            ),
+        ],
     )
-
-    with torch.no_grad():
-        next_logits = masked_logits(
-            actor(next_agent, next_base, next_scalars),
-            next_masks,
-        )
-        next_log_probs = F.log_softmax(next_logits, dim=-1)
-        next_probs = next_log_probs.exp()
-        next_q = torch.min(
-            target1(next_agent, next_base, next_scalars),
-            target2(next_agent, next_base, next_scalars),
-        )
-        next_value = (next_probs * (next_q - alpha * next_log_probs)).sum(dim=-1)
-        target_q = rewards + gamma * (1.0 - dones) * next_value
-
-    current_q1 = critic1(agent, base, scalars).gather(1, actions[:, None]).squeeze(1)
-    current_q2 = critic2(agent, base, scalars).gather(1, actions[:, None]).squeeze(1)
-    critic_loss = F.mse_loss(current_q1, target_q) + F.mse_loss(current_q2, target_q)
-
-    critic_opt.zero_grad()
-    critic_loss.backward()
-    nn.utils.clip_grad_norm_(list(critic1.parameters()) + list(critic2.parameters()), 5.0)
-    critic_opt.step()
-
-    logits = masked_logits(actor(agent, base, scalars), masks)
-    log_probs = F.log_softmax(logits, dim=-1)
-    probs = log_probs.exp()
-    q_min = torch.min(critic1(agent, base, scalars), critic2(agent, base, scalars))
-    actor_loss = (probs * (alpha * log_probs - q_min)).sum(dim=-1).mean()
-
-    actor_opt.zero_grad()
-    actor_loss.backward()
-    nn.utils.clip_grad_norm_(actor.parameters(), 5.0)
-    actor_opt.step()
-
-    with torch.no_grad():
-        for target, source in ((target1, critic1), (target2, critic2)):
-            for target_param, source_param in zip(target.parameters(), source.parameters()):
-                target_param.mul_(1.0 - tau).add_(source_param, alpha=tau)
-
-    return {
-        "actor_loss": float(actor_loss.detach().cpu()),
-        "critic_loss": float(critic_loss.detach().cpu()),
-    }
-
-
-def train_on_transition(
-    transition: Transition,
-    replay: ReplayBuffer,
-    state: dict[str, Any],
-    args: argparse.Namespace,
-    device: torch.device,
-) -> None:
-    replay.add(transition)
-    state["steps"] += 1
-    if len(replay) < max(args.batch_size, args.warmup_steps):
-        return
-
-    for _ in range(args.updates_per_step):
-        metrics = update_sac(
-            state["actor"],
-            state["critic1"],
-            state["critic2"],
-            state["target1"],
-            state["target2"],
-            state["actor_opt"],
-            state["critic_opt"],
-            replay,
-            args.batch_size,
-            args.gamma,
-            args.alpha,
-            args.tau,
-            device,
-        )
-        state["last_metrics"] = metrics
-
-
-def rollout_gym_env(env, state, replay, args, device) -> float:
-    reset_result = env.reset()
-    obs = reset_result[0] if isinstance(reset_result, tuple) else reset_result
-    obs = as_plain_obs(obs)
-    total_reward = 0.0
-
-    for _ in range(args.max_episode_steps):
-        epsilon = max(args.min_epsilon, args.epsilon * (1 - state["steps"] / args.total_steps))
-        action = select_action(state["actor"], obs, epsilon, device)
-        step_result = env.step(action)
-        if len(step_result) == 5:
-            next_obs, reward, terminated, truncated, _info = step_result
-            done = bool(terminated or truncated)
-        else:
-            next_obs, reward, done, _info = step_result
-        next_obs = as_plain_obs(next_obs)
-        total_reward += float(reward)
-        train_on_transition(
-            Transition(obs, action, float(reward), next_obs, done),
-            replay,
-            state,
-            args,
-            device,
-        )
-        obs = next_obs
-        if done or state["steps"] >= args.total_steps:
-            break
-    return total_reward
-
-
-def rollout_aec_env(env, state, replay, args, device) -> float:
-    env.reset()
-    controlled_agent = env.possible_agents[0]
-    last_obs = None
-    last_action = None
-    total_reward = 0.0
-
-    for agent in env.agent_iter(args.max_episode_steps * len(env.possible_agents)):
-        observation, reward, termination, truncation, _info = env.last()
-        done = bool(termination or truncation)
-        reward = float(reward)
-
-        if agent == controlled_agent:
-            obs = as_plain_obs(observation)
-            total_reward += reward
-            if last_obs is not None and last_action is not None:
-                train_on_transition(
-                    Transition(last_obs, last_action, reward, obs, done),
-                    replay,
-                    state,
-                    args,
-                    device,
-                )
-            if done:
-                action = None
-                last_obs = None
-                last_action = None
-            else:
-                epsilon = max(
-                    args.min_epsilon,
-                    args.epsilon * (1 - state["steps"] / args.total_steps),
-                )
-                action = select_action(state["actor"], obs, epsilon, device)
-                last_obs = obs
-                last_action = action
-        else:
-            action = None if done else env.action_space(agent).sample()
-
-        env.step(action)
-        if state["steps"] >= args.total_steps:
-            break
-    return total_reward
-
-
-def save_policy(actor: SACPolicyNetwork, path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save({"model_state_dict": actor.state_dict()}, path)
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=["novice", "advanced"], default="advanced")
-    parser.add_argument("--total-steps", type=int, default=5_000_000)
-    parser.add_argument("--max-episode-steps", type=int, default=240)
-    parser.add_argument("--envs", type=int, default=8)
-    parser.add_argument("--buffer-size", type=int, default=250_000)
-    parser.add_argument("--batch-size", type=int, default=256)
-    parser.add_argument("--warmup-steps", type=int, default=5_000)
-    parser.add_argument("--updates-per-step", type=int, default=1)
-    parser.add_argument("--gamma", type=float, default=0.995)
-    parser.add_argument("--alpha", type=float, default=0.05)
-    parser.add_argument("--tau", type=float, default=0.005)
-    parser.add_argument("--lr", type=float, default=3e-4)
-    parser.add_argument("--epsilon", type=float, default=0.20)
-    parser.add_argument("--min-epsilon", type=float, default=0.02)
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--save-freq", type=int, default=50_000)
-    parser.add_argument(
-        "--save-path",
-        type=Path,
-        default=Path("models/ae/sac_resnet_policy.pt"),
-    )
-    args = parser.parse_args()
-
-    random.seed(args.seed)
-    np.random.seed(args.seed)
-    torch.manual_seed(args.seed)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    actor = SACPolicyNetwork().to(device)
-    critic1 = SACCriticNetwork().to(device)
-    critic2 = SACCriticNetwork().to(device)
-    target1 = SACCriticNetwork().to(device)
-    target2 = SACCriticNetwork().to(device)
-    target1.load_state_dict(critic1.state_dict())
-    target2.load_state_dict(critic2.state_dict())
-
-    state = {
-        "actor": actor,
-        "critic1": critic1,
-        "critic2": critic2,
-        "target1": target1,
-        "target2": target2,
-        "actor_opt": torch.optim.Adam(actor.parameters(), lr=args.lr),
-        "critic_opt": torch.optim.Adam(
-            list(critic1.parameters()) + list(critic2.parameters()),
-            lr=args.lr,
-        ),
-        "steps": 0,
-        "last_metrics": {},
-    }
-    replay = ReplayBuffer(args.buffer_size)
-    envs = [make_env(args.mode, args.seed + idx) for idx in range(args.envs)]
-    next_save_step = args.save_freq
-
-    print(f"Training discrete SAC on {device} for {args.total_steps:,} steps")
-    episode = 0
-    while state["steps"] < args.total_steps:
-        env = envs[episode % len(envs)]
-        if hasattr(env, "agent_iter") and hasattr(env, "possible_agents"):
-            reward = rollout_aec_env(env, state, replay, args, device)
-        else:
-            reward = rollout_gym_env(env, state, replay, args, device)
-        episode += 1
-
-        if state["steps"] >= next_save_step:
-            save_policy(actor, args.save_path)
-            next_save_step += args.save_freq
-
-        print(
-            f"episode={episode} steps={state['steps']} reward={reward:.2f} "
-            f"buffer={len(replay)} metrics={state['last_metrics']}"
-        )
-
-    save_policy(actor, args.save_path)
-    for env in envs:
-        close = getattr(env, "close", None)
-        if close is not None:
-            close()
-    print(f"Training complete. Policy saved to {args.save_path}")
+    model.save(SELFPLAY_PATH)
+    shutil.copy(f"{SELFPLAY_PATH}.zip", "model/policy.zip")
+    logger.info(f"Phase 2 done → model/policy.zip")
+    return model
 
 
 if __name__ == "__main__":
-    main()
+    base  = phase1()
+    phase2(base)
+    logger.info("Training complete → copy model/policy.zip to ae/model/policy.zip")

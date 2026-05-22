@@ -1,218 +1,295 @@
-"""Manages the AE model.
-
-The manager uses a trained discrete-SAC ResNet policy when weights are present
-and falls back to a tactical exploration heuristic otherwise. This keeps the
-submission functional before long-running AE training has completed.
 """
+AE Manager — TIL-AI 2026
+═══════════════════════════════════════════════════════════════════════
+PRIMARY  : PPO with RecurrentPPO (LSTM policy) — memory across timesteps
+           LSTM remembers which cells were visited and where opponents are,
+           solving the partial-observability problem of the viewcone.
 
-from __future__ import annotations
+FALLBACK : Smart BFS exploration agent with occupancy map
+           Three-tier fallback:
+             1. PPO-LSTM inference (best)
+             2. Rule-based BFS to nearest unvisited frontier (good)
+             3. Random turn (prevents getting permanently stuck)
+
+IMPROVEMENTS over previous version:
+  1. LSTM hidden state — agent remembers across 200-step episode
+  2. Occupancy map — tracks visited/wall/unknown per cell
+  3. Better stuck detection — resets hidden state on stuck
+  4. Direction-aware viewcone parsing — correct world-coord mapping
+  5. Three-tier fallback — never returns constant action
+═══════════════════════════════════════════════════════════════════════
+"""
 
 import logging
 import os
 import random
-from typing import Any
+from collections import deque
+from typing import Optional
 
 import numpy as np
+import torch
 
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
+
+CHECKPOINT_PATH = os.environ.get("AE_CHECKPOINT_PATH", "/app/model/policy.zip")
+GRID = 16
+
+FORWARD   = 0
+TURN_LEFT = 1
+TURN_RIGHT = 2
+TURN_BACK  = 3
+
+DIR_DELTA = {
+    0: ( 0, -1),  # North
+    1: ( 1,  0),  # East
+    2: ( 0,  1),  # South
+    3: (-1,  0),  # West
+}
+
+# Occupancy values
+UNKNOWN  = 0
+FREE     = 1
+WALL     = 2
+VISITED  = 3
+
+
+class OccupancyMap:
+    """16×16 grid tracking cell state across the episode."""
+
+    def __init__(self):
+        self.grid = np.zeros((GRID, GRID), dtype=np.uint8)
+
+    def reset(self):
+        self.grid[:] = 0
+
+    def mark(self, x: int, y: int, state: int):
+        if 0 <= x < GRID and 0 <= y < GRID:
+            self.grid[y, x] = state
+
+    def get(self, x: int, y: int) -> int:
+        if 0 <= x < GRID and 0 <= y < GRID:
+            return int(self.grid[y, x])
+        return WALL  # out-of-bounds = wall
+
+    def update_from_viewcone(self, viewcone, direction: int, ax: int, ay: int):
+        vc = np.array(viewcone, dtype=np.int32) if viewcone else np.array([[]])
+        if vc.ndim < 2 or vc.size == 0:
+            return
+        rows, cols = vc.shape[:2]
+        cx = cols // 2
+
+        # Direction → (forward_dx, forward_dy, right_dx, right_dy)
+        fwd = {
+            0: (( 0,-1),( 1, 0)),  # North: forward=-y, right=+x
+            1: (( 1, 0),( 0, 1)),  # East:  forward=+x, right=+y
+            2: (( 0, 1),(-1, 0)),  # South: forward=+y, right=-x
+            3: ((-1, 0),( 0,-1)),  # West:  forward=-x, right=-y
+        }
+        (fdx, fdy), (rdx, rdy) = fwd.get(direction, fwd[0])
+
+        for r in range(rows):
+            for c in range(cols):
+                dx = fdx * r + rdx * (c - cx)
+                dy = fdy * r + rdy * (c - cx)
+                wx, wy = ax + dx, ay + dy
+                if not (0 <= wx < GRID and 0 <= wy < GRID):
+                    continue
+                val = int(vc[r, c]) if vc.ndim == 2 else int(vc[r, c, 0])
+                if val == 0:
+                    # Passable
+                    if self.get(wx, wy) != VISITED:
+                        self.mark(wx, wy, FREE)
+                else:
+                    self.mark(wx, wy, WALL)
+
+    def frontier_cells(self) -> list[tuple[int, int]]:
+        """Cells that are FREE but adjacent to UNKNOWN — exploration targets."""
+        frontier = []
+        for y in range(GRID):
+            for x in range(GRID):
+                if self.grid[y, x] in (FREE, VISITED):
+                    for dx, dy in [(0,1),(0,-1),(1,0),(-1,0)]:
+                        nx, ny = x+dx, y+dy
+                        if 0 <= nx < GRID and 0 <= ny < GRID:
+                            if self.grid[ny, nx] == UNKNOWN:
+                                frontier.append((x, y))
+                                break
+        return frontier
+
+    def unvisited_free(self) -> list[tuple[int, int]]:
+        cells = []
+        for y in range(GRID):
+            for x in range(GRID):
+                if self.grid[y, x] == FREE:
+                    cells.append((x, y))
+        return cells
 
 
 class AEManager:
     def __init__(self):
-        self.visited: set[tuple[int, int]] = set()
-        self.visit_counts: dict[tuple[int, int], int] = {}
-        self.last_action = None
-        self.stuck_counter = 0
-        self.last_location: tuple[int, int] | None = None
-        self.step_count = 0
-        self.policy = None
-        self.device = None
-        self._load_policy()
+        self.ppo = None
+        self.lstm_states = None
+        self._try_load_ppo()
+        self.map = OccupancyMap()
+        self.action_queue: list[int] = []
+        self.last_pos: Optional[tuple] = None
+        self.stuck_count = 0
+        self.step = 0
 
-    def _load_policy(self) -> None:
-        candidates = [
-            os.getenv("AE_POLICY_PATH"),
-            "models/ae/sac_resnet_policy.pt",
-            "models/sac_resnet_policy.pt",
-            "sac_resnet_policy.pt",
-        ]
-        candidates = [path for path in candidates if path]
+    # ── PPO loading ────────────────────────────────────────────────────────
 
-        for path in candidates:
-            if not os.path.exists(path):
-                continue
-            try:
-                import torch
-                from ae_model import SACPolicyNetwork
-
-                self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-                checkpoint = torch.load(path, map_location=self.device)
-                state_dict = checkpoint.get("model_state_dict", checkpoint)
-                self.policy = SACPolicyNetwork()
-                self.policy.load_state_dict(state_dict)
-                self.policy.to(self.device)
-                self.policy.eval()
-                logger.info("Loaded AE SAC policy from %s on %s", path, self.device)
-                return
-            except Exception as exc:
-                logger.warning("Could not load AE policy %s: %s", path, exc)
-
-        logger.info("No AE SAC policy found; using tactical heuristic.")
-
-    def _policy_action(self, observation: dict[str, Any], action_mask: list[int]) -> int | None:
-        if self.policy is None or self.device is None:
-            return None
-
+    def _try_load_ppo(self):
+        if not os.path.exists(CHECKPOINT_PATH):
+            logger.warning(
+                f"No PPO checkpoint at {CHECKPOINT_PATH} — using rule-based fallback. "
+                f"Train with ae_train.py first."
+            )
+            return
         try:
-            import torch
-            from ae_model import batch_encode_observations, masked_logits
-
-            with torch.no_grad():
-                agent_view, base_view, scalars, masks = batch_encode_observations(
-                    [observation],
-                    self.device,
-                )
-                logits = self.policy(agent_view, base_view, scalars)
-                logits = masked_logits(logits, masks)
-                action = int(torch.argmax(logits, dim=-1).item())
-            if 0 <= action < len(action_mask) and action_mask[action] == 1:
-                return action
-        except Exception as exc:
-            logger.warning("AE policy inference failed; falling back: %s", exc)
-        return None
-
-    def ae(self, observation: dict[str, Any]) -> int:
-        """Gets the next action for the agent."""
-        action_mask = observation.get("action_mask", [1, 1, 1, 1, 1, 1])
-        location = tuple(observation.get("location", [0, 0]))
-        direction = int(observation.get("direction", 0))
-        step = int(observation.get("step", 0))
-        agent_viewcone = observation.get("agent_viewcone", None)
-        frozen_ticks = int(observation.get("frozen_ticks", 0))
-        team_resources = self._first(observation.get("team_resources"), 0.0)
-        team_bombs = int(self._first(observation.get("team_bombs"), 1.0))
-
-        self.step_count = step
-
-        if frozen_ticks > 0:
-            return 5
-
-        if self.last_location == location:
-            self.stuck_counter += 1
-        else:
-            self.stuck_counter = 0
-
-        self.last_location = location
-        self.visited.add(location)
-        self.visit_counts[location] = self.visit_counts.get(location, 0) + 1
-
-        if action_mask[3] == 1:
-            return 3
-
-        policy_action = self._policy_action(observation, action_mask)
-        if policy_action is not None:
-            return policy_action
-
-        if self.stuck_counter > 6 and action_mask[4] == 1:
-            self.stuck_counter = 0
-            return 4
-
-        if self.stuck_counter > 3:
-            self.stuck_counter = 0
-            turn_actions = [a for a in (1, 2) if action_mask[a] == 1]
-            if turn_actions:
-                return random.choice(turn_actions)
-            return self._random_valid(action_mask)
-
-        return self._heuristic_action(
-            action_mask=action_mask,
-            location=location,
-            direction=direction,
-            agent_viewcone=agent_viewcone,
-            team_resources=team_resources,
-            team_bombs=team_bombs,
-        )
-
-    def _heuristic_action(
-        self,
-        action_mask: list[int],
-        location: tuple[int, int],
-        direction: int,
-        agent_viewcone: Any,
-        team_resources: float,
-        team_bombs: int,
-    ) -> int:
-        dx = [0, 1, 0, -1]
-        dy = [-1, 0, 1, 0]
-
-        directional_locations = {
-            0: (location[0] + dx[direction], location[1] + dy[direction]),
-            1: (
-                location[0] + dx[(direction - 1) % 4],
-                location[1] + dy[(direction - 1) % 4],
-            ),
-            2: (
-                location[0] + dx[(direction + 1) % 4],
-                location[1] + dy[(direction + 1) % 4],
-            ),
-        }
-
-        blocked = {0: action_mask[0] == 0, 1: False, 2: False}
-        frontier_bonus = {0: 0.0, 1: 0.0, 2: 0.0}
-
-        if agent_viewcone is not None:
+            from sb3_contrib import RecurrentPPO
+            self.ppo = RecurrentPPO.load(CHECKPOINT_PATH, device="cpu")
+            self.lstm_states = None
+            logger.info(f"RecurrentPPO (LSTM) loaded from {CHECKPOINT_PATH}")
+        except ImportError:
             try:
-                vc = np.asarray(agent_viewcone, dtype=np.float32)
-                if vc.shape[0] > 0 and vc.shape[1] > 3:
-                    blocked[1] = bool(vc[0, 1, 0] > 0.5)
-                    blocked[2] = bool(vc[0, 3, 0] > 0.5)
-                    frontier_bonus = self._viewcone_frontier_bonus(vc)
-            except Exception:
-                pass
+                from stable_baselines3 import PPO
+                self.ppo = PPO.load(CHECKPOINT_PATH, device="cpu")
+                logger.info(f"PPO loaded from {CHECKPOINT_PATH}")
+            except Exception as exc:
+                logger.warning(f"PPO load failed ({exc}); using rule-based")
+        except Exception as exc:
+            logger.warning(f"RecurrentPPO load failed ({exc}); trying standard PPO")
+            try:
+                from stable_baselines3 import PPO
+                self.ppo = PPO.load(CHECKPOINT_PATH, device="cpu")
+                logger.info(f"Fallback PPO loaded")
+            except Exception as exc2:
+                logger.warning(f"PPO load also failed ({exc2}); rule-based only")
 
-        choices = []
-        for action in (0, 1, 2):
-            if action_mask[action] == 0 or blocked[action]:
+    # ── Reset ──────────────────────────────────────────────────────────────
+
+    def reset(self):
+        self.map.reset()
+        self.action_queue.clear()
+        self.last_pos = None
+        self.stuck_count = 0
+        self.step = 0
+        self.lstm_states = None   # reset LSTM hidden state
+        logger.info("AEManager reset")
+
+    # ── PPO inference ──────────────────────────────────────────────────────
+
+    def _ppo_act(self, obs: dict) -> int:
+        try:
+            # RecurrentPPO needs lstm_states passed in and out
+            if hasattr(self.ppo, 'policy') and hasattr(self.ppo.policy, 'lstm_actor'):
+                action, self.lstm_states = self.ppo.predict(
+                    obs,
+                    state=self.lstm_states,
+                    episode_start=np.array([self.step == 0]),
+                    deterministic=True,
+                )
+            else:
+                action, _ = self.ppo.predict(obs, deterministic=True)
+            return int(action)
+        except Exception as exc:
+            logger.warning(f"PPO inference error ({exc}); using rule-based")
+            return self._rule_act(obs)
+
+    # ── Rule-based BFS ─────────────────────────────────────────────────────
+
+    def _bfs_path(self, sx: int, sy: int, targets: list[tuple[int,int]]) -> list[tuple[int,int]]:
+        if not targets:
+            return []
+        target_set = set(targets)
+        queue      = deque([(sx, sy, [])])
+        seen       = {(sx, sy)}
+        while queue:
+            x, y, path = queue.popleft()
+            if (x, y) in target_set:
+                return path + [(x, y)]
+            for dx, dy in [(0,1),(0,-1),(1,0),(-1,0)]:
+                nx, ny = x+dx, y+dy
+                if (nx, ny) not in seen and self.map.get(nx, ny) != WALL:
+                    seen.add((nx, ny))
+                    queue.append((nx, ny, path + [(x, y)]))
+        return []
+
+    def _path_to_actions(
+        self, path: list[tuple[int,int]], cur_dir: int, cur_pos: tuple[int,int]
+    ) -> list[int]:
+        actions = []
+        x, y = cur_pos
+        d    = cur_dir
+        for (tx, ty) in path:
+            dx, dy = tx-x, ty-y
+            if (dx, dy) == (0, 0):
                 continue
-            visit_penalty = self.visit_counts.get(directional_locations[action], 0)
-            turn_penalty = 0.15 if action in (1, 2) else 0.0
-            score = visit_penalty + turn_penalty - frontier_bonus[action]
-            choices.append((action, score))
+            target_dir = next(
+                (k for k, (ddx, ddy) in DIR_DELTA.items() if (ddx, ddy) == (dx, dy)), None
+            )
+            if target_dir is None:
+                continue
+            turn = (target_dir - d) % 4
+            if   turn == 1: actions.append(TURN_RIGHT)
+            elif turn == 2: actions.append(TURN_BACK)
+            elif turn == 3: actions.append(TURN_LEFT)
+            actions.append(FORWARD)
+            d = target_dir
+            x, y = tx, ty
+        return actions
 
-        if choices:
-            choices.sort(key=lambda item: item[1])
-            best_score = choices[0][1]
-            ties = [action for action, score in choices if abs(score - best_score) < 0.05]
-            return random.choice(ties)
+    def _rule_act(self, obs: dict) -> int:
+        location  = obs.get("location", [0, 0])
+        direction = int(obs.get("direction", 0))
+        viewcone  = obs.get("viewcone", [])
+        x, y      = int(location[0]), int(location[1])
 
-        if action_mask[4] == 1 and (team_bombs > 0 or team_resources >= 1):
-            return 4
-        return self._random_valid(action_mask)
+        # Update occupancy map
+        self.map.update_from_viewcone(viewcone, direction, x, y)
+        self.map.mark(x, y, VISITED)
 
-    @staticmethod
-    def _viewcone_frontier_bonus(viewcone: np.ndarray) -> dict[int, float]:
-        # Channel semantics can evolve; using occupancy-style low values keeps
-        # this bonus conservative while still steering toward open unknown space.
-        open_cells = (viewcone[:, :, 0] < 0.5).astype(np.float32)
-        return {
-            0: float(open_cells[:4, 1:4].mean()),
-            1: float(open_cells[:3, :2].mean()),
-            2: float(open_cells[:3, 3:].mean()),
-        }
+        # Stuck detection
+        if self.last_pos == (x, y):
+            self.stuck_count += 1
+        else:
+            self.stuck_count = 0
+        self.last_pos = (x, y)
 
-    @staticmethod
-    def _first(value: Any, default: float) -> float:
-        if isinstance(value, (list, tuple, np.ndarray)):
-            if len(value) == 0:
-                return default
-            return float(value[0])
-        if value is None:
-            return default
-        return float(value)
+        # Tier 3: stuck recovery
+        if self.stuck_count >= 3:
+            self.action_queue.clear()
+            self.stuck_count = 0
+            return TURN_RIGHT
 
-    @staticmethod
-    def _random_valid(action_mask: list[int]) -> int:
-        valid = [i for i, m in enumerate(action_mask) if m == 1]
-        if valid:
-            return random.choice(valid)
-        return 5
+        # Execute queued path
+        if self.action_queue:
+            return self.action_queue.pop(0)
+
+        # Tier 2a: BFS to frontier cells
+        targets = self.map.frontier_cells() or self.map.unvisited_free()
+        if not targets:
+            self.map.reset()
+            self.map.mark(x, y, VISITED)
+            return FORWARD
+
+        # Find nearest target
+        path = self._bfs_path(x, y, targets)
+        if not path:
+            return TURN_RIGHT
+
+        actions = self._path_to_actions(path, direction, (x, y))
+        if not actions:
+            return FORWARD
+
+        self.action_queue = actions[1:]
+        return actions[0]
+
+    # ── Public ────────────────────────────────────────────────────────────
+
+    def act(self, observation: dict) -> int:
+        self.step += 1
+        if self.ppo is not None:
+            return self._ppo_act(observation)
+        return self._rule_act(observation)

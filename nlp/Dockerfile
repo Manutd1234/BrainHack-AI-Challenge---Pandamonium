@@ -1,44 +1,42 @@
-# Dockerfile for building the NLP image.
+FROM nvidia/cuda:12.1.0-cudnn8-devel-ubuntu22.04
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y \
+        python3.11 python3-pip python3.11-dev git build-essential \
+    && rm -rf /var/lib/apt/lists/*
+RUN ln -sf /usr/bin/python3.11 /usr/bin/python3 && ln -sf /usr/bin/pip3 /usr/bin/pip
 
-
-# Start from the official vLLM OpenAI server image so Torch/CUDA/vLLM/openai
-# versions are already matched. Installing vLLM into the NGC PyTorch base caused
-# resolver backtracking and build failures.
-FROM vllm/vllm-openai:v0.20.2
-
-# Configures settings for the image.
-ENV PYTHONDONTWRITEBYTECODE=1
-ENV PYTHONUNBUFFERED=1
-ENV PIP_ROOT_USER_ACTION=ignore
-ENV ENABLE_LOCAL_VLLM=1
-ENV QWEN_MODEL=Qwen/Qwen3.6-27B
-ENV QWEN_TP_SIZE=2
-ENV QWEN_MAX_MODEL_LEN=131072
-ENV QWEN_BASE_URL=http://127.0.0.1:8000/v1
-ENV NLP_EMBEDDING_MODEL=BAAI/bge-m3
-ENV NLP_RERANKER_MODEL=BAAI/bge-reranker-large
-WORKDIR /workspace
-ENTRYPOINT []
-
-# Installs your dependencies.
-RUN pip install -U pip
+WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir flash-attn --no-build-isolation
 
-# Pre-download BGE-M3 during build. For final offline NLP images, pass
-# --build-arg DOWNLOAD_QWEN=1 to bundle the Qwen3.6 weights as well.
-ARG DOWNLOAD_QWEN=0
-COPY download_models.py .
-RUN if [ "${DOWNLOAD_QWEN}" = "1" ]; then \
-        python3 download_models.py; \
-    else \
-        python3 download_models.py --skip-qwen; \
-    fi
+RUN python3 -c "\
+from huggingface_hub import snapshot_download; \
+print('BGE-M3...'); snapshot_download('BAAI/bge-m3', local_dir='/app/model/bge-m3'); \
+print('Reranker...'); snapshot_download('BAAI/bge-reranker-v2-m3', local_dir='/app/model/bge-reranker'); \
+print('DeBERTa...'); snapshot_download('deepset/deberta-v3-large-squad2', local_dir='/app/model/deberta-reader'); \
+print('Done')"
 
-# Copies your source files.
-COPY src .
-COPY start_server.sh .
-RUN chmod +x /workspace/start_server.sh
+ENV EMBED_MODEL_PATH=/app/model/bge-m3
+ENV RERANKER_MODEL_PATH=/app/model/bge-reranker
+ENV READER_MODEL_PATH=/app/model/deberta-reader
+# QA training pairs — copy nlp.jsonl to data/nlp.jsonl before building
+ENV QA_JSONL_PATH=/app/data/nlp.jsonl
+# Tunable thresholds (no rebuild needed)
+ENV QA_CACHE_THRESHOLD=0.92
+ENV RERANK_L4_THRESHOLD=0.28
+ENV EXTRACT_HIGH=0.65
+ENV EXTRACT_LOW=0.18
+ENV W_DENSE=0.40
+ENV W_SPARSE=0.30
+ENV W_COLBERT=0.30
+ENV NVIDIA_VISIBLE_DEVICES=all
+ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility
+ENV TOKENIZERS_PARALLELISM=false
 
-# Starts your model server.
-CMD ["/workspace/start_server.sh"]
+COPY data/ /app/data/
+COPY src/  ./src/
+WORKDIR /app/src
+EXPOSE 5004
+CMD ["uvicorn", "nlp_server:app", "--host", "0.0.0.0", "--port", "5004", \
+     "--workers", "1", "--timeout-keep-alive", "300"]

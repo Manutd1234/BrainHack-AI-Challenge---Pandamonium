@@ -1,5 +1,8 @@
-# Dependencies for AE.
-
-fastapi==0.115.12
-uvicorn[standard]==0.34.2
-numpy
+stable-baselines3[extra]>=2.3.0
+sb3-contrib>=2.3.0
+torch>=2.3.0
+fastapi>=0.111.0
+uvicorn[standard]>=0.30.0
+pydantic>=2.7.0
+numpy>=1.26.0
+tensorboard>=2.16.0
