@@ -1,15 +1,21 @@
-FROM nvidia/cuda:12.1.0-cudnn8-devel-ubuntu22.04
+FROM nvidia/cuda:11.8.0-cudnn8-devel-ubuntu22.04
 ENV DEBIAN_FRONTEND=noninteractive
+
 RUN apt-get update && apt-get install -y \
-        python3.11 python3-pip python3.11-dev git build-essential \
+        python3.10 python3-pip python3.10-dev git build-essential \
     && rm -rf /var/lib/apt/lists/*
-RUN ln -sf /usr/bin/python3.11 /usr/bin/python3 && ln -sf /usr/bin/pip3 /usr/bin/pip
+
+RUN ln -sf /usr/bin/python3.10 /usr/bin/python3 && ln -sf /usr/bin/pip3 /usr/bin/pip
 
 WORKDIR /app
+
+# Install PyTorch with CUDA 11.8 support explicitly to prevent compatibility issues
+RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cu118
+
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-RUN pip install --no-cache-dir flash-attn --no-build-isolation
 
+# Download models at build time to ensure zero network requests at runtime (Offline Mode)
 RUN python3 -c "\
 from huggingface_hub import snapshot_download; \
 print('BGE-M3...'); snapshot_download('BAAI/bge-m3', local_dir='/app/model/bge-m3'); \

@@ -51,6 +51,7 @@ import re
 import sys
 from pathlib import Path
 from typing import Optional
+from collections import defaultdict
 
 import faiss
 import numpy as np
@@ -105,6 +106,7 @@ class NLPManager:
         self.bm25:           Optional[BM25Okapi]   = None
         # Sparse vectors from BGE-M3 (stored as dict list for dot-product)
         self.sparse_vecs:    list[dict]            = []
+        self.sparse_inverted_index = defaultdict(list)
 
         logger.info("NLPManager ready")
 
@@ -161,6 +163,7 @@ class NLPManager:
         self.qa_questions: list[str] = []
         self.qa_answers:   list[str] = []
         self.qa_index:     Optional[faiss.Index] = None
+        self.exact_qa_cache: dict[str, str] = {}
 
         if not os.path.exists(QA_JSONL_PATH):
             logger.warning(f"QA cache file not found: {QA_JSONL_PATH} — cache disabled")
@@ -187,6 +190,11 @@ class NLPManager:
             logger.warning("Q&A cache is empty — cache disabled")
             return
 
+        # Populate exact QA cache
+        for q, a in zip(self.qa_questions, self.qa_answers):
+            normalized_q = re.sub(r"\s+", " ", q.strip().lower())
+            self.exact_qa_cache[normalized_q] = a
+
         logger.info(f"Embedding {len(self.qa_questions)} training Q&A pairs ...")
         embs = self.embedder.encode(
             self.qa_questions, batch_size=64, max_length=128,
@@ -196,7 +204,7 @@ class NLPManager:
 
         self.qa_index = faiss.IndexFlatIP(embs.shape[1])
         self.qa_index.add(embs)
-        logger.info(f"Q&A cache ready: {self.qa_index.ntotal} entries")
+        logger.info(f"Q&A cache ready: {self.qa_index.ntotal} entries (exact match size: {len(self.exact_qa_cache)})")
 
     # ── Chunking ──────────────────────────────────────────────────────────
 
@@ -301,6 +309,12 @@ class NLPManager:
         # Store sparse vectors for dot-product scoring at query time
         self.sparse_vecs = sparse
 
+        # Build inverted index for fast sparse retrieval
+        self.sparse_inverted_index.clear()
+        for idx, vec in enumerate(self.sparse_vecs):
+            for tok, w in vec.items():
+                self.sparse_inverted_index[int(tok)].append((idx, float(w)))
+
         # BM25 index (lexical backup)
         tokenized = [re.findall(r"[\w\u4e00-\u9fff]+", c.lower()) for c in self.chunks]
         self.bm25 = BM25Okapi(tokenized)
@@ -316,13 +330,15 @@ class NLPManager:
                 scores[idx] = scores.get(idx, 0.0) + 1.0 / (k + rank + 1)
         return sorted(scores, key=lambda x: scores[x], reverse=True)
 
-    def _sparse_score(self, q_sparse: dict, idx: int) -> float:
-        """Dot product between query sparse vec and chunk sparse vec."""
-        c_sparse = self.sparse_vecs[idx]
-        score = 0.0
-        for tok, w in q_sparse.items():
-            score += w * c_sparse.get(tok, 0.0)
-        return score
+    def _sparse_score_inverted(self, q_sparse: dict) -> np.ndarray:
+        """Fast inverted index scoring for query sparse vector."""
+        scores = np.zeros(len(self.chunks), dtype=np.float32)
+        for tok, q_w in q_sparse.items():
+            tok_key = int(tok)
+            if tok_key in self.sparse_inverted_index:
+                for idx, c_w in self.sparse_inverted_index[tok_key]:
+                    scores[idx] += float(q_w) * c_w
+        return scores
 
     def _retrieve(self, question: str) -> tuple[list[str], list[str], float]:
         if not self.chunks or self.faiss_index is None:
@@ -343,8 +359,8 @@ class NLPManager:
         dense_scores, dense_idxs = self.faiss_index.search(q_dense, n)
         dense_ranking = dense_idxs[0].tolist()
 
-        # BGE-M3 sparse retrieval
-        sparse_scores = np.array([self._sparse_score(q_sparse, i) for i in range(len(self.chunks))])
+        # BGE-M3 sparse retrieval (optimized via inverted index)
+        sparse_scores = self._sparse_score_inverted(q_sparse)
         sparse_ranking = np.argsort(sparse_scores)[::-1][:n].tolist()
 
         # BM25 retrieval
@@ -380,6 +396,15 @@ class NLPManager:
         """
         if self.qa_index is None or self.qa_index.ntotal == 0:
             return None
+
+        # 1. Exact string match first (0ms)
+        normalized_q = re.sub(r"\s+", " ", question.strip().lower())
+        if normalized_q in self.exact_qa_cache:
+            cached_ans = self.exact_qa_cache[normalized_q]
+            logger.info(f"Exact QA cache HIT → '{cached_ans[:60]}'")
+            return cached_ans
+
+        # 2. Dense search (10-20ms)
         q_emb = self.embedder.encode(
             [question], return_dense=True,
             return_sparse=False, return_colbert_vecs=False,
@@ -387,10 +412,31 @@ class NLPManager:
         faiss.normalize_L2(q_emb)
         scores, idxs = self.qa_index.search(q_emb, 1)
         score = float(scores[0][0])
+        
         if score >= QA_CACHE_THRESHOLD:
+            matched_q = self.qa_questions[idxs[0][0]]
             cached_ans = self.qa_answers[idxs[0][0]]
+            
+            # Check numbers (digits) match exactly to prevent cross-matching different years/counts
+            q_digits = set(re.findall(r"\b\d+\b", question))
+            m_digits = set(re.findall(r"\b\d+\b", matched_q))
+            if q_digits != m_digits:
+                logger.info(f"QA cache candidate rejected: numbers mismatch (query={q_digits}, match={m_digits})")
+                return None
+                
+            # Check keyword overlap to prevent mismatching company names or subject entities
+            STOPWORDS = {"is", "the", "a", "an", "of", "and", "in", "to", "for", "with", "on", "at", "by", "from", "who", "what", "where", "when", "why", "how", "which", "are", "was", "were", "do", "does", "did", "have", "has", "had", "can", "could", "should", "would", "will", "about"}
+            q_keys = {w for w in re.findall(r"\b\w+\b", question.lower()) if w not in STOPWORDS}
+            m_keys = {w for w in re.findall(r"\b\w+\b", matched_q.lower()) if w not in STOPWORDS}
+            
+            if score < 0.98:
+                overlap = len(q_keys.intersection(m_keys)) / max(1, len(q_keys.union(m_keys)))
+                if overlap < 0.70:
+                    logger.info(f"QA cache candidate rejected: keyword overlap too low ({overlap:.2f} < 0.70)")
+                    return None
+            
             logger.info(
-                f"QA cache HIT (sim={score:.3f}) → '{cached_ans[:60]}'"
+                f"QA cache HIT (sim={score:.3f}, overlap={len(q_keys.intersection(m_keys))}/{len(q_keys)}) → '{cached_ans[:60]}'"
             )
             return cached_ans
         return None
