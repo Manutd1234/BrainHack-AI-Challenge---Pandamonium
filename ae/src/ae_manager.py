@@ -17,6 +17,7 @@ IMPROVEMENTS over previous version:
   3. Better stuck detection — resets hidden state on stuck
   4. Direction-aware viewcone parsing — correct world-coord mapping
   5. Three-tier fallback — never returns constant action
+  6. Hybrid Safety-First dodging and Strategic Bombing filters
 ═══════════════════════════════════════════════════════════════════════
 """
 
@@ -35,16 +36,20 @@ logger = logging.getLogger(__name__)
 CHECKPOINT_PATH = os.environ.get("AE_CHECKPOINT_PATH", "/app/model/policy.zip")
 GRID = 16
 
-FORWARD   = 0
-TURN_LEFT = 1
-TURN_RIGHT = 2
-TURN_BACK  = 3
+# Correct Environment Actions (from actions.py)
+FORWARD     = 0
+BACKWARD    = 1
+LEFT        = 2
+RIGHT       = 3
+STAY        = 4
+PLACE_BOMB  = 5
 
+# Authorized direction delta (matches Direction IntEnum RIGHT=0, DOWN=1, LEFT=2, UP=3)
 DIR_DELTA = {
-    0: ( 0, -1),  # North
-    1: ( 1,  0),  # East
-    2: ( 0,  1),  # South
-    3: (-1,  0),  # West
+    0: ( 1,  0),  # RIGHT (East)
+    1: ( 0,  1),  # DOWN (South)
+    2: (-1,  0),  # LEFT (West)
+    3: ( 0, -1),  # UP (North)
 }
 
 # Occupancy values
@@ -73,35 +78,43 @@ class OccupancyMap:
         return WALL  # out-of-bounds = wall
 
     def update_from_viewcone(self, viewcone, direction: int, ax: int, ay: int):
-        vc = np.array(viewcone, dtype=np.int32) if viewcone else np.array([[]])
-        if vc.ndim < 2 or vc.size == 0:
+        vc = np.array(viewcone, dtype=np.float32) if viewcone is not None and len(viewcone) > 0 else np.array([[]])
+        if vc.ndim < 3 or vc.size == 0:
             return
         rows, cols = vc.shape[:2]
         cx = cols // 2
 
-        # Direction → (forward_dx, forward_dy, right_dx, right_dy)
+        # direction (0=RIGHT, 1=DOWN, 2=LEFT, 3=UP)
         fwd = {
-            0: (( 0,-1),( 1, 0)),  # North: forward=-y, right=+x
-            1: (( 1, 0),( 0, 1)),  # East:  forward=+x, right=+y
-            2: (( 0, 1),(-1, 0)),  # South: forward=+y, right=-x
-            3: ((-1, 0),( 0,-1)),  # West:  forward=-x, right=-y
+            0: (( 1,  0), ( 0,  1)),  # RIGHT: forward=+x, right=+y
+            1: (( 0,  1), (-1,  0)),  # DOWN:  forward=+y, right=-x
+            2: ((-1,  0), ( 0, -1)),  # LEFT:  forward=-x, right=-y
+            3: (( 0, -1), ( 1,  0)),  # UP:    forward=-y, right=+x
         }
         (fdx, fdy), (rdx, rdy) = fwd.get(direction, fwd[0])
 
         for r in range(rows):
             for c in range(cols):
-                dx = fdx * r + rdx * (c - cx)
-                dy = fdy * r + rdy * (c - cx)
+                if vc[r, c, 0] != 1.0:  # Only parse visible cells
+                    continue
+                dx = fdx * (r - 2) + rdx * (c - cx)
+                dy = fdy * (r - 2) + rdy * (c - cx)
                 wx, wy = ax + dx, ay + dy
                 if not (0 <= wx < GRID and 0 <= wy < GRID):
                     continue
-                val = int(vc[r, c]) if vc.ndim == 2 else int(vc[r, c, 0])
-                if val == 0:
-                    # Passable
+                # If there are any wall edges on the cell, mark it blocked
+                # WALL_RIGHT=1, WALL_DOWN=2, WALL_LEFT=3, WALL_UP=4
+                has_wall_edge = (
+                    vc[r, c, 1] == 1.0 or
+                    vc[r, c, 2] == 1.0 or
+                    vc[r, c, 3] == 1.0 or
+                    vc[r, c, 4] == 1.0
+                )
+                if has_wall_edge:
+                    self.mark(wx, wy, WALL)
+                else:
                     if self.get(wx, wy) != VISITED:
                         self.mark(wx, wy, FREE)
-                else:
-                    self.mark(wx, wy, WALL)
 
     def frontier_cells(self) -> list[tuple[int, int]]:
         """Cells that are FREE but adjacent to UNKNOWN — exploration targets."""
@@ -237,18 +250,24 @@ class AEManager:
             if target_dir is None:
                 continue
             turn = (target_dir - d) % 4
-            if   turn == 1: actions.append(TURN_RIGHT)
-            elif turn == 2: actions.append(TURN_BACK)
-            elif turn == 3: actions.append(TURN_LEFT)
+            if turn == 1:
+                actions.append(RIGHT)
+                d = (d + 1) % 4
+            elif turn == 2:
+                actions.append(RIGHT)
+                actions.append(RIGHT)
+                d = (d + 2) % 4
+            elif turn == 3:
+                actions.append(LEFT)
+                d = (d - 1) % 4
             actions.append(FORWARD)
-            d = target_dir
             x, y = tx, ty
         return actions
 
     def _rule_act(self, obs: dict) -> int:
         location  = obs.get("location", [0, 0])
         direction = int(obs.get("direction", 0))
-        viewcone  = obs.get("viewcone", [])
+        viewcone  = obs.get("agent_viewcone", obs.get("viewcone", []))
         x, y      = int(location[0]), int(location[1])
 
         # Update occupancy map
@@ -266,7 +285,7 @@ class AEManager:
         if self.stuck_count >= 3:
             self.action_queue.clear()
             self.stuck_count = 0
-            return TURN_RIGHT
+            return RIGHT
 
         # Execute queued path
         if self.action_queue:
@@ -282,7 +301,7 @@ class AEManager:
         # Find nearest target
         path = self._bfs_path(x, y, targets)
         if not path:
-            return TURN_RIGHT
+            return RIGHT
 
         actions = self._path_to_actions(path, direction, (x, y))
         if not actions:
@@ -291,11 +310,160 @@ class AEManager:
         self.action_queue = actions[1:]
         return actions[0]
 
+    # ── Safety-Dodging & Bombing Helpers ────────────────────────────────────
+
+    def _get_threatened_cells(self, bombs: list[tuple[int, int]]) -> set[tuple[int, int]]:
+        threatened = set()
+        for bx, by in bombs:
+            threatened.add((bx, by))
+            for dx, dy in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
+                for step in range(1, 3):  # blast radius is 2
+                    tx, ty = bx + dx * step, by + dy * step
+                    if not (0 <= tx < GRID and 0 <= ty < GRID):
+                        break
+                    if self.map.get(tx, ty) == WALL:
+                        break
+                    threatened.add((tx, ty))
+        return threatened
+
+    def _find_escape_path(self, sx: int, sy: int, threatened: set[tuple[int, int]]) -> list[tuple[int, int]]:
+        queue = deque([(sx, sy, [])])
+        seen = {(sx, sy)}
+        while queue:
+            x, y, path = queue.popleft()
+            if (x, y) not in threatened:
+                return path + [(x, y)]
+            for dx, dy in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
+                nx, ny = x + dx, y + dy
+                if 0 <= nx < GRID and 0 <= ny < GRID:
+                    if (nx, ny) not in seen and self.map.get(nx, ny) != WALL:
+                        seen.add((nx, ny))
+                        queue.append((nx, ny, path + [(x, y)]))
+        return []
+
+    def _can_safely_place_bomb(self, ax: int, ay: int, current_bombs: list[tuple[int, int]]) -> bool:
+        all_bombs = current_bombs + [(ax, ay)]
+        threatened = self._get_threatened_cells(all_bombs)
+        escape_path = self._find_escape_path(ax, ay, threatened)
+        return len(escape_path) > 0
+
+    def _fallback_act(self, observation: dict) -> int:
+        if self.ppo is not None:
+            return self._ppo_act(observation)
+        return self._rule_act(observation)
+
     # ── Public ────────────────────────────────────────────────────────────
 
     def act(self, observation: dict) -> int:
         self.step += 1
         self._ensure_ppo_loaded()
-        if self.ppo is not None:
-            return self._ppo_act(observation)
-        return self._rule_act(observation)
+
+        # 1. Parse observation and get key state variables
+        location  = observation.get("location", [0, 0])
+        direction = int(observation.get("direction", 0))
+        viewcone  = observation.get("agent_viewcone", observation.get("viewcone", []))
+        action_mask = observation.get("action_mask", [1, 1, 1, 1, 1, 1])
+        x, y      = int(location[0]), int(location[1])
+
+        # 2. Update occupancy map
+        self.map.update_from_viewcone(viewcone, direction, x, y)
+        self.map.mark(x, y, VISITED)
+
+        # 3. Analyze viewcone
+        vc = np.array(viewcone, dtype=np.float32) if viewcone is not None and len(viewcone) > 0 else np.array([[]])
+        
+        # If viewcone is empty/invalid, use fallback directly
+        if vc.ndim < 3 or vc.size == 0:
+            return self._fallback_act(observation)
+
+        rows, cols = vc.shape[:2]
+        cx = cols // 2
+
+        (fdx, fdy), (rdx, rdy) = DIR_DELTA.get(direction, DIR_DELTA[0])
+
+        # Collect active bombs in world coords
+        visible_bombs = []
+        for r in range(rows):
+            for c in range(cols):
+                if vc[r, c, 17] == 1.0 or vc[r, c, 18] == 1.0:
+                    dx = fdx * (r - 2) + rdx * (c - cx)
+                    dy = fdy * (r - 2) + rdy * (c - cx)
+                    bx, by = x + dx, y + dy
+                    if 0 <= bx < GRID and 0 <= by < GRID:
+                        visible_bombs.append((bx, by))
+
+        # Get threatened cells
+        threatened = self._get_threatened_cells(visible_bombs)
+
+        # 4. SAFETY Dodging check
+        if (x, y) in threatened:
+            escape_path = self._find_escape_path(x, y, threatened)
+            if len(escape_path) >= 2:
+                tx, ty = escape_path[1]
+                dx, dy = tx - x, ty - y
+                target_dir = next((k for k, (ddx, ddy) in DIR_DELTA.items() if (ddx, ddy) == (dx, dy)), None)
+                if target_dir is not None:
+                    turn = (target_dir - direction) % 4
+                    if turn == 2 and action_mask[BACKWARD] == 1:
+                        self.action_queue.clear()
+                        return BACKWARD
+                    elif turn == 1 and action_mask[RIGHT] == 1:
+                        self.action_queue.clear()
+                        return RIGHT
+                    elif turn == 3 and action_mask[LEFT] == 1:
+                        self.action_queue.clear()
+                        return LEFT
+                    elif turn == 0 and action_mask[FORWARD] == 1:
+                        self.action_queue.clear()
+                        return FORWARD
+
+        # 5. STRATEGIC BOMBING check
+        if action_mask[PLACE_BOMB] == 1:
+            is_adj_enemy_or_breakable = False
+            # Destructible walls adjacent to agent cell (2, 2)
+            if (vc[2, 2, 13] == 1.0 or
+                vc[2, 2, 14] == 1.0 or
+                vc[2, 2, 15] == 1.0 or
+                vc[2, 2, 16] == 1.0):
+                is_adj_enemy_or_breakable = True
+                
+            # Adjacent cells (ahead, behind, left, right)
+            adj_coords = [(3, 2), (1, 2), (2, 1), (2, 3)]
+            for ar, ac in adj_coords:
+                if ar < rows and ac < cols:
+                    if vc[ar, ac, 10] == 1.0 or vc[ar, ac, 12] == 1.0:
+                        is_adj_enemy_or_breakable = True
+                        break
+
+            if is_adj_enemy_or_breakable:
+                if self._can_safely_place_bomb(x, y, visible_bombs):
+                    self.action_queue.clear()
+                    return PLACE_BOMB
+
+        # 6. BASE ACTION selection (PPO or BFS Explorer)
+        base_act = self._fallback_act(observation)
+
+        # 7. PRO-ACTIVE SAFETY BLOCK: avoid walking into danger
+        if base_act == FORWARD and action_mask[FORWARD] == 1:
+            next_pos = (x + fdx, y + fdy)
+            if next_pos in threatened:
+                self.action_queue.clear()
+                if action_mask[STAY] == 1:
+                    return STAY
+                elif action_mask[LEFT] == 1:
+                    return LEFT
+                elif action_mask[RIGHT] == 1:
+                    return RIGHT
+
+        if base_act == BACKWARD and action_mask[BACKWARD] == 1:
+            next_pos = (x - fdx, y - fdy)
+            if next_pos in threatened:
+                self.action_queue.clear()
+                if action_mask[STAY] == 1:
+                    return STAY
+                elif action_mask[LEFT] == 1:
+                    return LEFT
+                elif action_mask[RIGHT] == 1:
+                    return RIGHT
+
+        return base_act
