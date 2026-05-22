@@ -130,12 +130,17 @@ class AEManager:
     def __init__(self):
         self.ppo = None
         self.lstm_states = None
-        self._try_load_ppo()
+        self.ppo_loaded = False
         self.map = OccupancyMap()
         self.action_queue: list[int] = []
         self.last_pos: Optional[tuple] = None
         self.stuck_count = 0
         self.step = 0
+
+    def _ensure_ppo_loaded(self):
+        if not self.ppo_loaded:
+            self._try_load_ppo()
+            self.ppo_loaded = True
 
     # ── PPO loading ────────────────────────────────────────────────────────
 
@@ -290,6 +295,7 @@ class AEManager:
 
     def act(self, observation: dict) -> int:
         self.step += 1
+        self._ensure_ppo_loaded()
         if self.ppo is not None:
             return self._ppo_act(observation)
         return self._rule_act(observation)
