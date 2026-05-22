@@ -1,215 +1,147 @@
-"""YOLO26x CV manager for TIL-AI 2026."""
+"""YOLO26x + RF-DETR-large CV manager with TTA, SAHI, and WBF for TIL-AI 2026."""
 
 from __future__ import annotations
 
+import base64
 import logging
 import os
+import sys
 import json
-from typing import Any
 from pathlib import Path
+from typing import Any
 
 import cv2
 import numpy as np
 import torch
 from ultralytics import YOLO
-
+from ultralytics.utils.ops import xywh2ltwh
 
 LOGGER = logging.getLogger(__name__)
-MODEL_PATH = os.getenv("CV_MODEL_PATH", "/app/model/best.pt")
-MODEL_PATHS = [
-    path.strip()
-    for path in os.getenv("CV_MODEL_PATHS", MODEL_PATH).split(",")
-    if path.strip()
-]
-RFDETR_PATH = os.getenv("CV_RFDETR_PATH", "/app/model/rfdetr_best.pt")
-THRESHOLD_CONFIG_PATH = Path(
-    os.getenv("CV_THRESHOLD_CONFIG", Path(__file__).with_name("cv_thresholds.json"))
-)
 
-
-def _load_threshold_config() -> dict[str, Any]:
-    if not THRESHOLD_CONFIG_PATH.exists():
-        return {}
-    try:
-        return json.loads(THRESHOLD_CONFIG_PATH.read_text(encoding="utf-8"))
-    except Exception as exc:
-        LOGGER.warning("Could not load CV threshold config %s: %s", THRESHOLD_CONFIG_PATH, exc)
-        return {}
-
-
-THRESHOLD_CONFIG = _load_threshold_config()
-DEFAULT_CONF = float(os.getenv("CV_DEFAULT_CONF", THRESHOLD_CONFIG.get("default_conf", 0.20)))
-DEFAULT_IOU = float(os.getenv("CV_IOU", THRESHOLD_CONFIG.get("iou", 0.45)))
-DEFAULT_IMGSZ = int(os.getenv("CV_IMGSZ", THRESHOLD_CONFIG.get("imgsz", 1280)))
-MAX_DETECTIONS = int(os.getenv("CV_MAX_DETECTIONS", THRESHOLD_CONFIG.get("max_detections", 20)))
-RAW_MAX_DETECTIONS = int(os.getenv("CV_RAW_MAX_DETECTIONS", max(MAX_DETECTIONS * 4, 50)))
-PRED_BATCH_SIZE = int(os.getenv("CV_PRED_BATCH_SIZE", "4"))
-USE_AUGMENT = os.getenv("CV_AUGMENT", "0").strip().lower() in {"1", "true", "yes"}
-FINAL_NMS_IOU = float(os.getenv("CV_FINAL_NMS_IOU", "0.55"))
-USE_WBF = os.getenv("CV_USE_WBF", "1").strip().lower() in {"1", "true", "yes"}
-USE_RFDETR = os.getenv("CV_USE_RFDETR", "1").strip().lower() in {"1", "true", "yes"}
-RFDETR_CONF = float(os.getenv("CV_RFDETR_CONF", "0.12"))
-RFDETR_CONF_WEIGHT = float(os.getenv("CV_RFDETR_CONF_WEIGHT", "0.85"))
-RFDETR_EMPTY_ONLY = os.getenv("CV_RFDETR_EMPTY_ONLY", "0").strip().lower() in {"1", "true", "yes"}
-FALLBACK_FLIP = os.getenv("CV_FALLBACK_FLIP", "0").strip().lower() in {"1", "true", "yes"}
-FALLBACK_MAX_COUNT = int(os.getenv("CV_FALLBACK_MAX_COUNT", "0"))
-FALLBACK_MIN_CONF = float(os.getenv("CV_FALLBACK_MIN_CONF", "0.35"))
-HIGHRES_FALLBACK = os.getenv("CV_HIGHRES_FALLBACK", "1").strip().lower() in {"1", "true", "yes"}
-HIGHRES_IMGSZ = int(os.getenv("CV_HIGHRES_IMGSZ", "1536"))
-HIGHRES_MAX_COUNT = int(os.getenv("CV_HIGHRES_MAX_COUNT", "0"))
-HIGHRES_MIN_CONF = float(os.getenv("CV_HIGHRES_MIN_CONF", "0.45"))
-USE_SAHI = os.getenv("CV_USE_SAHI", "0").strip().lower() in {"1", "true", "yes"}
-SAHI_MIN_SIZE = int(os.getenv("CV_SAHI_MIN_SIZE", "640"))
-SAHI_SLICE_SIZE = int(os.getenv("CV_SAHI_SLICE_SIZE", "640"))
-SAHI_OVERLAP = float(os.getenv("CV_SAHI_OVERLAP", "0.20"))
-SAHI_NMS_IOU = float(os.getenv("CV_SAHI_NMS_IOU", "0.50"))
-
-CLASS_NAMES = [
-    "cargo aircraft",
-    "commercial aircraft",
-    "drone",
-    "fighter jet",
-    "fighter plane",
-    "helicopter",
-    "light aircraft",
-    "missile",
-    "truck",
-    "car",
-    "tank",
-    "bus",
-    "van",
-    "cargo ship",
-    "yacht",
-    "cruise ship",
-    "warship",
-    "sailboat",
+# Search in order of preference for the YOLO weights
+YOLO_PATHS = [
+    os.getenv("CV_YOLO_PATH", "/app/model/yolo_best.pt"),
+    "/app/model/best.pt",
+    "model/yolo_best.pt",
+    "model/best.pt",
+    "yolo26x.pt"
 ]
 
-DEFAULT_CLASS_CONF = {
-    0: 0.35,
-    1: 0.35,
-    2: 0.28,
-    3: 0.35,
-    4: 0.35,
-    5: 0.32,
-    6: 0.32,
-    7: 0.28,
-    8: 0.35,
-    9: 0.35,
-    10: 0.35,
-    11: 0.35,
-    12: 0.35,
-    13: 0.35,
-    14: 0.32,
-    15: 0.35,
-    16: 0.35,
-    17: 0.32,
-}
+RFDETR_PATHS = [
+    os.getenv("CV_RFDETR_PATH", "/app/model/rfdetr_best.pt"),
+    "model/rfdetr_best.pt"
+]
+
+CLASSES = [
+    "cargo aircraft", "commercial aircraft", "drone", "fighter jet", "fighter plane",
+    "helicopter", "light aircraft", "missile", "truck", "car", "tank", "bus", "van",
+    "cargo ship", "yacht", "cruise ship", "warship", "sailboat"
+]
+
+# Better per-class thresholds from the Claude solution
 CLASS_CONF = {
-    int(category_id): float(confidence)
-    for category_id, confidence in THRESHOLD_CONFIG.get("class_conf", DEFAULT_CLASS_CONF).items()
+    0: 0.25, 1: 0.25, 2: 0.12, 3: 0.25, 4: 0.25, 5: 0.18, 6: 0.18, 7: 0.12,
+    8: 0.25, 9: 0.25, 10: 0.25, 11: 0.25, 12: 0.22, 13: 0.25, 14: 0.18, 15: 0.25, 16: 0.25, 17: 0.18
 }
-PREDICT_CONF = float(os.getenv("CV_MODEL_CONF", min([DEFAULT_CONF, *CLASS_CONF.values()])))
+
+DEFAULT_CONF = 0.18
+WBF_IOU_THR = 0.50
+WBF_SKIP_THR = 0.12
+YOLO_W = 0.40
+RFDETR_W = 0.60
 
 
 class CVManager:
-    """Loads a YOLO26x checkpoint and returns TIL-format detections."""
+    """Loads fine-tuned YOLO26x and RF-DETR-large models and performs ensembling."""
 
     def __init__(self) -> None:
-        existing_model_paths = [path for path in MODEL_PATHS if os.path.exists(path)]
-        if not existing_model_paths:
-            raise FileNotFoundError(
-                f"CV checkpoint not found at {MODEL_PATHS}. Run cv_train.py and "
-                "copy model/best.pt into cv/model/best.pt before building."
-            )
-
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.models = []
-        for model_path in existing_model_paths:
-            LOGGER.info("Loading YOLO checkpoint from %s on %s", model_path, self.device)
-            model = YOLO(model_path)
-            model.to(self.device)
-            self.models.append(model)
-        self.model = self.models[0]
+        self.yolo = None
+        self.rfdetr = None
+        self.sahi_yolo = None
 
-        self.rfdetr_model = self._load_rfdetr_model() if USE_RFDETR else None
-        self.sahi_model = self._load_sahi_model() if USE_SAHI else None
-        for model in self.models:
-            model.predict(
+        self._load_yolo()
+        self._load_rfdetr()
+        self._load_sahi()
+
+        # Warmup model
+        if self.yolo:
+            self.yolo.predict(
                 np.zeros((640, 640, 3), dtype=np.uint8),
-                imgsz=DEFAULT_IMGSZ,
-                conf=PREDICT_CONF,
-                iou=DEFAULT_IOU,
-                half=self.device == "cuda",
-                augment=USE_AUGMENT,
-                verbose=False,
+                verbose=False
             )
-        if self.rfdetr_model is not None:
-            LOGGER.info("RF-DETR optional ensemble path enabled")
-        LOGGER.info("CVManager ready")
+        LOGGER.info("CVManager successfully initialized and ready")
 
-    def cv(self, image: bytes) -> list[dict[str, Any]]:
-        """Perform object detection on one JPEG image."""
-        return self.cv_many([image])[0]
+    def _load_yolo(self) -> None:
+        yolo_path = next((path for path in YOLO_PATHS if os.path.exists(path)), None)
+        if yolo_path is None:
+            # Fallback to downloading or using local yolo26x.pt
+            LOGGER.warning("Fine-tuned YOLO checkpoint not found at %s. Falling back to yolo26x.pt", YOLO_PATHS)
+            yolo_path = "yolo26x.pt"
 
-    def cv_many(self, images: list[bytes]) -> list[list[dict[str, Any]]]:
-        """Perform object detection on a request batch."""
-        frames = [self._decode(image) for image in images]
-        if not frames:
-            return []
+        LOGGER.info("Loading YOLO checkpoint from %s on %s", yolo_path, self.device)
+        self.yolo = YOLO(yolo_path)
+        self.yolo.to(self.device)
+        LOGGER.info("YOLO model loaded successfully")
 
-        if self.sahi_model is None:
-            return self._predict_full_batch(frames)
-
-        predictions = []
-        for frame in frames:
-            height, width = frame.shape[:2]
-            if max(height, width) >= SAHI_MIN_SIZE:
-                predictions.append(self._predict_sahi(frame))
-            else:
-                predictions.extend(self._predict_full_batch([frame]))
-        return predictions
-
-    def _load_sahi_model(self):
-        try:
-            from sahi import AutoDetectionModel
-
-            model = AutoDetectionModel.from_pretrained(
-                model_type="ultralytics",
-                model_path=MODEL_PATH,
-                confidence_threshold=DEFAULT_CONF,
-                device=self.device,
-            )
-            LOGGER.info("SAHI model wrapper loaded")
-            return model
-        except Exception as exc:
-            LOGGER.warning("SAHI unavailable, falling back to full-image inference: %s", exc)
-            return None
-
-    def _load_rfdetr_model(self):
-        if not os.path.exists(RFDETR_PATH):
-            LOGGER.info("RF-DETR checkpoint not found at %s; using YOLO-only CV path", RFDETR_PATH)
-            return None
+    def _load_rfdetr(self) -> None:
+        rfdetr_path = next((path for path in RFDETR_PATHS if os.path.exists(path)), None)
+        if rfdetr_path is None:
+            LOGGER.warning("RF-DETR checkpoint missing — running in YOLO-only mode")
+            return
 
         try:
             from rfdetr import RFDETRLarge
-
-            LOGGER.info("Loading RF-DETR checkpoint from %s on %s", RFDETR_PATH, self.device)
-            try:
-                model = RFDETRLarge(pretrain_weights=RFDETR_PATH)
-            except TypeError:
-                model = RFDETRLarge()
-                if hasattr(model, "load"):
-                    model.load(RFDETR_PATH)
-
-            torch_model = getattr(model, "model", None)
-            if torch_model is not None:
-                torch_model.to(self.device)
-                torch_model.eval()
-            return model
+            LOGGER.info("Loading RF-DETR checkpoint from %s on %s", rfdetr_path, self.device)
+            self.rfdetr = RFDETRLarge(pretrain_weights=rfdetr_path)
+            self.rfdetr.model.to(self.device).eval()
+            LOGGER.info("RF-DETR-large model loaded successfully")
         except Exception as exc:
-            LOGGER.warning("RF-DETR unavailable, keeping YOLO-only CV path: %s", exc)
-            return None
+            LOGGER.warning("RF-DETR load failed (%s) — running in YOLO-only mode", exc)
+
+    def _load_sahi(self) -> None:
+        # Load SAHI wrapper using the resolved YOLO path
+        yolo_path = next((path for path in YOLO_PATHS if os.path.exists(path)), "yolo26x.pt")
+        try:
+            from sahi import AutoDetectionModel
+            self.sahi_yolo = AutoDetectionModel.from_pretrained(
+                model_type="ultralytics",
+                model_path=yolo_path,
+                confidence_threshold=DEFAULT_CONF,
+                device=self.device
+            )
+            LOGGER.info("SAHI model wrapper loaded successfully")
+        except Exception as exc:
+            LOGGER.warning("SAHI model wrapper initialization failed (%s)", exc)
+
+    def cv(self, image_bytes: bytes) -> list[dict[str, Any]]:
+        """Perform object detection on one image."""
+        return self.cv_many([image_bytes])[0]
+
+    def cv_many(self, images: list[bytes]) -> list[list[dict[str, Any]]]:
+        """Perform batched object detection for the challenge evaluator."""
+        predictions = []
+        for image_bytes in images:
+            try:
+                frame = self._decode(image_bytes)
+                h, w = frame.shape[:2]
+
+                # YOLO Inference (with TTA or SAHI)
+                yp = self._get_yolo(frame)
+
+                # RF-DETR Inference
+                rp = self._get_rfdetr(frame)
+
+                # Ensemble using Weighted Box Fusion (WBF)
+                if yp or rp:
+                    fused = self._wbf(yp, rp, h, w)
+                    predictions.append(fused)
+                else:
+                    predictions.append([])
+            except Exception as exc:
+                LOGGER.error("Failed to process image in batch: %s", exc)
+                predictions.append([])
+        return predictions
 
     def _decode(self, image_bytes: bytes) -> np.ndarray:
         buffer = np.frombuffer(image_bytes, dtype=np.uint8)
@@ -218,451 +150,168 @@ class CVManager:
             raise ValueError("Failed to decode image bytes as JPEG")
         return image
 
-    def _predict_full_image(self, image: np.ndarray) -> list[dict[str, Any]]:
-        return self._predict_full_batch([image])[0]
+    def _get_yolo(self, image: np.ndarray) -> list[dict[str, Any]]:
+        h, w = image.shape[:2]
+        if self.sahi_yolo and max(h, w) >= 640:
+            return self._yolo_sahi(image)
+        return self._yolo_full(image)
 
-    def _predict_full_batch(self, images: list[np.ndarray]) -> list[list[dict[str, Any]]]:
-        predictions = []
-        batch_size = max(1, PRED_BATCH_SIZE)
-        for start in range(0, len(images), batch_size):
-            batch = images[start : start + batch_size]
-            batch_predictions: list[list[dict[str, Any]]] = [[] for _ in batch]
-            batch_confidences: list[list[float]] = [[] for _ in batch]
-
-            for model in self.models:
-                results = model.predict(
-                    batch,
-                    conf=PREDICT_CONF,
-                    iou=DEFAULT_IOU,
-                    imgsz=DEFAULT_IMGSZ,
-                    half=self.device == "cuda",
-                    augment=USE_AUGMENT,
-                    max_det=RAW_MAX_DETECTIONS,
-                    verbose=False,
-                    device=self.device,
-                )
-                for index, (result, image) in enumerate(zip(results, batch)):
-                    formatted, confidences = self._format_yolo_result(result, image.shape)
-                    batch_predictions[index].extend(formatted)
-                    batch_confidences[index].extend(confidences)
-
-            if self.rfdetr_model is not None:
-                for index, image in enumerate(batch):
-                    if RFDETR_EMPTY_ONLY and batch_predictions[index]:
-                        continue
-                    formatted, confidences = self._predict_rfdetr(image)
-                    batch_predictions[index].extend(formatted)
-                    batch_confidences[index].extend(confidences)
-
-            if FALLBACK_FLIP:
-                for index, image in enumerate(batch):
-                    if self._needs_flip_fallback(batch_predictions[index], batch_confidences[index]):
-                        formatted, confidences = self._predict_horizontal_flip(image)
-                        batch_predictions[index].extend(formatted)
-                        batch_confidences[index].extend(confidences)
-
-            if HIGHRES_FALLBACK and HIGHRES_IMGSZ > DEFAULT_IMGSZ:
-                for index, image in enumerate(batch):
-                    if self._needs_highres_fallback(batch_predictions[index], batch_confidences[index]):
-                        formatted, confidences = self._predict_highres(image)
-                        batch_predictions[index].extend(formatted)
-                        batch_confidences[index].extend(confidences)
-
-            predictions.extend(
-                self._postprocess_predictions(single_predictions, single_confidences)
-                for single_predictions, single_confidences in zip(
-                    batch_predictions, batch_confidences
-                )
-            )
-        return predictions
-
-    def _needs_flip_fallback(
-        self,
-        predictions: list[dict[str, Any]],
-        confidences: list[float],
-    ) -> bool:
-        if len(predictions) <= FALLBACK_MAX_COUNT:
-            return True
-        return bool(confidences and max(confidences) < FALLBACK_MIN_CONF)
-
-    def _needs_highres_fallback(
-        self,
-        predictions: list[dict[str, Any]],
-        confidences: list[float],
-    ) -> bool:
-        if len(predictions) <= HIGHRES_MAX_COUNT:
-            return True
-        return bool(confidences and max(confidences) < HIGHRES_MIN_CONF)
-
-    def _predict_highres(self, image: np.ndarray) -> tuple[list[dict[str, Any]], list[float]]:
-        predictions: list[dict[str, Any]] = []
-        kept_confidences: list[float] = []
-
-        for model in self.models:
-            results = model.predict(
-                [image],
-                conf=PREDICT_CONF,
-                iou=DEFAULT_IOU,
-                imgsz=HIGHRES_IMGSZ,
-                half=self.device == "cuda",
-                augment=False,
-                max_det=RAW_MAX_DETECTIONS,
-                verbose=False,
-                device=self.device,
-            )
-            formatted, confidences = self._format_yolo_result(results[0], image.shape)
-            predictions.extend(formatted)
-            kept_confidences.extend(confidences)
-
-        return predictions, kept_confidences
-
-    def _predict_rfdetr(self, image: np.ndarray) -> tuple[list[dict[str, Any]], list[float]]:
-        if self.rfdetr_model is None:
-            return [], []
-
-        try:
-            from PIL import Image
-
-            rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-            pil_image = Image.fromarray(rgb)
-            detections = self.rfdetr_model.predict(pil_image, threshold=RFDETR_CONF)
-        except Exception as exc:
-            LOGGER.warning("RF-DETR inference failed; skipping this image: %s", exc)
-            return [], []
-
-        height, width = image.shape[:2]
-        boxes_xyxy, class_ids, confidences = self._normalise_rfdetr_output(detections)
-        predictions: list[dict[str, Any]] = []
-        kept_confidences: list[float] = []
-
-        for xyxy, category_id, confidence in zip(boxes_xyxy, class_ids, confidences):
-            category_id = int(category_id)
-            confidence = float(confidence)
-            if category_id < 0 or category_id >= len(CLASS_NAMES):
-                continue
-            if confidence < CLASS_CONF.get(category_id, DEFAULT_CONF):
-                continue
-
-            x1, y1, x2, y2 = [float(value) for value in xyxy]
-            if max(abs(x1), abs(y1), abs(x2), abs(y2)) <= 1.5:
-                x1 *= width
-                x2 *= width
-                y1 *= height
-                y2 *= height
-
-            left = max(0.0, min(x1, float(width - 1)))
-            top = max(0.0, min(y1, float(height - 1)))
-            right = max(0.0, min(x2, float(width)))
-            bottom = max(0.0, min(y2, float(height)))
-            box_width = right - left
-            box_height = bottom - top
-            if box_width <= 0 or box_height <= 0:
-                continue
-
-            predictions.append(
-                {
-                    "bbox": [left, top, box_width, box_height],
-                    "category_id": category_id,
-                    "_confidence": confidence,
-                }
-            )
-            kept_confidences.append(confidence * RFDETR_CONF_WEIGHT)
-
-        return predictions, kept_confidences
-
-    def _normalise_rfdetr_output(self, detections) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        def as_numpy(value) -> np.ndarray:
-            if value is None:
-                return np.asarray([])
-            if hasattr(value, "detach"):
-                value = value.detach().cpu()
-            return np.asarray(value)
-
-        boxes = as_numpy(getattr(detections, "xyxy", None))
-        class_ids = as_numpy(
-            getattr(
-                detections,
-                "class_id",
-                getattr(detections, "class_ids", getattr(detections, "labels", None)),
-            )
-        )
-        confidences = as_numpy(
-            getattr(
-                detections,
-                "confidence",
-                getattr(detections, "confidences", getattr(detections, "scores", None)),
-            )
-        )
-
-        if boxes.size == 0 and isinstance(detections, (list, tuple)):
-            rows = detections
-            boxes = as_numpy([row.get("xyxy") or row.get("bbox") for row in rows])
-            class_ids = as_numpy([row.get("class_id", row.get("category_id", 0)) for row in rows])
-            confidences = as_numpy([row.get("confidence", row.get("score", 0.0)) for row in rows])
-
-        boxes = boxes.reshape((-1, 4)) if boxes.size else np.empty((0, 4), dtype=np.float32)
-        class_ids = class_ids.reshape((-1,)).astype(int) if class_ids.size else np.empty((0,), dtype=int)
-        confidences = (
-            confidences.reshape((-1,)).astype(float)
-            if confidences.size
-            else np.empty((0,), dtype=float)
-        )
-        count = min(len(boxes), len(class_ids), len(confidences))
-        return boxes[:count], class_ids[:count], confidences[:count]
-
-    def _predict_horizontal_flip(self, image: np.ndarray) -> tuple[list[dict[str, Any]], list[float]]:
-        flipped = cv2.flip(image, 1)
-        height, width = image.shape[:2]
-        predictions: list[dict[str, Any]] = []
-        kept_confidences: list[float] = []
-
-        for model in self.models:
-            results = model.predict(
-                [flipped],
-                conf=max(0.01, PREDICT_CONF * 0.75),
-                iou=DEFAULT_IOU,
-                imgsz=DEFAULT_IMGSZ,
-                half=self.device == "cuda",
-                augment=False,
-                max_det=RAW_MAX_DETECTIONS,
-                verbose=False,
-                device=self.device,
-            )
-            result = results[0]
-            if result.boxes is None or len(result.boxes) == 0:
-                continue
-            boxes_xywh = result.boxes.xywh.detach().cpu().numpy()
-            class_ids = result.boxes.cls.detach().cpu().numpy().astype(int)
-            confidences = result.boxes.conf.detach().cpu().numpy()
-            for xywh, category_id, confidence in zip(boxes_xywh, class_ids, confidences):
-                if category_id < 0 or category_id >= len(CLASS_NAMES):
-                    continue
-                if confidence < CLASS_CONF.get(int(category_id), DEFAULT_CONF):
-                    continue
-                unflipped_xywh = np.array(xywh, dtype=np.float32)
-                unflipped_xywh[0] = float(width) - float(unflipped_xywh[0])
-                left, top, box_width, box_height = self._xywh_to_ltwh(
-                    unflipped_xywh,
-                    width,
-                    height,
-                )
-                if box_width <= 0 or box_height <= 0:
-                    continue
-                predictions.append(
-                    {
-                        "bbox": [left, top, box_width, box_height],
-                        "category_id": int(category_id),
-                        "_confidence": float(confidence),
-                    }
-                )
-                kept_confidences.append(float(confidence))
-
-        return predictions, kept_confidences
-
-    def _predict_sahi(self, image: np.ndarray) -> list[dict[str, Any]]:
+    def _yolo_sahi(self, image: np.ndarray) -> list[dict[str, Any]]:
         from sahi.predict import get_sliced_prediction
-
-        result = get_sliced_prediction(
+        res = get_sliced_prediction(
             image,
-            self.sahi_model,
-            slice_height=SAHI_SLICE_SIZE,
-            slice_width=SAHI_SLICE_SIZE,
-            overlap_height_ratio=SAHI_OVERLAP,
-            overlap_width_ratio=SAHI_OVERLAP,
+            self.sahi_yolo,
+            slice_height=640,
+            slice_width=640,
+            overlap_height_ratio=0.2,
+            overlap_width_ratio=0.2,
             perform_standard_pred=True,
             postprocess_type="NMS",
-            postprocess_match_threshold=SAHI_NMS_IOU,
-            postprocess_class_agnostic=False,
-            verbose=0,
+            postprocess_match_threshold=0.45,
+            verbose=0
+        )
+        preds = []
+        for obj in res.object_prediction_list:
+            cat = int(obj.category.id)
+            if obj.score.value < CLASS_CONF.get(cat, DEFAULT_CONF):
+                continue
+            b = obj.bbox
+            l = int(b.minx)
+            t = int(b.miny)
+            w = int(b.maxx - b.minx)
+            h = int(b.maxy - b.miny)
+            if w > 0 and h > 0:
+                preds.append({
+                    "bbox": [l, t, w, h],
+                    "category_id": cat,
+                    "score": float(obj.score.value)
+                })
+        return preds
+
+    def _yolo_full(self, image: np.ndarray) -> list[dict[str, Any]]:
+        # augment=True enables built-in TTA (multi-scale + flip) at inference
+        res = self.yolo.predict(
+            image,
+            conf=DEFAULT_CONF,
+            iou=0.45,
+            verbose=False,
+            device=self.device,
+            augment=True
+        )
+        r = res[0]
+        if r.boxes is None or len(r.boxes) == 0:
+            return []
+
+        boxes = xywh2ltwh(r.boxes.xywh.cpu().numpy())  # Convert to LTWH
+        clsids = r.boxes.cls.cpu().numpy().astype(int)
+        confs = r.boxes.conf.cpu().numpy()
+        preds = []
+        for box, cls, conf in zip(boxes, clsids, confs):
+            if conf < CLASS_CONF.get(int(cls), DEFAULT_CONF):
+                continue
+            l, t, w, h = (int(v) for v in box.tolist())
+            if w > 0 and h > 0:
+                preds.append({
+                    "bbox": [l, t, w, h],
+                    "category_id": int(cls),
+                    "score": float(conf)
+                })
+        return preds
+
+    def _get_rfdetr(self, image: np.ndarray) -> list[dict[str, Any]]:
+        if self.rfdetr is None:
+            return []
+        h, w = image.shape[:2]
+        try:
+            import PIL.Image
+            pil = PIL.Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
+            dets = self.rfdetr.predict(pil, threshold=DEFAULT_CONF)
+            preds = []
+            for xyxy, cls, conf in zip(dets.xyxy, dets.class_id, dets.confidence):
+                cat = int(cls)
+                if conf < CLASS_CONF.get(cat, DEFAULT_CONF):
+                    continue
+                x1 = int(xyxy[0] * w)
+                y1 = int(xyxy[1] * h)
+                bw = int((xyxy[2] - xyxy[0]) * w)
+                bh = int((xyxy[3] - xyxy[1]) * h)
+                if bw > 0 and bh > 0:
+                    preds.append({
+                        "bbox": [x1, y1, bw, bh],
+                        "category_id": cat,
+                        "score": float(conf)
+                    })
+            return preds
+        except Exception as exc:
+            LOGGER.warning("RF-DETR inference error: %s", exc)
+            return []
+
+    def _wbf(
+        self,
+        yolo_p: list[dict[str, Any]],
+        rfdetr_p: list[dict[str, Any]],
+        img_h: int,
+        img_w: int
+    ) -> list[dict[str, Any]]:
+        # If no RF-DETR is active, skip ensembling and output YOLO predictions
+        if not rfdetr_p:
+            return [{"bbox": p["bbox"], "category_id": p["category_id"]} for p in yolo_p]
+
+        from ensemble_boxes import weighted_boxes_fusion
+
+        def to_norm(preds):
+            boxes, scores, labels = [], [], []
+            for p in preds:
+                l, t, w, h = p["bbox"]
+                x1 = max(0.0, l / img_w)
+                y1 = max(0.0, t / img_h)
+                x2 = min(1.0, (l + w) / img_w)
+                y2 = min(1.0, (t + h) / img_h)
+                if x2 > x1 and y2 > y1:
+                    boxes.append([x1, y1, x2, y2])
+                    scores.append(p["score"])
+                    labels.append(float(p["category_id"]))
+            return boxes, scores, labels
+
+        ybx, ysc, ylb = to_norm(yolo_p)
+        rbx, rsc, rlb = to_norm(rfdetr_p)
+
+        if not ybx and not rbx:
+            return []
+
+        boxes_l, scores_l, labels_l, weights = [], [], [], []
+        if ybx:
+            boxes_l.append(ybx)
+            scores_l.append(ysc)
+            labels_l.append(ylb)
+            weights.append(YOLO_W)
+        if rbx:
+            boxes_l.append(rbx)
+            scores_l.append(rsc)
+            labels_l.append(rlb)
+            weights.append(RFDETR_W)
+
+        fb, fs, fl = weighted_boxes_fusion(
+            boxes_l,
+            scores_l,
+            labels_l,
+            weights=weights,
+            iou_thr=WBF_IOU_THR,
+            skip_box_thr=WBF_SKIP_THR
         )
 
-        predictions = []
-        confidences = []
-        height, width = image.shape[:2]
-        for obj in result.object_prediction_list:
-            category_id = int(obj.category.id)
-            if category_id < 0 or category_id >= len(CLASS_NAMES):
+        out = []
+        for box, score, label in zip(fb, fs, fl):
+            cat = int(round(label))
+            if score < CLASS_CONF.get(cat, DEFAULT_CONF):
                 continue
-            if obj.score.value < CLASS_CONF.get(category_id, DEFAULT_CONF):
-                continue
-
-            left = float(max(0.0, min(float(obj.bbox.minx), float(width - 1))))
-            top = float(max(0.0, min(float(obj.bbox.miny), float(height - 1))))
-            right = float(max(0.0, min(float(obj.bbox.maxx), float(width))))
-            bottom = float(max(0.0, min(float(obj.bbox.maxy), float(height))))
-            box_width = right - left
-            box_height = bottom - top
-            if box_width <= 0 or box_height <= 0:
-                continue
-
-            predictions.append(
-                {
-                    "bbox": [left, top, box_width, box_height],
-                    "category_id": category_id,
-                    "_confidence": float(obj.score.value),
-                }
-            )
-            confidences.append(float(obj.score.value))
-
-        return self._postprocess_predictions(predictions, confidences)
-
-    def _format_yolo_result(
-        self,
-        result,
-        image_shape: tuple[int, int, int],
-    ) -> tuple[list[dict[str, Any]], list[float]]:
-        if result.boxes is None or len(result.boxes) == 0:
-            return [], []
-
-        height, width = image_shape[:2]
-        boxes_xywh = result.boxes.xywh.detach().cpu().numpy()
-        class_ids = result.boxes.cls.detach().cpu().numpy().astype(int)
-        confidences = result.boxes.conf.detach().cpu().numpy()
-
-        predictions = []
-        kept_confidences = []
-        for xywh, category_id, confidence in zip(boxes_xywh, class_ids, confidences):
-            if category_id < 0 or category_id >= len(CLASS_NAMES):
-                continue
-            if confidence < CLASS_CONF.get(int(category_id), DEFAULT_CONF):
-                continue
-
-            left, top, box_width, box_height = self._xywh_to_ltwh(xywh, width, height)
-            if box_width <= 0 or box_height <= 0:
-                continue
-
-            predictions.append(
-                {
-                    "bbox": [left, top, box_width, box_height],
-                    "category_id": int(category_id),
-                    "_confidence": float(confidence),
-                }
-            )
-            kept_confidences.append(float(confidence))
-
-        return predictions, kept_confidences
-
-    def _postprocess_predictions(
-        self,
-        predictions: list[dict[str, Any]],
-        confidences: list[float] | None = None,
-    ) -> list[dict[str, Any]]:
-        if confidences is None:
-            confidences = [float(prediction.get("_confidence", 1.0)) for prediction in predictions]
-
-        predictions = self._classwise_nms(predictions, confidences)
-        confidences = [float(prediction.get("_confidence", 1.0)) for prediction in predictions]
-        if len(predictions) > MAX_DETECTIONS:
-            order = np.argsort(-np.asarray(confidences))[:MAX_DETECTIONS]
-            predictions = [predictions[int(index)] for index in order]
-
-        for prediction in predictions:
-            prediction.pop("_confidence", None)
-        return predictions
-
-    def _classwise_nms(
-        self,
-        predictions: list[dict[str, Any]],
-        confidences: list[float],
-    ) -> list[dict[str, Any]]:
-        if not predictions:
-            return []
-        if USE_WBF:
-            return self._classwise_weighted_fusion(predictions, confidences)
-
-        kept: list[dict[str, Any]] = []
-        by_class: dict[int, list[int]] = {}
-        for index, prediction in enumerate(predictions):
-            by_class.setdefault(int(prediction["category_id"]), []).append(index)
-
-        for indices in by_class.values():
-            ordered = sorted(indices, key=lambda index: confidences[index], reverse=True)
-            while ordered:
-                current = ordered.pop(0)
-                kept.append(predictions[current])
-                ordered = [
-                    other
-                    for other in ordered
-                    if self._bbox_iou(predictions[current]["bbox"], predictions[other]["bbox"])
-                    < FINAL_NMS_IOU
-                ]
-
-        kept.sort(key=lambda prediction: float(prediction.get("_confidence", 1.0)), reverse=True)
-        return kept
-
-    def _classwise_weighted_fusion(
-        self,
-        predictions: list[dict[str, Any]],
-        confidences: list[float],
-    ) -> list[dict[str, Any]]:
-        kept: list[dict[str, Any]] = []
-        by_class: dict[int, list[int]] = {}
-        for index, prediction in enumerate(predictions):
-            by_class.setdefault(int(prediction["category_id"]), []).append(index)
-
-        for category_id, indices in by_class.items():
-            ordered = sorted(indices, key=lambda index: confidences[index], reverse=True)
-            while ordered:
-                current = ordered.pop(0)
-                group = [current]
-                remaining = []
-                for other in ordered:
-                    if self._bbox_iou(predictions[current]["bbox"], predictions[other]["bbox"]) >= FINAL_NMS_IOU:
-                        group.append(other)
-                    else:
-                        remaining.append(other)
-                ordered = remaining
-
-                weights = np.asarray(
-                    [max(1e-6, confidences[index]) for index in group],
-                    dtype=np.float32,
-                )
-                boxes = np.asarray([predictions[index]["bbox"] for index in group], dtype=np.float32)
-                fused_box = np.average(boxes, axis=0, weights=weights).tolist()
-                kept.append(
-                    {
-                        "bbox": [float(value) for value in fused_box],
-                        "category_id": int(category_id),
-                        "_confidence": float(max(confidences[index] for index in group)),
-                    }
-                )
-
-        kept.sort(key=lambda prediction: float(prediction.get("_confidence", 1.0)), reverse=True)
-        return kept
-
-    def _bbox_iou(self, first: list[float], second: list[float]) -> float:
-        first_x1, first_y1, first_w, first_h = first
-        second_x1, second_y1, second_w, second_h = second
-        first_x2 = first_x1 + first_w
-        first_y2 = first_y1 + first_h
-        second_x2 = second_x1 + second_w
-        second_y2 = second_y1 + second_h
-
-        inter_x1 = max(first_x1, second_x1)
-        inter_y1 = max(first_y1, second_y1)
-        inter_x2 = min(first_x2, second_x2)
-        inter_y2 = min(first_y2, second_y2)
-        inter_w = max(0.0, inter_x2 - inter_x1)
-        inter_h = max(0.0, inter_y2 - inter_y1)
-        intersection = inter_w * inter_h
-        union = first_w * first_h + second_w * second_h - intersection
-        return intersection / union if union > 0 else 0.0
-
-    def _xywh_to_ltwh(
-        self,
-        xywh: np.ndarray,
-        image_width: int,
-        image_height: int,
-    ) -> tuple[float, float, float, float]:
-        center_x, center_y, box_width, box_height = (float(v) for v in xywh)
-        left = center_x - box_width / 2
-        top = center_y - box_height / 2
-        right = center_x + box_width / 2
-        bottom = center_y + box_height / 2
-
-        left = float(max(0.0, min(left, float(image_width - 1))))
-        top = float(max(0.0, min(top, float(image_height - 1))))
-        right = float(max(0.0, min(right, float(image_width))))
-        bottom = float(max(0.0, min(bottom, float(image_height))))
-
-        return left, top, right - left, bottom - top
+            x1 = int(box[0] * img_w)
+            y1 = int(box[1] * img_h)
+            bw = int((box[2] - box[0]) * img_w)
+            bh = int((box[3] - box[1]) * img_h)
+            if bw > 0 and bh > 0:
+                out.append({
+                    "bbox": [x1, y1, bw, bh],
+                    "category_id": cat
+                })
+        return out

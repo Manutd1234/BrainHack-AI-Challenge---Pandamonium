@@ -11,3 +11,5 @@ Pillow>=10.3.0,<13
 # Image decoding and training utilities.
 opencv-python-headless>=4.10,<5
 pyyaml>=6.0.2,<7
+ensemble-boxes>=1.0.9
+
