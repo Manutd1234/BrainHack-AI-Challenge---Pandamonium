@@ -55,7 +55,7 @@ except ImportError:
 # ── Config ─────────────────────────────────────────────────────────────────
 N_ENVS           = 8
 PHASE1_STEPS    = 10_000_000
-PHASE2_STEPS    = 5_000_000
+PHASE2_STEPS    = 6_000_000
 SEED            = 88
 
 BASE_PATH      = "model/policy_base"
