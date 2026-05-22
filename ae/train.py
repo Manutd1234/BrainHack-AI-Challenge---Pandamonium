@@ -88,20 +88,22 @@ LSTM_CONFIG = dict(
 
 # ── Reward Shaping Wrapper ──────────────────────────────────────────────────
 
-class RewardShapingParallelWrapper:
+from pettingzoo.utils.env import ParallelEnv
+
+class RewardShapingParallelWrapper(ParallelEnv):
     """PettingZoo ParallelEnv wrapper for custom exploration reward shaping."""
     def __init__(self, env, bonus: float = 0.0):
+        super().__init__()
         self.env = env
         self.bonus = bonus
         self._visited = {}
+        # Propagate properties required by pettingzoo/supersuit
+        self.possible_agents = env.possible_agents
+        self.metadata = getattr(env, "metadata", {})
 
     @property
     def agents(self):
         return self.env.agents
-
-    @property
-    def possible_agents(self):
-        return self.env.possible_agents
 
     def observation_space(self, agent):
         return self.env.observation_space(agent)
@@ -126,6 +128,9 @@ class RewardShapingParallelWrapper:
                     self._visited[agent].add(loc)
                     rews[agent] += self.bonus
         return obs, rews, terminations, truncations, infos
+
+    def render(self):
+        return self.env.render()
 
     def close(self):
         return self.env.close()
