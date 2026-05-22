@@ -254,9 +254,9 @@ class AEManager:
                 actions.append(RIGHT)
                 d = (d + 1) % 4
             elif turn == 2:
-                actions.append(RIGHT)
-                actions.append(RIGHT)
-                d = (d + 2) % 4
+                actions.append(BACKWARD)
+                x, y = tx, ty
+                continue
             elif turn == 3:
                 actions.append(LEFT)
                 d = (d - 1) % 4
@@ -312,19 +312,47 @@ class AEManager:
 
     # ── Safety-Dodging & Bombing Helpers ────────────────────────────────────
 
+    def _los_to_cell(self, bx: int, by: int, tx: int, ty: int) -> bool:
+        if bx == tx and by == ty:
+            return True
+        x0, y0 = bx, by
+        x1, y1 = tx, ty
+        dx = x1 - x0
+        dy = y1 - y0
+        nx = abs(dx)
+        ny = abs(dy)
+        sign_x = 1 if dx > 0 else -1 if dx < 0 else 0
+        sign_y = 1 if dy > 0 else -1 if dy < 0 else 0
+        px, py = x0, y0
+        ix = iy = 0
+        while ix < nx or iy < ny:
+            if (1 + 2 * ix) * ny == (1 + 2 * iy) * nx:
+                px += sign_x
+                py += sign_y
+                ix += 1
+                iy += 1
+            elif (1 + 2 * ix) * ny < (1 + 2 * iy) * nx:
+                px += sign_x
+                ix += 1
+            else:
+                py += sign_y
+                iy += 1
+            if (px, py) != (tx, ty):
+                if self.map.get(px, py) == WALL:
+                    return False
+        return True
+
     def _get_threatened_cells(self, bombs: list[tuple[int, int]]) -> set[tuple[int, int]]:
         threatened = set()
         for bx, by in bombs:
-            threatened.add((bx, by))
-            for dx, dy in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
-                for step in range(1, 3):  # blast radius is 2
-                    tx, ty = bx + dx * step, by + dy * step
-                    if not (0 <= tx < GRID and 0 <= ty < GRID):
-                        break
-                    if self.map.get(tx, ty) == WALL:
-                        break
-                    threatened.add((tx, ty))
+            for dx in range(-2, 3):
+                for dy in range(-2, 3):
+                    tx, ty = bx + dx, by + dy
+                    if 0 <= tx < GRID and 0 <= ty < GRID:
+                        if self._los_to_cell(bx, by, tx, ty):
+                            threatened.add((tx, ty))
         return threatened
+
 
     def _find_escape_path(self, sx: int, sy: int, threatened: set[tuple[int, int]]) -> list[tuple[int, int]]:
         queue = deque([(sx, sy, [])])
