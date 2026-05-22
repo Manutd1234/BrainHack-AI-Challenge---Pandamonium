@@ -1,148 +1,62 @@
-"""Runs the NLP server."""
-
-from __future__ import annotations
-
-import asyncio
-import logging
-from typing import Any
-
-from fastapi import FastAPI, HTTPException, Request
-from nlp_manager import NLPManager
+"""NLP Server — port 5004
+POST /load   {"documents": [...]}        → {"status": "loaded", "chunks": N}
+POST /       {"question": "...", ...}    → {"answer": "...", "documents": [...], "path": "..."}
+GET  /health → {"status": "ok", "chunks": N, "qa_cache": N}
+"""
+import logging, time
+from typing import Any, Optional
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
+from nlp_manager import NLPManager
 
-
-app = FastAPI(title="TIL-AI 2026 NLP")
-manager = NLPManager()
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
+app     = FastAPI(title="TIL-AI 2026 NLP")
+manager = NLPManager()
 
 class LoadRequest(BaseModel):
-    corpus: list[str | dict[str, str]]
-
+    documents: list[dict[str, Any]]
 
 class QueryRequest(BaseModel):
-    query: str
+    question:  str
+    query_id:  Optional[str] = None
 
-
-class _LoadState:
-    """Tracks corpus-loading state for async, pollable behavior."""
-
-    def __init__(self) -> None:
-        self.status = "idle"
-        self.error: str | None = None
-        self.task: asyncio.Task | None = None
-        self.lock = asyncio.Lock()
-
-
-load_state = _LoadState()
-
-
-def _normalise_load_documents(raw_documents: list[Any]) -> list[dict[str, str]]:
-    documents = []
-    for index, document in enumerate(raw_documents):
-        if isinstance(document, str):
-            documents.append({"id": f"DOC-{index + 1:04d}", "document": document})
-        else:
-            documents.append(
-                {
-                    "id": str(document.get("id") or f"DOC-{index:04d}"),
-                    "document": str(
-                        document.get("document") or document.get("text") or ""
-                    ),
-                }
-            )
-    return documents
-
-
-def _do_load(documents: list[dict[str, str]]) -> bool:
-    manager.load_corpus(documents)
-    return manager.loaded
-
-
-async def _load_task(documents: list[dict[str, str]]) -> None:
-    try:
-        ok = await asyncio.to_thread(_do_load, documents)
-        load_state.status = "loaded" if ok else "failed"
-        load_state.error = None if ok else "Corpus load returned false."
-    except Exception as exc:
-        logger.exception("Corpus load failed")
-        load_state.status = "failed"
-        load_state.error = str(exc)
-
-
-async def _start_load(raw_documents: list[Any]) -> dict[str, str]:
-    documents = _normalise_load_documents(raw_documents)
-    if not documents:
-        raise HTTPException(status_code=400, detail="Corpus cannot be empty.")
-
-    async with load_state.lock:
-        if load_state.status == "loading":
-            return {"status": "loading"}
-        load_state.status = "loading"
-        load_state.error = None
-        load_state.task = asyncio.create_task(_load_task(documents))
-        return {"status": load_state.status}
-
-
-@app.post("/nlp")
-async def nlp(request: Request) -> dict[str, list[Any]]:
-    """Load the corpus or answer TIL-formatted NLP questions."""
-    inputs_json = await request.json()
-    instances = inputs_json["instances"]
-    first = instances[0]
-
-    if first.get("documents") is not None:
-        await _start_load(first["documents"])
-        return {"predictions": ["loading"]}
-
-    if first.get("poll") is not None:
-        status = load_state.status
-        if status == "failed":
-            status = "error"
-        return {"predictions": [status]}
-
-    if load_state.status != "loaded":
-        raise HTTPException(status_code=400, detail=f"Corpus status: {load_state.status}")
-
-    raw_predictions = [
-        await asyncio.to_thread(manager.qa, instance["question"])
-        for instance in instances
-    ]
-    predictions = []
-    for pred in raw_predictions:
-        if isinstance(pred, dict):
-            predictions.append({
-                "documents": list(pred.get("documents") or []),
-                "answer": str(pred.get("answer") or "")
-            })
-        else:
-            predictions.append({
-                "documents": [],
-                "answer": str(pred)
-            })
-    return {"predictions": predictions}
-
-
-@app.post("/load")
-async def load_corpus(req: LoadRequest) -> dict[str, str]:
-    """Compatibility route for manually loading a corpus."""
-    return await _start_load(req.corpus)
-
-
-@app.post("/")
-async def query_model(req: QueryRequest) -> dict[str, Any]:
-    """Compatibility route matching the standalone Gemini draft."""
-    if load_state.status != "loaded":
-        raise HTTPException(status_code=400, detail=f"Corpus status: {load_state.status}")
-
-    prediction = await asyncio.to_thread(manager.qa, req.query)
-    return {
-        "response": prediction["answer"],
-        "doc_ids": prediction["documents"],
-    }
-
+class QueryResponse(BaseModel):
+    answer:    str
+    documents: list[str]
+    path:      str = "unknown"
 
 @app.get("/health")
-def health() -> dict[str, str]:
-    """Health check endpoint."""
-    return {"message": "health ok"}
+def health():
+    return {
+        "status":   "ok",
+        "chunks":   len(manager.chunks),
+        "qa_cache": manager.qa_index.ntotal if manager.qa_index else 0,
+    }
+
+@app.post("/load")
+@app.post("/corpus")
+def load(req: LoadRequest):
+    if not req.documents:
+        raise HTTPException(400, "documents list is empty")
+    t0 = time.perf_counter()
+    manager.load_corpus(req.documents)
+    logger.info(f"Corpus loaded in {time.perf_counter()-t0:.1f}s")
+    return {"status": "loaded", "chunks": len(manager.chunks)}
+
+@app.post("/", response_model=QueryResponse)
+@app.post("/query", response_model=QueryResponse)
+def query(req: QueryRequest):
+    if not req.question:
+        raise HTTPException(400, "question is empty")
+    try:
+        t0 = time.perf_counter()
+        answer, documents, path = manager.answer(req.question)
+        logger.info(
+            f"[{req.query_id or '?'}] path={path} "
+            f"elapsed={1000*(time.perf_counter()-t0):.0f}ms"
+        )
+        return QueryResponse(answer=answer, documents=documents, path=path)
+    except Exception as exc:
+        logger.exception("Query error")
+        raise HTTPException(500, str(exc))

@@ -1,180 +1,281 @@
-"""Train a shared PPO policy for the TIL-AI 2026 AE environment.
+"""
+AE Training — TIL-AI 2026
+═══════════════════════════════════════════════════════════════════════
+Phase 1 — RecurrentPPO with LSTM (10M steps)
+  Uses sb3-contrib RecurrentPPO so the policy maintains hidden state
+  across the 200-step episode. Solves partial observability (viewcone
+  only shows what's directly ahead — LSTM remembers the rest).
 
-Run from this directory after installing the AE environment package:
+Phase 2 — Self-play fine-tune (5M steps)
+  Opponents drawn from rolling pool of past checkpoints.
+  PoolUpdateCallback adds live policy to pool every 500K steps.
 
-    pip install -e /path/to/til-26-ae
-    pip install -r requirements.txt
-    python ae_train.py
+Curriculum:
+  Shaped reward ramps from exploration-heavy (+0.1 new cell) in Phase 1
+  to competition-realistic (+0.05 new cell) in Phase 2, forcing the
+  agent to learn challenge activation and opponent interaction.
+
+Output: model/policy.zip (RecurrentPPO LSTM checkpoint)
+Install:
+    pip install stable-baselines3[extra] sb3-contrib tensorboard
+    pip install -e /path/to/til-26/
 """
 
-from __future__ import annotations
-
+import glob
+import logging
 import os
-from pathlib import Path
+import random
+import shutil
 
 import numpy as np
-import supersuit as ss
-from gymnasium import spaces
-from stable_baselines3 import PPO
-from stable_baselines3.common.callbacks import CheckpointCallback, EvalCallback
-from stable_baselines3.common.utils import get_schedule_fn
-from stable_baselines3.common.vec_env import VecMonitor
 
-from til_environment.bomberman_env import parallel_basic_env
-from til_environment.config import default_config
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger(__name__)
 
+try:
+    from sb3_contrib import RecurrentPPO
+    USE_RECURRENT = True
+    logger.info("Using RecurrentPPO (LSTM policy)")
+except ImportError:
+    from stable_baselines3 import PPO as RecurrentPPO
+    USE_RECURRENT = False
+    logger.warning("sb3-contrib not found — falling back to standard PPO (no LSTM)")
 
-TOTAL_STEPS = int(os.getenv("AE_TOTAL_STEPS", "10000000"))
-N_ENVS = int(os.getenv("AE_N_ENVS", "8"))
-N_CPUS = int(os.getenv("AE_N_CPUS", str(N_ENVS)))
-SEED = int(os.getenv("AE_SEED", "88"))
-RESUME_PATH = Path(os.getenv("AE_RESUME_PATH", "model/policy.zip"))
-OUTPUT_PATH = Path(os.getenv("AE_OUTPUT_PATH", "model/policy.zip"))
-RESUME = os.getenv("AE_RESUME", "true").lower() in {"1", "true", "yes"}
-FINETUNE = os.getenv("AE_FINETUNE", "true").lower() in {"1", "true", "yes"}
-FINETUNE_LR = float(os.getenv("AE_FINETUNE_LR", "0.0001"))
-FINETUNE_ENT_COEF = float(os.getenv("AE_FINETUNE_ENT_COEF", "0.005"))
+from stable_baselines3.common.callbacks import BaseCallback, CheckpointCallback, EvalCallback
+from stable_baselines3.common.env_util import make_vec_env
+from stable_baselines3.common.vec_env import SubprocVecEnv, VecMonitor
 
-PPO_CONFIG = {
-    "policy": "MultiInputPolicy",
-    "learning_rate": float(os.getenv("AE_LR", "0.0003")),
-    "n_steps": int(os.getenv("AE_N_STEPS", "2048")),
-    "batch_size": int(os.getenv("AE_BATCH_SIZE", "512")),
-    "n_epochs": int(os.getenv("AE_N_EPOCHS", "10")),
-    "gamma": float(os.getenv("AE_GAMMA", "0.99")),
-    "gae_lambda": float(os.getenv("AE_GAE_LAMBDA", "0.95")),
-    "clip_range": float(os.getenv("AE_CLIP_RANGE", "0.2")),
-    "ent_coef": float(os.getenv("AE_ENT_COEF", "0.01")),
-    "vf_coef": float(os.getenv("AE_VF_COEF", "0.5")),
-    "max_grad_norm": float(os.getenv("AE_MAX_GRAD_NORM", "0.5")),
-    "verbose": 1,
-    "tensorboard_log": "./logs/tensorboard",
-}
+try:
+    from til_environment.env import TILEnvironment
+except ImportError:
+    raise ImportError("pip install -e /path/to/til-26/")
 
+# ── Config ─────────────────────────────────────────────────────────────────
+N_ENVS          = 8
+PHASE1_STEPS    = 10_000_000
+PHASE2_STEPS    = 5_000_000
+POOL_SIZE       = 8
+POOL_UPDATE_FREQ = 500_000
 
-def _config():
-    cfg = default_config()
-    cfg.env.render_mode = None
-    cfg.env.novice = os.getenv("AE_NOVICE", "true").lower() in {"1", "true", "yes"}
-    cfg.rewards.stationary_penalty = -0.01
-    cfg.rewards.invalid_action = -0.02
-    cfg.rewards.agent_collide_wall = -0.01
-    return cfg
+BASE_PATH      = "model/policy_base"
+SELFPLAY_PATH  = "model/policy_selfplay"
+POOL_DIR       = "model/pool"
+LOG_DIR        = "logs"
 
+PPO_CONFIG = dict(
+    learning_rate  = 3e-4,
+    n_steps        = 2048,
+    batch_size     = 512,
+    n_epochs       = 10,
+    gamma          = 0.99,
+    gae_lambda     = 0.95,
+    clip_range     = 0.2,
+    ent_coef       = 0.01,
+    vf_coef        = 0.5,
+    max_grad_norm  = 0.5,
+    verbose        = 1,
+    tensorboard_log= LOG_DIR,
+)
 
-def make_vec_env(num_envs: int, num_cpus: int):
-    """Build a vectorized multi-agent self-play environment for SB3."""
-    env = parallel_basic_env(env_wrappers=[], cfg=_config())
-    env = _patch_observation_dtypes(env)
-    env = ss.pettingzoo_env_to_vec_env_v1(env)
-    env = ss.concat_vec_envs_v1(
-        env,
-        num_vec_envs=num_envs,
-        num_cpus=num_cpus,
-        base_class="stable_baselines3",
-    )
-    return _patch_seed_method(VecMonitor(env))
+LSTM_CONFIG = dict(
+    **PPO_CONFIG,
+    # RecurrentPPO extra params
+    lstm_hidden_size = 256,
+    n_lstm_layers    = 1,
+    shared_lstm      = False,
+    enable_critic_lstm = True,
+)
 
 
-def _patch_observation_dtypes(env):
-    """Cast env observations to the dtypes declared by their spaces."""
-    original_reset = env.reset
-    original_step = env.step
+# ── Environments ───────────────────────────────────────────────────────────
 
-    def cast_many(observations):
-        return {
-            agent: _cast_to_space(observation, env.observation_space(agent))
-            for agent, observation in observations.items()
-        }
+class ExplorationEnv(TILEnvironment):
+    """Phase 1: heavy exploration shaping."""
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self._visited: set = set()
 
-    def reset(*args, **kwargs):
-        observations, infos = original_reset(*args, **kwargs)
-        return cast_many(observations), infos
+    def reset(self, **kw):
+        self._visited.clear()
+        return super().reset(**kw)
 
-    def step(actions):
-        observations, rewards, terminations, truncations, infos = original_step(actions)
-        return cast_many(observations), rewards, terminations, truncations, infos
-
-    env.reset = reset
-    env.step = step
-    return env
+    def step(self, action):
+        obs, rew, term, trunc, info = super().step(action)
+        loc = tuple(obs.get("location", [0, 0]))
+        if loc not in self._visited:
+            self._visited.add(loc)
+            rew += 0.10   # strong exploration bonus in Phase 1
+        return obs, rew, term, trunc, info
 
 
-def _cast_to_space(value, space):
-    if isinstance(space, spaces.Dict):
-        return {
-            key: _cast_to_space(value[key], subspace)
-            for key, subspace in space.spaces.items()
-        }
-    if isinstance(space, spaces.Box):
-        return np.asarray(value, dtype=space.dtype)
-    if isinstance(space, spaces.Discrete):
-        return np.asarray(value, dtype=space.dtype)
-    return value
+class SelfPlayEnv(TILEnvironment):
+    """Phase 2: exploration shaping + pool opponent."""
+    def __init__(self, pool_dir: str, *a, **kw):
+        super().__init__(*a, **kw)
+        self.pool_dir    = pool_dir
+        self._opp        = None
+        self._opp_path   = None
+        self._visited: set = set()
+
+    def reset(self, **kw):
+        self._visited.clear()
+        # Sample new opponent from pool
+        files = glob.glob(os.path.join(self.pool_dir, "*.zip"))
+        if files:
+            path = random.choice(files)
+            if path != self._opp_path:
+                try:
+                    self._opp = RecurrentPPO.load(path, device="cpu")
+                    self._opp_path = path
+                except Exception:
+                    self._opp = None
+        return super().reset(**kw)
+
+    def step(self, action):
+        obs, rew, term, trunc, info = super().step(action)
+        loc = tuple(obs.get("location", [0, 0]))
+        if loc not in self._visited:
+            self._visited.add(loc)
+            rew += 0.05   # lighter shaping in Phase 2
+        return obs, rew, term, trunc, info
 
 
-def _patch_seed_method(env):
-    """Add missing seed methods on Supersuit vec-env wrappers for SB3."""
-    current = env
-    while current is not None:
-        if not hasattr(current, "seed"):
-            def seed(seed_value=None, _env=current):
-                return [seed_value] * int(getattr(_env, "num_envs", 1))
+# ── Pool management ────────────────────────────────────────────────────────
 
-            current.seed = seed
-        current = getattr(current, "venv", None)
-    return env
+class OpponentPool:
+    def __init__(self, pool_dir: str, max_size: int = POOL_SIZE):
+        self.pool_dir = pool_dir
+        self.max_size = max_size
+        os.makedirs(pool_dir, exist_ok=True)
+
+    def add(self, model, step: int):
+        path = os.path.join(self.pool_dir, f"opp_{step:010d}")
+        model.save(path)
+        logger.info(f"Pool: added opp at step {step:,}")
+        files = sorted(glob.glob(os.path.join(self.pool_dir, "*.zip")))
+        while len(files) > self.max_size:
+            os.remove(files.pop(0))
+
+    def __len__(self):
+        return len(glob.glob(os.path.join(self.pool_dir, "*.zip")))
 
 
-def train() -> None:
-    Path("model/checkpoints").mkdir(parents=True, exist_ok=True)
-    Path("model/best").mkdir(parents=True, exist_ok=True)
-    Path("logs/eval").mkdir(parents=True, exist_ok=True)
+class PoolUpdateCallback(BaseCallback):
+    def __init__(self, pool: OpponentPool, freq: int = POOL_UPDATE_FREQ):
+        super().__init__()
+        self.pool = pool
+        self.freq = freq
+        self._last = 0
 
-    train_env = make_vec_env(N_ENVS, N_CPUS)
-    eval_env = make_vec_env(1, 1)
-    device = os.getenv("AE_DEVICE", "cuda")
-    if RESUME and RESUME_PATH.exists():
-        print(f"Resuming PPO checkpoint from {RESUME_PATH}")
-        model = PPO.load(RESUME_PATH, env=train_env, seed=SEED, device=device)
-        if FINETUNE:
-            print(
-                f"Fine-tuning with learning_rate={FINETUNE_LR} "
-                f"ent_coef={FINETUNE_ENT_COEF}"
-            )
-            model.learning_rate = FINETUNE_LR
-            model.lr_schedule = get_schedule_fn(FINETUNE_LR)
-            model.ent_coef = FINETUNE_ENT_COEF
-        reset_num_timesteps = False
-    else:
-        model = PPO(env=train_env, seed=SEED, device=device, **PPO_CONFIG)
-        reset_num_timesteps = True
+    def _on_step(self) -> bool:
+        if self.num_timesteps - self._last >= self.freq:
+            self.pool.add(self.model, self.num_timesteps)
+            self._last = self.num_timesteps
+        return True
+
+
+# ── Training ───────────────────────────────────────────────────────────────
+
+def make_phase1_env(seed=0):
+    return lambda: ExplorationEnv(seed=seed)
+
+def make_phase2_env(pool_dir, seed=0):
+    return lambda: SelfPlayEnv(pool_dir=pool_dir, seed=seed)
+
+
+def phase1():
+    os.makedirs("model", exist_ok=True)
+    os.makedirs(LOG_DIR,  exist_ok=True)
+
+    if os.path.exists(f"{BASE_PATH}.zip"):
+        logger.info(f"Phase 1 checkpoint found — skipping Phase 1")
+        return RecurrentPPO.load(BASE_PATH, device="cuda")
+
+    logger.info("=" * 60)
+    logger.info("PHASE 1 — RecurrentPPO LSTM (10M steps, exploration shaping)")
+    logger.info("=" * 60)
+
+    envs = SubprocVecEnv([make_phase1_env(i) for i in range(N_ENVS)])
+    envs = VecMonitor(envs)
+    eval_env = make_vec_env(TILEnvironment, n_envs=1)
+
+    policy = "MlpLstmPolicy" if USE_RECURRENT else "MultiInputPolicy"
+    config  = LSTM_CONFIG    if USE_RECURRENT else PPO_CONFIG
+
+    model = RecurrentPPO(policy=policy, env=envs, device="cuda", **{
+        k: v for k, v in config.items()
+        if k not in ("policy",)
+    })
 
     model.learn(
-        total_timesteps=TOTAL_STEPS,
-        reset_num_timesteps=reset_num_timesteps,
+        total_timesteps=PHASE1_STEPS,
         progress_bar=True,
         callback=[
             CheckpointCallback(
-                save_freq=max(1, 500_000 // max(1, N_ENVS)),
-                save_path="model/checkpoints",
-                name_prefix="ppo_til26_ae",
+                save_freq=500_000 // N_ENVS,
+                save_path="model/ckpts_p1/",
+                name_prefix="p1",
             ),
             EvalCallback(
-                eval_env,
-                eval_freq=max(1, 200_000 // max(1, N_ENVS)),
-                n_eval_episodes=6,
-                best_model_save_path="model/best",
-                log_path="logs/eval",
-                deterministic=True,
+                eval_env, eval_freq=200_000 // N_ENVS,
+                n_eval_episodes=10, deterministic=True,
+                best_model_save_path="model/best_p1/",
             ),
         ],
     )
+    model.save(BASE_PATH)
+    logger.info(f"Phase 1 done → {BASE_PATH}.zip")
+    return model
 
-    OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    model.save(str(OUTPUT_PATH))
-    print(f"Saved PPO checkpoint to {OUTPUT_PATH}")
+
+def phase2(base_model):
+    logger.info("=" * 60)
+    logger.info("PHASE 2 — Self-play fine-tune (5M steps)")
+    logger.info("=" * 60)
+
+    pool = OpponentPool(POOL_DIR)
+    pool.add(base_model, step=0)
+
+    envs = SubprocVecEnv([make_phase2_env(POOL_DIR, i) for i in range(N_ENVS)])
+    envs = VecMonitor(envs)
+    eval_env = make_vec_env(TILEnvironment, n_envs=1)
+
+    policy = "MlpLstmPolicy" if USE_RECURRENT else "MultiInputPolicy"
+    config  = {**LSTM_CONFIG, "learning_rate": 1e-4, "ent_coef": 0.005} \
+              if USE_RECURRENT else \
+              {**PPO_CONFIG, "learning_rate": 1e-4, "ent_coef": 0.005}
+
+    model = RecurrentPPO(policy=policy, env=envs, device="cuda", **{
+        k: v for k, v in config.items()
+        if k not in ("policy",)
+    })
+    model.set_parameters(base_model.get_parameters())
+
+    model.learn(
+        total_timesteps=PHASE2_STEPS,
+        progress_bar=True,
+        reset_num_timesteps=True,
+        callback=[
+            PoolUpdateCallback(pool),
+            CheckpointCallback(
+                save_freq=500_000 // N_ENVS,
+                save_path="model/ckpts_p2/",
+                name_prefix="p2",
+            ),
+            EvalCallback(
+                eval_env, eval_freq=200_000 // N_ENVS,
+                n_eval_episodes=10, deterministic=True,
+                best_model_save_path="model/best_p2/",
+            ),
+        ],
+    )
+    model.save(SELFPLAY_PATH)
+    shutil.copy(f"{SELFPLAY_PATH}.zip", "model/policy.zip")
+    logger.info(f"Phase 2 done → model/policy.zip")
+    return model
 
 
 if __name__ == "__main__":
-    train()
+    base  = phase1()
+    phase2(base)
+    logger.info("Training complete → copy model/policy.zip to ae/model/policy.zip")

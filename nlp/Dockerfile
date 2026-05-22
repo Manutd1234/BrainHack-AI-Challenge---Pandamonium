@@ -1,59 +1,42 @@
-# Dockerfile for the TIL NLP container.
-FROM nvcr.io/nvidia/pytorch:25.11-py3
-
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
-    PIP_ROOT_USER_ACTION=ignore \
-    QWEN_MODEL_PATH=/app/src/qwen-quantized \
-    QWEN_ENABLE_THINKING=0 \
-    NLP_USE_APPROX_LOOKUP=1 \
-    NLP_USE_QA_MEMORY=0 \
-    NLP_USE_QA_MEMORY_HINTS=0 \
-    NLP_APPROX_MIN_JACCARD=0.48 \
-    NLP_APPROX_MIN_OVERLAP=4 \
-    NLP_APPROX_MIN_CONFIDENCE=0.64 \
-    NLP_APPROX_HINT_MIN_CONFIDENCE=0.42 \
-    NLP_QA_MEMORY_MIN_CONFIDENCE=0.62 \
-    NLP_QA_MEMORY_HINT_CONFIDENCE=0.36 \
-    NLP_QA_MEMORY_MIN_OVERLAP=4 \
-    NLP_DOC_BM25_BOOST=0.55 \
-    NLP_SENTENCE_WINDOW=3 \
-    NLP_SENTENCE_STRIDE=2 \
-    NLP_MAX_DOC_CHUNKS=18 \
-    NLP_MAX_MODEL_LEN=2048 \
-    NLP_LLM_CONTEXT_CHARS=3600 \
-    NLP_LORA_ADAPTER_PATH=/app/src/lora_adapter \
-    NLP_MAX_GPU_MEMORY=12GiB \
-    NLP_USE_DENSE=1 \
-    NLP_USE_LLM=0 \
-    NLP_USE_QA_READER=0 \
-    NLP_QA_READER_MODEL_PATH=/app/models/qa-reader \
-    NLP_QA_READER_CONTEXTS=5 \
-    NLP_QA_READER_MIN_SCORE=5.0 \
-    NLP_LLM_MODE=selective \
-    NLP_MAX_NEW_TOKENS=96 \
-    HF_HOME=/app/.cache/huggingface \
-    HF_HUB_OFFLINE=1 \
-    TRANSFORMERS_OFFLINE=1
+FROM nvidia/cuda:12.1.0-cudnn8-devel-ubuntu22.04
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y \
+        python3.11 python3-pip python3.11-dev git build-essential \
+    && rm -rf /var/lib/apt/lists/*
+RUN ln -sf /usr/bin/python3.11 /usr/bin/python3 && ln -sf /usr/bin/pip3 /usr/bin/pip
 
 WORKDIR /app
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        git \
-    && rm -rf /var/lib/apt/lists/*
-
 COPY requirements.txt .
-RUN python -m pip install --no-cache-dir --upgrade pip setuptools wheel \
-    && pip install --no-cache-dir -r requirements.txt \
-    && pip install --no-cache-dir --upgrade "transformers>=4.51.0"
+RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir flash-attn --no-build-isolation
 
-# Pre-download BGE models to cache them for offline runtime evaluation.
-RUN python -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='BAAI/bge-m3'); snapshot_download(repo_id='BAAI/bge-reranker-large')" \
-    && chmod -R 777 /app/.cache
+RUN python3 -c "\
+from huggingface_hub import snapshot_download; \
+print('BGE-M3...'); snapshot_download('BAAI/bge-m3', local_dir='/app/model/bge-m3'); \
+print('Reranker...'); snapshot_download('BAAI/bge-reranker-v2-m3', local_dir='/app/model/bge-reranker'); \
+print('DeBERTa...'); snapshot_download('deepset/deberta-v3-large-squad2', local_dir='/app/model/deberta-reader'); \
+print('Done')"
 
-COPY src/ ./src/
+ENV EMBED_MODEL_PATH=/app/model/bge-m3
+ENV RERANKER_MODEL_PATH=/app/model/bge-reranker
+ENV READER_MODEL_PATH=/app/model/deberta-reader
+# QA training pairs — copy nlp.jsonl to data/nlp.jsonl before building
+ENV QA_JSONL_PATH=/app/data/nlp.jsonl
+# Tunable thresholds (no rebuild needed)
+ENV QA_CACHE_THRESHOLD=0.92
+ENV RERANK_L4_THRESHOLD=0.28
+ENV EXTRACT_HIGH=0.65
+ENV EXTRACT_LOW=0.18
+ENV W_DENSE=0.40
+ENV W_SPARSE=0.30
+ENV W_COLBERT=0.30
+ENV NVIDIA_VISIBLE_DEVICES=all
+ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility
+ENV TOKENIZERS_PARALLELISM=false
 
+COPY data/ /app/data/
+COPY src/  ./src/
 WORKDIR /app/src
-
 EXPOSE 5004
-CMD ["uvicorn", "nlp_server:app", "--host", "0.0.0.0", "--port", "5004", "--workers", "1"]
+CMD ["uvicorn", "nlp_server:app", "--host", "0.0.0.0", "--port", "5004", \
+     "--workers", "1", "--timeout-keep-alive", "300"]
