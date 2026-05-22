@@ -210,8 +210,26 @@ def phase1():
     Path(LOG_DIR).mkdir(parents=True, exist_ok=True)
 
     if os.path.exists(f"{BASE_PATH}.zip"):
-        logger.info(f"Phase 1 checkpoint found — skipping Phase 1 base training")
-        return RecurrentPPO.load(BASE_PATH, device="cuda")
+        logger.info(f"Phase 1 checkpoint found — loading checkpoint")
+        global USE_RECURRENT
+        if USE_RECURRENT:
+            try:
+                model = RecurrentPPO.load(BASE_PATH, device="cuda")
+                logger.info("Successfully loaded RecurrentPPO model.")
+                return model
+            except Exception as e:
+                logger.warning(f"Failed to load as RecurrentPPO: {e}")
+                logger.info("Falling back to standard PPO to load checkpoint.")
+                from stable_baselines3 import PPO
+                model = PPO.load(BASE_PATH, device="cuda")
+                USE_RECURRENT = False
+                logger.info("Successfully loaded standard PPO model. Disabling recurrent training.")
+                return model
+        else:
+            from stable_baselines3 import PPO
+            model = PPO.load(BASE_PATH, device="cuda")
+            logger.info("Successfully loaded standard PPO model.")
+            return model
 
     logger.info("=" * 60)
     logger.info("PHASE 1 — RecurrentPPO LSTM (10M steps, exploration shaping = +0.10)")
@@ -261,10 +279,17 @@ def phase2(base_model):
               if USE_RECURRENT else \
               {**PPO_CONFIG, "learning_rate": 1e-4, "ent_coef": 0.005}
 
-    model = RecurrentPPO(policy=policy, env=train_env, seed=SEED, device="cuda", **{
-        k: v for k, v in config.items()
-        if k not in ("policy", "tensorboard_log")
-    })
+    if USE_RECURRENT:
+        model = RecurrentPPO(policy=policy, env=train_env, seed=SEED, device="cuda", **{
+            k: v for k, v in config.items()
+            if k not in ("policy", "tensorboard_log")
+        })
+    else:
+        from stable_baselines3 import PPO
+        model = PPO(policy=policy, env=train_env, seed=SEED, device="cuda", **{
+            k: v for k, v in config.items()
+            if k not in ("policy", "tensorboard_log")
+        })
     model.set_parameters(base_model.get_parameters())
 
     model.learn(
