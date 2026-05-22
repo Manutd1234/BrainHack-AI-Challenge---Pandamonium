@@ -1,95 +1,71 @@
-"""Fine-tune YOLO26x for the TIL-AI 2026 CV challenge."""
-
-from __future__ import annotations
-
+"""
+CV Training — trains RF-DETR-large and/or YOLO26x on aerial dataset.
+Run: python cv_train.py --model rfdetr
+     python cv_train.py --model yolo
+     python cv_train.py --model both
+"""
+import argparse
 import os
 import shutil
-from pathlib import Path
-
 import yaml
-from ultralytics import YOLO
 
-
-TIL_CLASSES = [
-    "cargo aircraft",
-    "commercial aircraft",
-    "drone",
-    "fighter jet",
-    "fighter plane",
-    "helicopter",
-    "light aircraft",
-    "missile",
-    "truck",
-    "car",
-    "tank",
-    "bus",
-    "van",
-    "cargo ship",
-    "yacht",
-    "cruise ship",
-    "warship",
-    "sailboat",
+CLASSES = [
+    "cargo aircraft", "commercial aircraft", "drone", "fighter jet", "fighter plane",
+    "helicopter", "light aircraft", "missile", "truck", "car", "tank", "bus", "van",
+    "cargo ship", "yacht", "cruise ship", "warship", "sailboat"
 ]
 
-DATA_YAML = {
-    "path": str(Path("data/til26").resolve()),
-    "train": "images/train",
-    "val": "images/val",
-    "names": {index: name for index, name in enumerate(TIL_CLASSES)},
-    "nc": len(TIL_CLASSES),
-}
-
-
-def write_data_yaml(path: str = "data/til26.yaml") -> str:
-    """Write the local Ultralytics dataset config."""
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    with open(path, "w", encoding="utf-8") as handle:
-        yaml.safe_dump(DATA_YAML, handle, default_flow_style=False, sort_keys=False)
-    print(f"data.yaml written to {path}")
-    return path
-
-
-def train() -> None:
-    """Train YOLO26x and copy the best checkpoint into model/best.pt."""
-    data_yaml = write_data_yaml()
-    model = YOLO("yolo26x.pt")
-
-    results = model.train(
-        data=data_yaml,
-        epochs=100,
-        imgsz=1280,
-        batch=4,
-        device="cuda",
-        workers=4,
-        project="runs",
-        name="yolo26x_til26",
-        exist_ok=True,
-        degrees=90.0,
-        flipud=0.5,
-        fliplr=0.5,
-        mosaic=1.0,
-        mixup=0.15,
-        copy_paste=0.3,
-        erasing=0.4,
-        hsv_h=0.015,
-        hsv_s=0.7,
-        hsv_v=0.4,
-        optimizer="auto",
-        lr0=0.01,
-        lrf=0.01,
-        warmup_epochs=3,
-        save=True,
-        save_period=10,
-        val=True,
-        plots=True,
+def train_rfdetr(data_dir="data/til26"):
+    print("=" * 60)
+    print("STARTING RF-DETR-LARGE TRAINING (50 EPOCHS)")
+    print("=" * 60)
+    from rfdetr import RFDETRLarge
+    model = RFDETRLarge(num_classes=len(CLASSES), pretrained=True)
+    model.train(
+        dataset_dir=data_dir, epochs=50, batch_size=8,
+        lr=1e-4, lr_encoder=1e-5, resolution=800,
+        grad_accumulation_steps=2, num_workers=4,
+        output_dir="runs/rfdetr_til26",
     )
-
     os.makedirs("model", exist_ok=True)
-    shutil.copy("runs/yolo26x_til26/weights/best.pt", "model/best.pt")
-    metric = results.results_dict.get("metrics/mAP50-95(B)", "N/A")
-    print(f"mAP50-95: {metric}")
-    print("Checkpoint saved to model/best.pt")
+    shutil.copy("runs/rfdetr_til26/checkpoint_best.pth", "model/rfdetr_best.pt")
+    print("RF-DETR training complete → model/rfdetr_best.pt")
 
+def train_yolo(data_yaml="data/til26.yaml"):
+    print("=" * 60)
+    print("STARTING YOLO26X TRAINING (50 EPOCHS)")
+    print("=" * 60)
+    from ultralytics import YOLO
+    if not os.path.exists(data_yaml):
+        cfg = {
+            "path": os.path.abspath("data/til26"),
+            "train": "images/train",
+            "val": "images/val",
+            "names": {i: n for i, n in enumerate(CLASSES)},
+            "nc": len(CLASSES)
+        }
+        with open(data_yaml, "w") as f:
+            yaml.dump(cfg, f, allow_unicode=True)
+            
+    model = YOLO("yolo26x.pt")
+    model.train(
+        data=data_yaml, epochs=50, imgsz=1280, batch=4, device="cuda",
+        degrees=90.0, flipud=0.5, fliplr=0.5, mosaic=1.0, mixup=0.15,
+        copy_paste=0.3, erasing=0.4, hsv_h=0.015, hsv_s=0.7, hsv_v=0.4,
+        optimizer="auto", lr0=0.01, lrf=0.01, warmup_epochs=3,
+        project="runs", name="yolo26x_til26", exist_ok=True,
+        save=True, val=True, plots=True,
+    )
+    os.makedirs("model", exist_ok=True)
+    shutil.copy("runs/yolo26x_til26/weights/best.pt", "model/yolo_best.pt")
+    shutil.copy("runs/yolo26x_til26/weights/best.pt", "model/best.pt")
+    print("YOLO26x training complete → model/best.pt & model/yolo_best.pt")
 
 if __name__ == "__main__":
-    train()
+    p = argparse.ArgumentParser()
+    p.add_argument("--model", choices=["rfdetr", "yolo", "both"], default="both")
+    args = p.parse_args()
+    if args.model in ("rfdetr", "both"):
+        train_rfdetr()
+    if args.model in ("yolo", "both"):
+        train_yolo()
