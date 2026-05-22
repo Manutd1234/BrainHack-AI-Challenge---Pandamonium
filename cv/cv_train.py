@@ -20,7 +20,13 @@ def train_rfdetr(data_dir="data/til26"):
     print("STARTING RF-DETR-LARGE TRAINING (50 EPOCHS)")
     print("=" * 60)
     from rfdetr import RFDETRLarge
-    model = RFDETRLarge(num_classes=len(CLASSES), pretrained=True)
+    try:
+        model = RFDETRLarge(num_classes=len(CLASSES), pretrain_weights=True)
+    except Exception:
+        try:
+            model = RFDETRLarge(num_classes=len(CLASSES), pretrain_weights="coco")
+        except Exception:
+            model = RFDETRLarge(num_classes=len(CLASSES))
     model.train(
         dataset_dir=data_dir, epochs=50, batch_size=8,
         lr=1e-4, lr_encoder=1e-5, resolution=800,
