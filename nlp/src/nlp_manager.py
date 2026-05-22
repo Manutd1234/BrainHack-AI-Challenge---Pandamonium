@@ -94,10 +94,16 @@ class NLPManager:
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         logger.info(f"Device: {self.device}")
 
-        self._load_embedder()
-        self._load_reranker()
-        self._load_reader()
-        self._load_qa_cache()
+        # Models initialized to None (loaded lazily)
+        self.embedder = None
+        self.reranker = None
+        self.reader = None
+        
+        self.qa_questions: list[str] = []
+        self.qa_answers:   list[str] = []
+        self.qa_index:     Optional[faiss.Index] = None
+        self.exact_qa_cache: dict[str, str] = {}
+        self.models_loaded = False
 
         # Corpus state
         self.chunks:         list[str]             = []
@@ -108,7 +114,18 @@ class NLPManager:
         self.sparse_vecs:    list[dict]            = []
         self.sparse_inverted_index = defaultdict(list)
 
-        logger.info("NLPManager ready")
+        logger.info("NLPManager created (models will load lazily on first request)")
+
+    def _ensure_models_loaded(self):
+        if self.models_loaded:
+            return
+        logger.info("Lazily loading all NLP models and Q&A cache...")
+        self._load_embedder()
+        self._load_reranker()
+        self._load_reader()
+        self._load_qa_cache()
+        self.models_loaded = True
+        logger.info("All NLP models and Q&A cache loaded successfully.")
 
     # ── Checks ────────────────────────────────────────────────────────────
 
@@ -273,6 +290,7 @@ class NLPManager:
         return dense, sparse, colbert
 
     def load_corpus(self, documents: list[dict]):
+        self._ensure_models_loaded()
         logger.info(f"Building corpus: {len(documents)} documents ...")
         self.chunks.clear()
         self.chunk_docids.clear()
@@ -487,6 +505,7 @@ class NLPManager:
         Returns (answer_text, doc_ids, path).
         path: "cache" | "extractive" | "l4" | "l5_extractive"
         """
+        self._ensure_models_loaded()
 
         # 1. QA cache lookup — fastest possible path
         cached = self._qa_cache_lookup(question)
