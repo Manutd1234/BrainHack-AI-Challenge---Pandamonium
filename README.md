@@ -1,156 +1,83 @@
-# 🧠 BrainHack_V2 — Team Pandamonium
+# BrainHack V2: Team Pandamonium TIL-AI 2026 Finals Stack
 
-> **TIL-AI 2026 · Novice Track**
-> Five containerized AI microservices for the TIL-AI 2026 hackathon.
+This repository contains Team Pandamonium's model containers for the TIL-AI 2026 Novice Finals. It is based on the official `til-ai/til-26` template and keeps each challenge as a standalone Docker service that can be built, tested, and submitted with the `til` CLI.
 
----
+The official challenge specifications define four scored model tasks: ASR, CV, NLP, and AE. Each task score is weighted 75% accuracy or reward and 25% inference speed. The overall score weights are ASR 20%, CV 20%, NLP 20%, and AE 40%. Noise is a finals gameplay component that adversarially perturbs opponents' CV inputs while respecting the image-similarity constraints.
 
-## All 5 Tasks
+## Repository Layout
 
-All builds use the `BrainHack_V2` directory (the best implementations):
+```text
+BrainHack_V2/
+├── ae/       # Autonomous Exploration agent, MaskablePPO plus BFS/A* fallback logic
+├── asr/      # Parakeet ASR, fine-tuned decoder checkpoints, correction pipeline
+├── cv/       # YOLOv11/Ultralytics detector pipeline for aircraft, vehicles, and vessels
+├── nlp/      # BM25-first RAG with optional dense/reranker/LLM components
+└── noise/    # YOLO-surrogate adversarial image noise generator
+```
 
-| Task | Model | Source Dir | Port |
-|------|-------|------------|------|
-| **ASR** | Parakeet-TDT 0.6B | `BrainHack_V2/asr` | `5001` |
-| **CV** | YOLO26x + RF-DETR ensemble | `BrainHack_V2/cv` | `5002` |
-| **Noise** | PGD w/ YOLO surrogate (speed-optimized) | `BrainHack_V2/noise` | `5003` |
-| **NLP** | BGE-M3 RAG + Reranker | `BrainHack_V2/nlp` | `5004` |
-| **AE** | SB3 PPO RL agent | `BrainHack_V2/ae` | `5005` |
+## Runtime Endpoints
 
----
+| Task | Route | Port | Output contract |
+| --- | --- | --- | --- |
+| ASR | `POST /asr` | `5001` | `{"predictions": ["transcript", ...]}` |
+| CV | `POST /cv` | `5002` | `{"predictions": [[{"bbox": [l,t,w,h], "category_id": int}], ...]}` |
+| Noise | `POST /noise` | `5003` | `{"predictions": ["BASE64_JPEG", ...]}` |
+| NLP | `POST /nlp` | `5004` | Corpus load, poll, and question-answer responses |
+| AE | `POST /ae`, `GET /reset` | `5005` | `{"predictions": [{"action": int}]}` |
 
-## 🚀 Quick Start (GCP Workbench)
+## Build, Test, Submit
+
+Set the repo path once per shell:
 
 ```bash
-# 0. Auth & environment
-cd ~
-export TEAM_NAME=pandamonium
-export TEAM_TRACK=novice
-export TIL_FOLDER=/home/jupyter
-gcloud auth configure-docker asia-southeast1-docker.pkg.dev
-
-# 1. Pull latest code
-cd ~/BrainHack_V2
-git pull origin main
-
-# 2. Prep: copy CV model as noise surrogate
-cp ~/BrainHack_V2/cv/model/best.pt ~/BrainHack_V2/noise/model/best.pt
-
-# 3. Build all 5 images
-til build asr v20
-til build cv v20
-til build noise v20
-til build nlp v20
-til build ae v20
-
-# 4. Test locally (optional)
-til test asr v20
-til test cv v20
-til test noise v20
-til test nlp v20
-til test ae v20
-
-# 5. Submit for evaluation
-til submit asr v20
-til submit cv v20
-til submit noise v20
-til submit nlp v20
-til submit ae v20
+export TIL_FOLDER=/home/jupyter/BrainHack_clean/BrainHack_V2
 ```
 
----
+Build and test an individual task:
 
-## 📂 Project Structure
-
-```
-BrainHack_V2/
-├── asr/                    # Automatic Speech Recognition
-│   ├── Dockerfile
-│   ├── src/
-│   │   ├── asr_manager.py  # Parakeet-TDT 0.6B + optional Whisper rescue
-│   │   └── asr_server.py   # FastAPI server on port 5001
-│   ├── model/              # Pre-downloaded Parakeet .nemo checkpoint
-│   └── requirements.txt
-│
-├── cv/                     # Computer Vision (Object Detection)
-│   ├── Dockerfile
-│   ├── src/
-│   │   ├── cv_manager.py   # YOLO26x + RF-DETR ensemble + WBF fusion
-│   │   └── cv_server.py    # FastAPI server on port 5002
-│   ├── model/              # best.pt (YOLO) + rfdetr_best.pt
-│   └── requirements.txt
-│
-├── noise/                  # Adversarial Noise Generation
-│   ├── Dockerfile
-│   ├── src/
-│   │   ├── noise_manager.py # PGD attack with YOLO surrogate (speed-optimized)
-│   │   └── noise_server.py  # FastAPI server on port 5003
-│   ├── model/              # Copy of cv/model/best.pt as surrogate
-│   └── requirements.txt
-│
-├── nlp/                    # Natural Language Processing (QA)
-│   ├── Dockerfile
-│   ├── src/
-│   │   ├── nlp_manager.py  # BGE-M3 dense+sparse retrieval + BM25 + reranker
-│   │   └── nlp_server.py   # FastAPI server on port 5004
-│   └── requirements.txt
-│
-└── ae/                     # Agent Environment (Reinforcement Learning)
-    ├── Dockerfile
-    ├── src/
-    │   ├── ae_manager.py   # PPO policy + BFS rule-based hybrid fallback
-    │   └── ae_server.py    # FastAPI server on port 5005
-    ├── model/              # policy.zip (SB3 PPO checkpoint)
-    └── requirements.txt
+```bash
+cd "$TIL_FOLDER"
+til build asr v43
+til test asr v43
 ```
 
----
+Submit to automatic evaluation:
 
-## 🔧 Task Details
+```bash
+til submit asr v43
+```
 
-### ASR — Parakeet-TDT 0.6B
-- **Model**: `nvidia/parakeet-tdt-0.6b-v2` (NeMo ASR)
-- **Features**: Batch transcription, fp16 autocast, optional Whisper-large-v3-turbo rescue for blank outputs, domain term correction, audio memory caching
-- **Input**: Base64 WAV audio → **Output**: Transcribed text
+Repeat the same pattern for `ae`, `cv`, `nlp`, and `noise`.
 
-### CV — YOLO26x + RF-DETR Ensemble
-- **Primary**: Fine-tuned YOLO26x on TIL-26 dataset (18 vehicle classes)
-- **Ensemble**: RF-DETR Large as secondary detector
-- **Post-processing**: Weighted Box Fusion (WBF), per-class confidence thresholds, high-resolution fallback at 1536px
-- **Input**: Base64 JPEG image → **Output**: COCO-format detections `[{bbox, category_id}]`
+## Model Summary
 
-### Noise — Speed-Optimized PGD Attack
-- **Method**: Projected Gradient Descent using the fine-tuned YOLO model as a white-box surrogate
-- **Speed optimizations** (quality=1.000, speed improved from 0.546):
-  - PGD steps: 20 → **7**
-  - SSIM bisection: 24 → **8** iterations
-  - Attack resolution: 1280 → **640px**
-  - GPU fp16 autocast enabled
-  - SSIM window: 7 → **3**
-- **Input**: Base64 JPEG image → **Output**: Base64 adversarial JPEG (SSIM ≥ 0.85)
+### ASR
 
-### NLP — BGE-M3 RAG Pipeline
-- **Retrieval**: BGE-M3 (dense + sparse) + BM25 hybrid scoring with sentence windowing
-- **Reranking**: BGE-reranker-large for top-k re-scoring
-- **Features**: Approximate answer lookup, QA memory cache, configurable LLM mode (Qwen3 optional)
-- **Input**: Question + document corpus → **Output**: Answer string
+The ASR module uses NVIDIA Parakeet TDT as the acoustic model. The strongest local checkpoint is a decoder fine-tuned Parakeet v2 model with safe phrase corrections, TF32/FP16 inference, sorted batching, persistent temporary WAV reuse, and a carefully selected audio duration cap. See [asr/README.md](asr/README.md).
 
-### AE — PPO Reinforcement Learning Agent
-- **Algorithm**: Stable-Baselines3 PPO with hybrid policy
-- **Fallback**: BFS rule-based agent when no trained checkpoint exists
-- **Input**: Game state observation → **Output**: Action integer
+### CV
 
----
+The CV module uses an Ultralytics YOLOv11-style detector workflow, with threshold tuning, optional model ensembling, optional high-resolution fallback, and LTWH output conversion for the challenge contract. See [cv/README.md](cv/README.md).
 
-## 📋 Important Notes
+### Noise
 
-- **Version tags are arbitrary** — use any string (`v20`, `v21`, etc.). Just ensure `til build` and `til submit` use the **same tag**.
-- **Noise needs the CV model** — always copy `cv/model/best.pt` to `noise/model/best.pt` before building noise.
-- **No internet at runtime** — all model weights must be baked into Docker images during build.
-- **GPU required** — ASR, CV, and Noise containers need NVIDIA GPU access (`--gpus all`).
+The Noise module uses a YOLO surrogate to generate adversarial image perturbations under SSIM/RMSE-style visual constraints. When the surrogate checkpoint is missing, it falls back to deterministic bounded noise. See [noise/README.md](noise/README.md).
 
----
+### NLP
 
-## 👥 Team Pandamonium
+The NLP module is BM25-first RAG. It indexes the provided corpus at runtime, retrieves candidate chunks/documents with sparse lexical scoring, optionally augments/reranks with neural components, and answers with extractive heuristics or a quantized LLM when enabled. See [nlp/README.md](nlp/README.md).
 
-TIL-AI 2026 Hackathon — Novice Track
+### AE
+
+The AE module combines MaskablePPO training with feature engineering, action masking, reward shaping, and a rule-based BFS/A* fallback for robust navigation in the fixed Novice map. See [ae/README.md](ae/README.md).
+
+## Files Not Committed
+
+Large model artifacts are intentionally expected to be copied into each task's `model/` directory before build. The repository keeps `.gitkeep` placeholders where checkpoints should be placed. This avoids accidentally pushing multi-GB `.pt`, `.zip`, or `.nemo` files.
+
+## Useful Official References
+
+- Challenge specifications: https://github.com/til-ai/til-26/wiki/Challenge-specifications
+- Template repository: https://github.com/til-ai/til-26
+- Finals repository: https://github.com/til-ai/til-26-finals
+- Finals submission flow: https://github.com/til-ai/til-26/wiki/Finals-competition-flow#how-to-submit

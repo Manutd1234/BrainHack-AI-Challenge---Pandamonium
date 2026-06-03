@@ -1,13 +1,20 @@
-"""Runs the ASR server."""
+"""ASR FastAPI server. Single-process, single GPU."""
 
-# Unless you want to do something special with the server, you shouldn't need
-# to change anything in this file.
+from __future__ import annotations
 
-
+import asyncio
 import base64
+import logging
+import time
+from typing import Any
+
+from fastapi import FastAPI, Request
 
 from asr_manager import ASRManager
-from fastapi import FastAPI, Request
+
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("asr")
 
 app = FastAPI()
 manager = ASRManager()
@@ -15,28 +22,21 @@ manager = ASRManager()
 
 @app.post("/asr")
 async def asr(request: Request) -> dict[str, list[str]]:
-    """Performs ASR on audio files.
+    body = await request.json()
+    instances = body.get("instances") or []
 
-    Args:
-        request: The API request. Contains a list of audio files, encoded in
-            base-64.
+    payloads: list[bytes] = []
+    for inst in instances:
+        b64 = inst.get("b64") if isinstance(inst, dict) else None
+        payloads.append(base64.b64decode(b64) if b64 else b"")
 
-    Returns:
-        A `dict` with a single key, `"predictions"`, mapping to a `list` of
-        `str` transcriptions, in the same order as which appears in `request`.
-    """
-
-    inputs_json = await request.json()
-
-    audio_payloads = [
-        base64.b64decode(instance["b64"]) for instance in inputs_json["instances"]
-    ]
-    predictions = manager.asr_many(audio_payloads)
-
+    t0 = time.perf_counter()
+    predictions = await asyncio.to_thread(manager.asr_many, payloads)
+    dt = time.perf_counter() - t0
+    log.info("asr n=%d total=%.2fs avg=%.2fs", len(payloads), dt, dt / max(1, len(payloads)))
     return {"predictions": predictions}
 
 
 @app.get("/health")
 def health() -> dict[str, str]:
-    """Health check endpoint for the server."""
     return {"message": "health ok"}

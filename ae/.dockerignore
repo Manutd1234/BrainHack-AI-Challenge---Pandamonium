@@ -1,7 +1,16 @@
-__pycache__/
-*.pyc
-.pytest_cache/
-logs/
+# Training stuff that does NOT belong in the inference image
+train.py
+requirements-train.txt
+models/snapshots/
+models/ckpts/
+models/tb/
 runs/
-model/checkpoints/
-model/best/
+*.pyc
+__pycache__/
+.venv/
+venv/
+.git/
+.gitignore
+README.md
+*.ipynb
+.DS_Store

@@ -1,19 +1,20 @@
-# AE
+# AE: Autonomous Exploration Agent
 
-Your AE challenge is to direct your agent through the Bomberman map while
-collecting rewards, placing bombs, and avoiding frozen downtime.
+This module serves the Autonomous Exploration challenge on `POST /ae` at port `5005` and resets round state through `GET /reset`.
 
-## Input
+AE is the highest-weighted challenge in the TIL-AI scoring mix. The Novice map is fixed, which makes a hybrid of reinforcement learning and classical path planning attractive.
 
-The TIL endpoint is `POST /ae` on port `5005`:
+## Input and Output
 
-```JSON
+Input:
+
+```json
 {
   "instances": [
     {
       "observation": {
-        "agent_viewcone": [[[0, "..."]]],
-        "base_viewcone": [[[0, "..."]]],
+        "agent_viewcone": [[[0]]],
+        "base_viewcone": [[[0]]],
         "direction": 0,
         "location": [0, 0],
         "base_location": [0, 0],
@@ -21,51 +22,132 @@ The TIL endpoint is `POST /ae` on port `5005`:
         "frozen_ticks": 0,
         "base_health": [100.0],
         "team_resources": [0.0],
-        "team_bombs": 3,
+        "team_bombs": 0,
         "step": 0,
-        "action_mask": [1, 1, 1, 1, 1, 1]
+        "action_mask": [1, 1, 1, 1, 1, 0]
       }
     }
   ]
 }
 ```
 
-The response is:
+Output:
 
-```Python
+```json
 {
-    "predictions": [{"action": 0}]
+  "predictions": [
+    {
+      "action": 0
+    }
+  ]
 }
 ```
 
-Actions are `0=FORWARD`, `1=BACKWARD`, `2=LEFT`, `3=RIGHT`, `4=STAY`, and
-`5=PLACE_BOMB`.
+The action is one of the legal discrete environment actions. The manager always respects `action_mask`; if the learned policy proposes an illegal action, a legal fallback is selected.
 
-## Implementation
+## Architecture
 
-The manager first tries to load `model/policy.zip` as a MaskablePPO/PPO policy.
-If no checkpoint exists, it uses a deterministic rule fallback that:
+The AE design combines:
 
-- Resets memory automatically when `step == 0`.
-- Parses the 25-channel viewcone into a local map.
-- Prioritizes mission, resource, and recon tiles.
-- Places bombs when enemy bases or agents are inside blast range.
-- Uses BFS frontier exploration when no reward target is known.
-- Respects `action_mask` before returning an action.
+- MaskablePPO from `sb3-contrib`.
+- CNN/MLP feature extraction for `agent_viewcone`, `base_viewcone`, and scalar state.
+- Reward shaping for faster early learning.
+- Opponent snapshots for league-style self-play.
+- BFS/A* style fallback behavior when the policy is uncertain or invalid.
 
-Build immediately with the rule fallback:
+## Why PPO plus BFS/A*
 
-```bash
-docker build -t pandamonium-ae:v2 .
-docker run -p 5005:5005 pandamonium-ae:v2
+PPO learns tactical behavior from interaction, but the Novice map has strong path-planning structure. BFS/A* style logic is useful for:
+
+- reaching mission/challenge tiles,
+- escaping local loops,
+- returning toward base or safe zones,
+- selecting a valid movement when the policy emits an invalid action,
+- keeping behavior deterministic during bad observations.
+
+The final inference stack favors the trained policy but keeps rule-based navigation as a safety net.
+
+## Training Files
+
+```text
+ae/
+├── train.py                   # phased PPO training entrypoint
+├── requirements-train.txt     # training dependencies
+├── requirements.txt           # inference dependencies
+├── src/
+│   ├── ae_manager.py          # policy loading and action selection
+│   ├── ae_server.py           # FastAPI service
+│   ├── features.py            # neural feature extractor
+│   ├── obs_utils.py           # observation packing
+│   └── wrappers.py            # environment wrapper, masks, shaping
+└── model/                     # inference policy location
 ```
 
-Optional PPO training:
+## Training Recipe
+
+Create an isolated venv and install training dependencies:
 
 ```bash
-pip install -e /path/to/til-26-ae
-pip install -r requirements.txt
-python ae_train.py
+cd /home/jupyter/BrainHack_clean/BrainHack_V2/ae
+python -m venv .venv_ae
+source .venv_ae/bin/activate
+pip install -r requirements-train.txt
 ```
 
-That writes `model/policy.zip`; rebuild the Docker image to include it.
+If `til_environment` is not installed in the venv, point Python to the local reference environment:
+
+```bash
+export PYTHONPATH=/home/jupyter/reference-til26/til-26-ae:$PYTHONPATH
+```
+
+Train in phases:
+
+```bash
+python train.py --phase 1 --total-envs 16 --device cuda --out-dir models
+python train.py --phase 2 --total-envs 8 --device cuda --resume models/phase1_final.zip --out-dir models
+python train.py --phase 3 --total-envs 8 --device cuda --resume models/phase2_final.zip --out-dir models
+```
+
+If phase 2 or phase 3 is unstable at 16 environments, reduce to 8 environments. This reduces throughput but often improves stability.
+
+Prepare the inference checkpoint:
+
+```bash
+cp -f models/phase3_final.zip models/ae_policy.zip
+```
+
+If only phase 1 completed and a quick inference build is required:
+
+```bash
+cp -f models/phase1_final.zip models/ae_policy.zip
+```
+
+## TensorBoard
+
+```bash
+cd /home/jupyter/BrainHack_clean/BrainHack_V2/ae
+source .venv_ae/bin/activate
+python -m pip install "setuptools<81" tensorboard
+tensorboard --logdir models/tb --port 6006 --host 0.0.0.0
+```
+
+Open the forwarded Workbench/Jupyter port for `6006`.
+
+## Build and Submit
+
+```bash
+export TIL_FOLDER=/home/jupyter/BrainHack_clean/BrainHack_V2
+cd "$TIL_FOLDER/ae"
+
+ls -lh models/ae_policy.zip
+til build ae v10
+til test ae v10
+til submit ae v10
+```
+
+## Debug Checklist
+
+- If `ae_policy.zip.zip` appears in logs, the manager path appended `.zip` twice.
+- If `numpy._core.numeric` is missing, align inference `numpy` and SB3 versions with the training environment.
+- If `ModuleNotFoundError: src` appears while loading the checkpoint, the training wrapper module paths changed. Keep `src/` package structure consistent.
+- If local test imports `pettingzoo.utils.AgentSelector` incorrectly, restore the environment's pinned `gymnasium` and `pettingzoo` versions.

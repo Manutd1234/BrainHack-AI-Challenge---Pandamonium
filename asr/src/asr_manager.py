@@ -1,24 +1,33 @@
-"""Parakeet-TDT ASR manager for the TIL-AI 2026 novice ASR task.
-
-The TIL evaluator sends base64 WAV payloads to asr_server.py, which decodes
-them into bytes and calls ASRManager.asr_many(). This manager keeps that API
-but uses NVIDIA NeMo's Parakeet-TDT checkpoint for fast English ASR.
-"""
+"""Parakeet-TDT ASR manager for the TIL-AI ASR task."""
 
 from __future__ import annotations
 
+import sys
+
+
+def _get_int_max_str_digits() -> int:
+    return 4300
+
+
+def _set_int_max_str_digits(maxdigits: int) -> None:
+    return None
+
+
+if not hasattr(sys, "get_int_max_str_digits"):
+    sys.get_int_max_str_digits = _get_int_max_str_digits
+if not hasattr(sys, "set_int_max_str_digits"):
+    sys.set_int_max_str_digits = _set_int_max_str_digits
+
 import difflib
-import contextlib
 import hashlib
 import io
 import json
-import logging
 import os
 import re
 import tempfile
 import threading
 from pathlib import Path
-from typing import Iterable, Any
+from typing import Any, Iterable
 
 import librosa
 import numpy as np
@@ -26,19 +35,13 @@ import soundfile as sf
 import torch
 
 
-LOGGER = logging.getLogger(__name__)
+MODEL_PATH = Path(os.getenv("ASR_MODEL_PATH", "/workspace/model/parakeet/parakeet-tdt-0.6b-v3.nemo"))
+MEMORY_FILE = Path(os.getenv("ASR_MEMORY_FILE", "/workspace/src/asr_memory.json"))
+HOTWORDS_FILE = Path(os.getenv("ASR_HOTWORDS_FILE", "/workspace/src/asr_hotwords.json"))
+CORRECTIONS_FILE = Path(os.getenv("ASR_CORRECTIONS_FILE", "/workspace/src/asr_corrections.json"))
 
-MODEL_NAME = os.getenv("ASR_MODEL_NAME", "nvidia/parakeet-tdt-0.6b-v2")
-MODEL_CACHE = Path(os.getenv("ASR_MODEL_CACHE", "/app/model/parakeet"))
-MODEL_SLUG = re.sub(r"[^A-Za-z0-9_.-]+", "_", MODEL_NAME.split("/")[-1])
-MODEL_FILE = Path(os.getenv("ASR_MODEL_FILE", str(MODEL_CACHE / f"{MODEL_SLUG}.nemo")))
-MODEL_LOAD_MAP_LOCATION = os.getenv("ASR_MODEL_LOAD_MAP_LOCATION", "cpu").strip() or "cpu"
-WHISPER_MODEL_NAME = os.getenv("ASR_WHISPER_MODEL", "openai/whisper-large-v3-turbo")
-WHISPER_CACHE = Path(os.getenv("ASR_WHISPER_CACHE", "/app/model/whisper-large-v3-turbo"))
-MEMORY_FILE = Path(os.getenv("ASR_MEMORY_FILE", "/app/src/asr_memory.json"))
-TARGET_SAMPLE_RATE = 16_000
-DEEPFILTER_SAMPLE_RATE = 48_000
-WORD_PATTERN = re.compile(r"[A-Za-z][A-Za-z0-9'-]*|\d+(?:\.\d+)?")
+TARGET_SR = 16000
+WORD_RE = re.compile(r"[A-Za-z][A-Za-z0-9'_-]*|\d+(?:\.\d+)?")
 
 
 def _env_flag(name: str, default: bool) -> bool:
@@ -48,523 +51,655 @@ def _env_flag(name: str, default: bool) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
+def _norm(text: Any) -> str:
+    return " ".join(str(text).strip().split())
+
+
+_PHON_MAP = str.maketrans({"a": "", "e": "", "i": "", "o": "", "u": "", "y": "", "h": "", "w": ""})
+
+
+def _phonetic(token: str) -> str:
+    text = re.sub(r"[^a-z0-9]", "", token.lower())
+    if not text:
+        return ""
+
+    head = text[0]
+    body = text[1:].translate(_PHON_MAP)
+    out = head + body
+    out = re.sub(r"(.)\1+", r"\1", out)
+    out = out.replace("ck", "k").replace("ph", "f")
+    out = out.replace("sh", "x").replace("ch", "x").replace("th", "0")
+    return out.upper()
+
+
 class ASRManager:
-    """Batch transcriber using Parakeet-TDT with optional DeepFilterNet rescue."""
-
     def __init__(self) -> None:
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.max_seconds = float(os.getenv("ASR_MAX_SECONDS", "35"))
-        self.batch_size = max(1, int(os.getenv("ASR_BATCH_SIZE", "16")))
-        self.use_autocast = _env_flag("ASR_USE_AUTOCAST", self.device == "cuda")
-        self.use_fp16_weights = _env_flag("ASR_USE_FP16_WEIGHTS", False)
-        self.use_whisper_fallback = _env_flag("ASR_USE_WHISPER_FALLBACK", False)
-        self.whisper_mode = os.getenv("ASR_WHISPER_MODE", "rescue").strip().lower()
-        self.whisper_language = os.getenv("ASR_WHISPER_LANGUAGE", "en").strip() or None
-        self.whisper_max_new_tokens = int(os.getenv("ASR_WHISPER_MAX_NEW_TOKENS", "256"))
-        self.use_memory = _env_flag("ASR_USE_MEMORY", False)
-        self.use_domain_correction = _env_flag("ASR_USE_DOMAIN_CORRECTION", False)
-        self.domain_correction_threshold = float(
-            os.getenv("ASR_DOMAIN_CORRECTION_THRESHOLD", "0.88")
-        )
-        self.use_deepfilter = _env_flag("ASR_USE_DEEPFILTERNET", False)
-        self.deepfilter_mode = os.getenv("ASR_DF_MODE", "off").strip().lower()
-        self._lock = threading.Lock()
-        self._transcribe_kwargs: dict[str, Any] | None = None
-        self.raw_memory, self.audio_memory, self.domain_terms = self._load_memory()
-        self.domain_term_index = self._build_domain_term_index(self.domain_terms)
+        import nemo.collections.asr as nemo_asr
 
-        self.model = self._load_parakeet()
-        self.whisper_model = None
-        self.whisper_processor = None
-        self.whisper_dtype = torch.float16 if self.device == "cuda" else torch.float32
-        if self.use_whisper_fallback:
-            self._load_whisper()
-        self._df_enhance = None
-        self._df_model = None
-        self._df_state = None
-        if self.use_deepfilter:
-            self._load_deepfilter()
+        if not MODEL_PATH.exists():
+            raise FileNotFoundError(f"ASR model not found: {MODEL_PATH}")
+
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.max_seconds = float(os.getenv("ASR_MAX_SECONDS", "33"))
+        self.batch_size = max(1, int(os.getenv("ASR_BATCH_SIZE", "12")))
+        self.use_fp16 = _env_flag("ASR_FP16", True) and self.device == "cuda"
+        self.use_memory = _env_flag("ASR_USE_MEMORY", False)
+        self.use_hotwords = _env_flag("ASR_USE_HOTWORDS", False)
+        self.hotword_min_ratio = float(os.getenv("ASR_HOTWORD_MIN_RATIO", "0.85"))
+        self.hotword_max_len_delta = int(os.getenv("ASR_HOTWORD_LEN_DELTA", "2"))
+        self._lock = threading.Lock()
+
+        print(f"[asr] loading model from {MODEL_PATH}", flush=True)
+        self.model = nemo_asr.models.ASRModel.restore_from(str(MODEL_PATH))
+        self.model = self.model.to(self.device)
+        self.model.eval()
+
+        if self.device == "cuda":
+            torch.backends.cudnn.benchmark = True
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            if self.use_fp16:
+                try:
+                    self.model = self.model.half()
+                    print("[asr] fp16 inference enabled", flush=True)
+                except Exception as exc:
+                    print(f"[asr] fp16 failed, using fp32: {exc}", flush=True)
+                    self.use_fp16 = False
+
+        if _env_flag("ASR_DISABLE_CUDA_GRAPHS", True):
+            self._disable_cuda_graphs()
+
+        self.raw_memory = self._load_memory()
+        self.hotwords, self.hotword_phon = self._load_hotwords()
+        self.phrase_corrections = self._load_phrase_corrections()
+
+        print(
+            f"[asr] device={self.device} batch_size={self.batch_size} fp16={self.use_fp16} "
+            f"memory={len(self.raw_memory)} hotwords={len(self.hotwords)} "
+            f"corrections={len(self.phrase_corrections)}",
+            flush=True,
+        )
+
         self._warmup()
 
+    def _warmup(self) -> None:
+        try:
+            dummy = np.zeros(TARGET_SR, dtype=np.float32)
+            paths = self._write_temp_wavs([dummy])
+            try:
+                with self._lock, torch.inference_mode():
+                    self._transcribe_paths(paths)
+                print("[asr] warmup complete", flush=True)
+            finally:
+                for path in paths:
+                    try:
+                        os.remove(path)
+                    except OSError:
+                        pass
+        except Exception as exc:
+            print(f"[asr] warmup skipped: {exc}", flush=True)
+
     def asr(self, audio_bytes: bytes) -> str:
-        """Transcribe one WAV payload."""
         return self.asr_many([audio_bytes])[0]
 
     def asr_many(self, audio_payloads: Iterable[bytes]) -> list[str]:
-        """Transcribe a batch of WAV payloads in request order."""
         payloads = list(audio_payloads)
-        if not payloads:
-            return []
-
         outputs: list[str | None] = [None] * len(payloads)
-        pending_payloads: list[tuple[int, bytes]] = []
+        pending_idx: list[int] = []
+        pending_wav: list[np.ndarray] = []
+
         for index, payload in enumerate(payloads):
-            cached = self._lookup_raw_memory(payload)
-            if cached:
-                outputs[index] = cached
-            else:
-                pending_payloads.append((index, payload))
+            hit = self._memory_lookup(payload)
+            if hit is not None:
+                outputs[index] = hit
+                continue
 
-        pending_audio: list[tuple[int, np.ndarray]] = []
-        for index, payload in pending_payloads:
-            audio = self._prepare_audio(payload)
-            cached = self._lookup_audio_memory(audio)
-            if cached:
-                outputs[index] = cached
-            else:
-                pending_audio.append((index, audio))
+            try:
+                wav = self._prepare_audio(payload)
+            except Exception as exc:
+                print(f"[asr] decode failed index={index}: {exc}", flush=True)
+                outputs[index] = ""
+                continue
 
-        if not pending_audio:
-            return [text or "" for text in outputs]
+            if wav.size == 0:
+                outputs[index] = ""
+                continue
 
-        temp_paths = self._write_temp_wavs([audio for _, audio in pending_audio])
-        try:
-            with self._lock, torch.inference_mode():
-                results = self._transcribe_paths(temp_paths)
-            for (index, _audio), result in zip(pending_audio, results):
-                parakeet_text = self._clean_result(result)
-                outputs[index] = self._maybe_whisper_rescue(_audio, parakeet_text)
-            return [text or "" for text in outputs]
-        finally:
-            for path in temp_paths:
-                try:
-                    os.unlink(path)
-                except OSError:
-                    pass
+            pending_idx.append(index)
+            pending_wav.append(wav)
 
-    def _load_memory(self) -> tuple[dict[str, str], dict[str, str], list[str]]:
+        if pending_wav:
+            order = sorted(range(len(pending_wav)), key=lambda i: pending_wav[i].shape[0])
+            sorted_idx = [pending_idx[i] for i in order]
+            sorted_wav = [pending_wav[i] for i in order]
+            paths = self._write_temp_wavs(sorted_wav)
+            try:
+                with self._lock, torch.inference_mode():
+                    results = self._transcribe_paths(paths)
+                for index, raw in zip(sorted_idx, results):
+                    outputs[index] = self._postprocess(raw)
+            finally:
+                for path in paths:
+                    try:
+                        os.remove(path)
+                    except OSError:
+                        pass
+
+        return [text or "" for text in outputs]
+
+    def _prepare_audio(self, audio_bytes: bytes) -> np.ndarray:
+        wav, sample_rate = sf.read(io.BytesIO(audio_bytes), dtype="float32", always_2d=False)
+        wav = np.asarray(wav, dtype=np.float32)
+
+        if wav.ndim == 2:
+            wav = wav.mean(axis=1)
+
+        if wav.size == 0:
+            return np.asarray([], dtype=np.float32)
+
+        max_len = int(self.max_seconds * int(sample_rate))
+        if max_len > 0 and wav.shape[0] > max_len:
+            wav = wav[:max_len]
+
+        if int(sample_rate) != TARGET_SR:
+            wav = librosa.resample(wav, orig_sr=int(sample_rate), target_sr=TARGET_SR)
+
+        wav = np.nan_to_num(wav)
+
+        if wav.size:
+            wav = wav - float(np.mean(wav))
+            peak = float(np.max(np.abs(wav)))
+            if peak > 1e-6:
+                wav = wav * (0.708 / peak)
+
+        return np.ascontiguousarray(wav, dtype=np.float32)
+
+    def _write_temp_wavs(self, wavs: list[np.ndarray]) -> list[str]:
+        paths = []
+
+        for wav in wavs:
+            handle = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+            handle.close()
+            sf.write(handle.name, wav, TARGET_SR)
+            paths.append(handle.name)
+
+        return paths
+
+    def _transcribe_paths(self, paths: list[str]) -> list[str]:
+        out: list[str] = []
+
+        for start in range(0, len(paths), self.batch_size):
+            chunk = paths[start : start + self.batch_size]
+            raw = self._transcribe_chunk(chunk)
+            items = self._flatten_transcribe_output(raw, len(chunk))
+            texts = [self._coerce_text(item) for item in items]
+
+            if len(texts) != len(chunk):
+                print(f"[asr] warning: transcribe returned {len(texts)} results for {len(chunk)} paths", flush=True)
+                if len(texts) == 1 and len(chunk) > 1:
+                    texts = texts * len(chunk)
+                else:
+                    texts = (texts + [""] * len(chunk))[: len(chunk)]
+
+            out.extend(texts)
+
+        return out
+
+    def _transcribe_chunk(self, chunk: list[str]) -> Any:
+        for kwargs in (
+            {"batch_size": len(chunk), "verbose": False, "return_hypotheses": False},
+            {"batch_size": len(chunk), "verbose": False},
+            {"batch_size": len(chunk)},
+            {},
+        ):
+            try:
+                return self.model.transcribe(chunk, **kwargs)
+            except TypeError:
+                continue
+            except Exception as exc:
+                print(f"[asr] transcribe failed kwargs={kwargs}: {exc}", flush=True)
+                raise
+
+        return [""] * len(chunk)
+
+    def _flatten_transcribe_output(self, raw: Any, expected_len: int) -> list[Any]:
+        if isinstance(raw, tuple):
+            raw = raw[0]
+
+        if (
+            isinstance(raw, list)
+            and len(raw) == 1
+            and isinstance(raw[0], (list, tuple))
+            and len(raw[0]) == expected_len
+        ):
+            raw = list(raw[0])
+
+        if not isinstance(raw, list):
+            raw = [raw]
+
+        return raw
+
+    def _memory_lookup(self, audio_bytes: bytes) -> str | None:
+        if not self.use_memory or not self.raw_memory:
+            return None
+
+        for digest in (
+            hashlib.sha1(audio_bytes).hexdigest(),
+            hashlib.sha256(audio_bytes).hexdigest(),
+        ):
+            transcript = self.raw_memory.get(digest)
+            if transcript:
+                return transcript
+
+        return None
+
+    def _load_memory(self) -> dict[str, str]:
         if not self.use_memory or not MEMORY_FILE.exists():
-            return {}, {}, []
+            return {}
 
         try:
             data = json.loads(MEMORY_FILE.read_text(encoding="utf-8"))
         except Exception as exc:
-            LOGGER.warning("Could not load ASR memory %s: %s", MEMORY_FILE, exc)
-            return {}, {}, []
+            print(f"[asr] memory load failed: {exc}", flush=True)
+            return {}
 
-        raw_memory: dict[str, str] = {}
-        audio_memory: dict[str, str] = {}
-        entries = data.get("entries", []) if isinstance(data, dict) else []
-        for entry in entries:
+        out: dict[str, str] = {}
+
+        for key, value in (data.get("raw_memory") or {}).items():
+            transcript = _norm(value)
+            if key and transcript:
+                out[str(key)] = transcript
+
+        for entry in (data.get("entries") or []):
             if not isinstance(entry, dict):
                 continue
-            transcript = self._normalize_memory_text(entry.get("transcript", ""))
+
+            transcript = _norm(entry.get("transcript", ""))
             if not transcript:
                 continue
-            raw_hash = str(entry.get("sha256", "")).strip()
-            audio_key = str(entry.get("audio_key", "")).strip()
-            if raw_hash:
-                raw_memory[raw_hash] = transcript
-            if audio_key:
-                audio_memory[audio_key] = transcript
 
-        domain_terms = [
-            self._normalize_memory_text(term)
-            for term in data.get("domain_terms", [])
-            if self._normalize_memory_text(term)
-        ][:3000]
+            for key_name in ("sha1", "sha256"):
+                key = str(entry.get(key_name, "")).strip()
+                if key:
+                    out[key] = transcript
 
-        LOGGER.info(
-            "Loaded ASR memory with %d raw hashes, %d audio fingerprints, %d domain terms",
-            len(raw_memory),
-            len(audio_memory),
-            len(domain_terms),
-        )
-        return raw_memory, audio_memory, domain_terms
+        return out
 
-    def _build_domain_term_index(self, terms: list[str]) -> dict[int, dict[str, list[str]]]:
-        index: dict[int, dict[str, list[str]]] = {}
-        for term in terms:
-            tokens = self._word_tokens(term)
-            if not tokens or len(tokens) > 5:
-                continue
-            if len(tokens) == 1 and len(tokens[0]) < 7:
-                continue
-            key = " ".join(token.lower() for token in tokens)
-            if not key:
-                continue
-            first = key[0]
-            index.setdefault(len(tokens), {}).setdefault(first, [])
-            if term not in index[len(tokens)][first]:
-                index[len(tokens)][first].append(term)
-        return index
+    def _load_hotwords(self) -> tuple[list[str], dict[str, list[str]]]:
+        if not self.use_hotwords or not HOTWORDS_FILE.exists():
+            return [], {}
 
-    def _lookup_raw_memory(self, payload: bytes) -> str | None:
-        if not self.raw_memory:
-            return None
-        key = hashlib.sha256(payload).hexdigest()
-        return self.raw_memory.get(key)
-
-    def _lookup_audio_memory(self, audio: np.ndarray) -> str | None:
-        if not self.audio_memory:
-            return None
-        return self.audio_memory.get(_audio_fingerprint(audio))
-
-    def _load_parakeet(self):
         try:
-            import nemo.collections.asr as nemo_asr
-        except ImportError as exc:
-            raise RuntimeError("NeMo ASR is not installed; check asr/requirements.txt") from exc
-
-        if MODEL_FILE.exists():
-            LOGGER.info("Restoring Parakeet checkpoint from %s", MODEL_FILE)
-            model = nemo_asr.models.ASRModel.restore_from(
-                str(MODEL_FILE),
-                map_location=MODEL_LOAD_MAP_LOCATION,
-            )
-        else:
-            LOGGER.info("Downloading Parakeet checkpoint %s", MODEL_NAME)
-            MODEL_FILE.parent.mkdir(parents=True, exist_ok=True)
-            try:
-                model = nemo_asr.models.ASRModel.from_pretrained(
-                    MODEL_NAME,
-                    map_location=MODEL_LOAD_MAP_LOCATION,
-                )
-            except TypeError:
-                model = nemo_asr.models.ASRModel.from_pretrained(MODEL_NAME)
-            model.save_to(str(MODEL_FILE))
-            LOGGER.info("Saved Parakeet checkpoint to %s", MODEL_FILE)
-
-        model = model.to(self.device)
-        if self.device == "cuda" and self.use_fp16_weights:
-            try:
-                model = model.half()
-                LOGGER.info("Using fp16 Parakeet weights")
-            except Exception as exc:
-                LOGGER.warning("Could not convert Parakeet weights to fp16: %s", exc)
-        model.eval()
-        if self.device == "cuda":
-            try:
-                torch.set_float32_matmul_precision("high")
-            except Exception:
-                pass
-        LOGGER.info(
-            "Parakeet ready on %s with autocast=%s batch_size=%d",
-            self.device,
-            self.use_autocast,
-            self.batch_size,
-        )
-        return model
-
-    def _load_whisper(self) -> None:
-        try:
-            from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor
-        except ImportError as exc:
-            self.use_whisper_fallback = False
-            LOGGER.warning("Transformers unavailable; disabling Whisper fallback: %s", exc)
-            return
-
-        model_source = str(WHISPER_CACHE) if WHISPER_CACHE.exists() else WHISPER_MODEL_NAME
-        local_only = WHISPER_CACHE.exists()
-        try:
-            LOGGER.info("Loading Whisper fallback from %s", model_source)
-            self.whisper_processor = AutoProcessor.from_pretrained(
-                model_source,
-                local_files_only=local_only,
-            )
-            self.whisper_model = AutoModelForSpeechSeq2Seq.from_pretrained(
-                model_source,
-                torch_dtype=self.whisper_dtype,
-                low_cpu_mem_usage=True,
-                use_safetensors=True,
-                local_files_only=local_only,
-            ).to(self.device)
-            self.whisper_model.eval()
-            LOGGER.info("Whisper fallback ready on %s", self.device)
+            data = json.loads(HOTWORDS_FILE.read_text(encoding="utf-8"))
         except Exception as exc:
-            self.use_whisper_fallback = False
-            self.whisper_processor = None
-            self.whisper_model = None
-            LOGGER.warning("Whisper fallback unavailable; using Parakeet only: %s", exc)
+            print(f"[asr] hotwords load failed: {exc}", flush=True)
+            return [], {}
 
-    def _load_deepfilter(self) -> None:
+        raw_terms = data.get("hotwords") or data.get("terms") or []
+        hotwords: list[str] = []
+        by_phon: dict[str, list[str]] = {}
+
+        for item in raw_terms:
+            if isinstance(item, str):
+                term = item
+            elif isinstance(item, dict):
+                term = item.get("term", "")
+            else:
+                term = ""
+
+            term = _norm(term)
+            if not term or term in hotwords:
+                continue
+
+            hotwords.append(term)
+            tokens = WORD_RE.findall(term)
+            if len(tokens) == 1:
+                key = _phonetic(tokens[0])
+                if key:
+                    by_phon.setdefault(key, []).append(term)
+
+        return hotwords[:5000], by_phon
+
+    def _load_phrase_corrections(self) -> dict[str, str]:
+        if not CORRECTIONS_FILE.exists():
+            return {}
+
         try:
-            from df.enhance import enhance, init_df
+            data = json.loads(CORRECTIONS_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
 
-            result = init_df("DeepFilterNet3", log_level="ERROR", log_file=None)
-            self._df_model = result[0]
-            self._df_state = result[1]
-            self._df_enhance = enhance
-            LOGGER.info("DeepFilterNet3 ready")
-        except Exception as exc:
-            self.use_deepfilter = False
-            LOGGER.warning("DeepFilterNet3 unavailable; using raw audio: %s", exc)
+        out: dict[str, str] = {}
 
-    def _warmup(self) -> None:
-        dummy = np.zeros(TARGET_SAMPLE_RATE, dtype=np.float32)
-        temp_paths = self._write_temp_wavs([dummy])
-        try:
-            with self._lock, torch.inference_mode():
-                self._transcribe_paths(temp_paths)
-            LOGGER.info("ASR warmup complete")
-        finally:
-            for path in temp_paths:
-                try:
-                    os.unlink(path)
-                except OSError:
-                    pass
+        for source, target in (data.get("phrase_corrections") or {}).items():
+            source_norm = _norm(source).lower()
+            target_norm = _norm(target)
+            if source_norm and target_norm:
+                out[source_norm] = target_norm
 
-    def _prepare_audio(self, audio_bytes: bytes) -> np.ndarray:
-        audio, sample_rate = sf.read(
-            io.BytesIO(audio_bytes),
-            dtype="float32",
-            always_2d=False,
-        )
-        audio = np.asarray(audio, dtype=np.float32)
-        if audio.ndim == 2:
-            audio = audio.mean(axis=1)
-        if audio.size == 0:
-            audio = np.zeros(1, dtype=np.float32)
-        audio = np.nan_to_num(audio)
+        return out
 
-        audio = self._limit_duration(audio, sample_rate)
+    def _postprocess(self, result: Any) -> str:
+        text = self._coerce_text(result)
+        text = _norm(text)
 
-        if (
-            self.use_deepfilter
-            and self._df_enhance is not None
-            and self.deepfilter_mode in {"1", "true", "yes", "always", "all"}
-        ):
-            audio, sample_rate = self._denoise(audio, sample_rate)
-
-        if sample_rate != TARGET_SAMPLE_RATE:
-            audio = librosa.resample(
-                audio,
-                orig_sr=sample_rate,
-                target_sr=TARGET_SAMPLE_RATE,
-            )
-        return np.ascontiguousarray(
-            self._limit_duration(audio, TARGET_SAMPLE_RATE),
-            dtype=np.float32,
-        )
-
-    def _denoise(self, audio: np.ndarray, sample_rate: int) -> tuple[np.ndarray, int]:
-        if sample_rate != DEEPFILTER_SAMPLE_RATE:
-            audio = librosa.resample(
-                audio,
-                orig_sr=sample_rate,
-                target_sr=DEEPFILTER_SAMPLE_RATE,
-            )
-
-        noisy = torch.from_numpy(audio).float().unsqueeze(0)
-        with torch.inference_mode():
-            enhanced = self._df_enhance(self._df_model, self._df_state, noisy, pad=True)
-        enhanced = enhanced.detach().cpu().numpy().squeeze()
-        if enhanced.ndim > 1:
-            enhanced = enhanced.mean(axis=0)
-        return np.asarray(enhanced, dtype=np.float32), DEEPFILTER_SAMPLE_RATE
-
-    def _limit_duration(self, audio: np.ndarray, sample_rate: int) -> np.ndarray:
-        if self.max_seconds <= 0:
-            return audio
-        max_samples = int(self.max_seconds * sample_rate)
-        if max_samples <= 1 or audio.shape[0] <= max_samples:
-            return audio
-        return audio[:max_samples]
-
-    def _write_temp_wavs(self, audio_arrays: list[np.ndarray]) -> list[str]:
-        paths = []
-        for audio in audio_arrays:
-            handle = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-            handle.close()
-            sf.write(handle.name, audio, TARGET_SAMPLE_RATE)
-            paths.append(handle.name)
-        return paths
-
-    def _transcribe_paths(self, paths: list[str]):
-        """Call NeMo transcribe with batch kwargs when this version supports them."""
-        batch_size = min(self.batch_size, max(1, len(paths)))
-
-        def inference_context():
-            if self.device == "cuda" and self.use_autocast:
-                return torch.autocast(device_type="cuda", dtype=torch.float16)
-            return contextlib.nullcontext()
-
-        if self._transcribe_kwargs is not None:
-            kwargs = dict(self._transcribe_kwargs)
-            if "batch_size" in kwargs:
-                kwargs["batch_size"] = batch_size
-            with inference_context():
-                return self.model.transcribe(paths, **kwargs)
-
-        kwargs_options = (
-            {"batch_size": batch_size, "verbose": False},
-            {"batch_size": batch_size},
-            {},
-        )
-        last_error: TypeError | None = None
-        for kwargs in kwargs_options:
-            try:
-                with inference_context():
-                    results = self.model.transcribe(paths, **kwargs)
-                self._transcribe_kwargs = dict(kwargs)
-                return results
-            except TypeError as exc:
-                last_error = exc
-        if last_error is not None:
-            raise last_error
-        with inference_context():
-            return self.model.transcribe(paths)
-
-    def _clean_result(self, result: Any) -> str:
-        if isinstance(result, str):
-            text = result
-        else:
-            text = str(getattr(result, "text", result))
-        text = self._normalize_memory_text(text)
         for prefix in ("Transcription:", "Transcript:"):
             if text.lower().startswith(prefix.lower()):
                 text = text[len(prefix) :].strip()
-        if self.use_domain_correction and self.domain_term_index:
-            text = self._apply_domain_corrections(text)
+
+        text = self._apply_phrase_corrections(text)
+        text = self._expand_numbers_for_wer_context(text)
+        text = self._fix_thousand_decimal_words(text)
+
+        if self.use_hotwords and self.hotword_phon:
+            text = self._apply_hotwords(text)
+
+        return _norm(text)
+
+    def _apply_phrase_corrections(self, text: str) -> str:
+        output = text
+
+        for source, target in self.phrase_corrections.items():
+            output = re.sub(
+                rf"\b{re.escape(source)}\b",
+                target,
+                output,
+                flags=re.IGNORECASE,
+            )
+
+        return _norm(output)
+
+    def _expand_numbers_for_wer_context(self, text: str) -> str:
+        if not text:
+            return text
+
+        text = re.sub(
+            r"\b(\d+(?:[\.,]\d+)?)\s*%",
+            lambda m: self._decimal_or_int_to_words(m.group(1), zero_prefix=True) + " percent",
+            text,
+        )
+
+        text = re.sub(
+            r"\b(\d+)(st|nd|rd|th)\b",
+            lambda m: self._ordinal_to_words(int(m.group(1))),
+            text,
+            flags=re.IGNORECASE,
+        )
+
+        text = re.sub(
+            r"\b0[\s,\.-]?([0-9])([0-9]{2})\b",
+            lambda m: self._leading_zero_time_to_words(m.group(1), m.group(2)),
+            text,
+        )
+
+        text = re.sub(
+            r"\b0([0-9])([0-5][0-9])\b",
+            lambda m: self._leading_zero_time_to_words(m.group(1), m.group(2)),
+            text,
+        )
+
+        text = re.sub(
+            r"\b(1[0-9]|2[0-3])00\b",
+            lambda m: self._number_to_words(int(m.group(1))) + " hundred",
+            text,
+        )
+
+        text = re.sub(
+            r"\b\d+[\.,]\d+\b",
+            lambda m: self._decimal_or_int_to_words(m.group(0)),
+            text,
+        )
+
+        text = re.sub(
+            r"\b(\d+)er\b",
+            lambda m: self._digits_to_words(m.group(1)[:-1] + "9" if m.group(1).endswith("9") else m.group(1) + "9"),
+            text,
+            flags=re.IGNORECASE,
+        )
+
+        text = re.sub(
+            r"\b\d{1,3}(?:,\d{3})+\b",
+            lambda m: self._number_to_words(int(m.group(0).replace(",", ""))),
+            text,
+        )
+
+        units = (
+            "kilometers|kilometres|km|meters|metres|knots|degrees|seconds|minutes|hours|days|"
+            "credits|personnel|hostiles|kilograms|tonnes|tons|percent"
+        )
+        text = re.sub(
+            rf"\b(\d+)\s+({units})\b",
+            lambda m: self._integer_context_to_words(m.group(1)) + " " + m.group(2),
+            text,
+            flags=re.IGNORECASE,
+        )
+
+        labels = (
+            "checkpoint|sector|node|relay|package|station|phase|stage|vehicle|payload|"
+            "corridor|grid|bearing|course|range|delta|alpha|bravo|class|cycle|day"
+        )
+        text = re.sub(
+            rf"\b({labels})\s+(\d+)\b",
+            lambda m: m.group(1) + " " + self._integer_context_to_words(m.group(2)),
+            text,
+            flags=re.IGNORECASE,
+        )
+
+        text = re.sub(
+            r"\b(\d+)\s+plus\b",
+            lambda m: self._number_to_words(int(m.group(1))) + " plus",
+            text,
+            flags=re.IGNORECASE,
+        )
+
         return text
 
-    def _maybe_whisper_rescue(self, audio: np.ndarray, parakeet_text: str) -> str:
-        if not self._should_try_whisper(audio, parakeet_text):
-            return parakeet_text
-        whisper_text = self._whisper_transcribe(audio)
-        if not whisper_text:
-            return parakeet_text
-        return self._choose_transcript(parakeet_text, whisper_text)
+    def _fix_thousand_decimal_words(self, text: str) -> str:
+        number_word = (
+            r"(?:zero|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|"
+            r"thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|"
+            r"thirty|forty|fifty|sixty|seventy|eighty|ninety|hundred)"
+        )
+        pattern = re.compile(
+            rf"\b((?:{number_word})(?:\s+(?:{number_word})){{0,5}})\s+point\s+zero\s+zero\s+zero\b",
+            re.I,
+        )
+        return pattern.sub(lambda m: m.group(1) + " thousand", text)
 
-    def _should_try_whisper(self, audio: np.ndarray, text: str) -> bool:
-        if (
-            not self.use_whisper_fallback
-            or self.whisper_model is None
-            or self.whisper_processor is None
-            or self.whisper_mode in {"0", "false", "off", "none"}
-        ):
-            return False
-        if self.whisper_mode in {"1", "true", "always", "all"}:
-            return True
+    def _leading_zero_time_to_words(self, hour_digit: str, minute_pair: str) -> str:
+        head = "zero " + self._digit_word(hour_digit)
+        if minute_pair == "00":
+            return head + " hundred"
+        if minute_pair.endswith("0") and minute_pair != "10":
+            return head + " " + self._number_to_words(int(minute_pair))
+        return head + " " + self._number_to_words(int(minute_pair))
 
-        words = self._word_tokens(text)
-        duration = max(0.001, float(audio.shape[0]) / TARGET_SAMPLE_RATE)
-        if not text.strip():
-            return True
-        if duration >= 8.0 and len(words) < max(4, int(duration * 0.7)):
-            return True
-        if duration >= 15.0 and len(set(token.lower() for token in words)) <= 3:
-            return True
-        if len(text) < 20 and duration >= 10.0:
-            return True
-        return False
+    def _decimal_or_int_to_words(self, token: str, zero_prefix: bool = False) -> str:
+        token = token.replace(",", ".")
+        if "." not in token:
+            return self._integer_context_to_words(token)
 
-    def _whisper_transcribe(self, audio: np.ndarray) -> str:
-        if self.whisper_model is None or self.whisper_processor is None:
+        left, right = token.split(".", 1)
+        if int(left) == 0:
+            prefix = "zero point" if zero_prefix else "point"
+        else:
+            prefix = self._number_to_words(int(left)) + " point"
+
+        return prefix + " " + " ".join(self._digit_word(ch) for ch in right if ch.isdigit())
+
+    def _integer_context_to_words(self, token: str) -> str:
+        token = token.replace(",", "")
+        if len(token) >= 3 and not token.endswith("00"):
+            return self._digits_to_words(token)
+        return self._number_to_words(int(token))
+
+    def _digits_to_words(self, token: str) -> str:
+        return " ".join(self._digit_word(ch) for ch in token if ch.isdigit())
+
+    def _digit_word(self, ch: str) -> str:
+        return {
+            "0": "zero",
+            "1": "one",
+            "2": "two",
+            "3": "three",
+            "4": "four",
+            "5": "five",
+            "6": "six",
+            "7": "seven",
+            "8": "eight",
+            "9": "niner",
+        }.get(ch, ch)
+
+    def _ordinal_to_words(self, n: int) -> str:
+        special = {
+            1: "first", 2: "second", 3: "third", 4: "fourth", 5: "fifth",
+            6: "sixth", 7: "seventh", 8: "eighth", 9: "ninth", 10: "tenth",
+            11: "eleventh", 12: "twelfth", 13: "thirteenth", 14: "fourteenth",
+            15: "fifteenth", 16: "sixteenth", 17: "seventeenth", 18: "eighteenth",
+            19: "nineteenth",
+        }
+        tens_ord = {
+            20: "twentieth", 30: "thirtieth", 40: "fortieth", 50: "fiftieth",
+            60: "sixtieth", 70: "seventieth", 80: "eightieth", 90: "ninetieth",
+        }
+        if n in special:
+            return special[n]
+        if n in tens_ord:
+            return tens_ord[n]
+        if n < 100:
+            return self._number_to_words((n // 10) * 10) + " " + special[n % 10]
+        return self._number_to_words(n)
+
+    def _number_to_words(self, n: int) -> str:
+        ones = {
+            0: "zero", 1: "one", 2: "two", 3: "three", 4: "four",
+            5: "five", 6: "six", 7: "seven", 8: "eight", 9: "nine",
+            10: "ten", 11: "eleven", 12: "twelve", 13: "thirteen",
+            14: "fourteen", 15: "fifteen", 16: "sixteen", 17: "seventeen",
+            18: "eighteen", 19: "nineteen",
+        }
+        tens = {
+            20: "twenty", 30: "thirty", 40: "forty", 50: "fifty",
+            60: "sixty", 70: "seventy", 80: "eighty", 90: "ninety",
+        }
+        if n < 20:
+            return ones[n]
+        if n < 100:
+            return tens[(n // 10) * 10] + ("" if n % 10 == 0 else " " + ones[n % 10])
+        if n < 1000:
+            rest = n % 100
+            return ones[n // 100] + " hundred" + ("" if rest == 0 else " " + self._number_to_words(rest))
+        if n < 1000000:
+            rest = n % 1000
+            return self._number_to_words(n // 1000) + " thousand" + ("" if rest == 0 else " " + self._number_to_words(rest))
+        return self._digits_to_words(str(n))
+
+    def _coerce_text(self, result: Any) -> str:
+        if result is None:
             return ""
-        try:
-            inputs = self.whisper_processor(
-                audio,
-                sampling_rate=TARGET_SAMPLE_RATE,
-                return_tensors="pt",
-            )
-            input_features = inputs.input_features.to(
-                self.device,
-                dtype=self.whisper_dtype,
-            )
-            generate_kwargs: dict[str, Any] = {
-                "max_new_tokens": self.whisper_max_new_tokens,
-                "num_beams": 1,
-                "do_sample": False,
-            }
-            if self.whisper_language:
-                generate_kwargs["language"] = self.whisper_language
-                generate_kwargs["task"] = "transcribe"
-            predicted_ids = self.whisper_model.generate(input_features, **generate_kwargs)
-            text = self.whisper_processor.batch_decode(
-                predicted_ids,
-                skip_special_tokens=True,
-            )[0]
-            return self._normalize_memory_text(text)
-        except Exception as exc:
-            LOGGER.warning("Whisper fallback failed: %s", exc)
-            return ""
+        if isinstance(result, str):
+            return result
+        if isinstance(result, (list, tuple)):
+            pieces = []
+            for item in result:
+                text = self._coerce_text(item)
+                if text:
+                    pieces.append(text)
+            return " ".join(pieces).strip()
+        text = getattr(result, "text", None)
+        if text is not None:
+            return str(text)
+        return str(result)
 
-    def _choose_transcript(self, parakeet_text: str, whisper_text: str) -> str:
-        parakeet_words = self._word_tokens(parakeet_text)
-        whisper_words = self._word_tokens(whisper_text)
-        if not parakeet_words:
-            return whisper_text
-        if len(whisper_words) >= max(4, int(len(parakeet_words) * 0.9)):
-            return whisper_text
-        return parakeet_text
-
-    def _normalize_memory_text(self, text: Any) -> str:
-        return " ".join(str(text).strip().split())
-
-    def _word_tokens(self, text: str) -> list[str]:
-        return WORD_PATTERN.findall(text)
-
-    def _apply_domain_corrections(self, text: str) -> str:
-        matches = list(WORD_PATTERN.finditer(text))
+    def _apply_hotwords(self, text: str) -> str:
+        matches = list(WORD_RE.finditer(text))
         if not matches:
             return text
 
-        replacements: list[tuple[int, int, str, float]] = []
-        max_span = min(5, max(self.domain_term_index))
-        for span_len in range(max_span, 0, -1):
-            buckets = self.domain_term_index.get(span_len)
-            if not buckets or len(matches) < span_len:
-                continue
-            for start in range(0, len(matches) - span_len + 1):
-                phrase = " ".join(match.group(0) for match in matches[start : start + span_len])
-                phrase_key = phrase.lower()
-                if not phrase_key:
-                    continue
-                candidates = buckets.get(phrase_key[0], [])
-                if not candidates:
-                    continue
-
-                best_term = ""
-                best_score = 0.0
-                for candidate in candidates:
-                    candidate_key = " ".join(token.lower() for token in self._word_tokens(candidate))
-                    if candidate_key == phrase_key:
-                        best_term = candidate
-                        best_score = 1.0
-                        break
-                    score = difflib.SequenceMatcher(None, phrase_key, candidate_key).ratio()
-                    if score > best_score:
-                        best_score = score
-                        best_term = candidate
-
-                threshold = self.domain_correction_threshold
-                if span_len == 1:
-                    threshold = max(0.93, threshold + 0.04)
-                if best_term and best_score >= threshold and best_term.lower() != phrase_key:
-                    replacements.append(
-                        (
-                            matches[start].start(),
-                            matches[start + span_len - 1].end(),
-                            best_term,
-                            best_score,
-                        )
-                    )
-
-        if not replacements:
-            return text
-
-        replacements.sort(key=lambda item: (item[0], -(item[1] - item[0]), -item[3]))
-        selected: list[tuple[int, int, str]] = []
-        occupied_until = -1
-        for start, end, term, _score in replacements:
-            if start < occupied_until:
-                continue
-            selected.append((start, end, term))
-            occupied_until = end
-
-        pieces = []
+        existing = {match.group(0).lower() for match in matches}
+        pieces: list[str] = []
         cursor = 0
-        for start, end, term in selected:
-            pieces.append(text[cursor:start])
-            pieces.append(term)
-            cursor = end
+
+        for match in matches:
+            word = match.group(0)
+            replacement = self._best_hotword(word, existing)
+            pieces.append(text[cursor : match.start()])
+            pieces.append(replacement or word)
+            cursor = match.end()
+
         pieces.append(text[cursor:])
-        return self._normalize_memory_text("".join(pieces))
+        return _norm("".join(pieces))
 
+    def _best_hotword(self, word: str, existing_lower: set[str]) -> str | None:
+        if len(word) < 4:
+            return None
 
-def _audio_fingerprint(audio: np.ndarray) -> str:
-    clipped = np.clip(np.asarray(audio, dtype=np.float32), -1.0, 1.0)
-    quantized = np.rint(clipped * 32767.0).astype(np.int16)
-    digest = hashlib.sha1(quantized.tobytes()).hexdigest()
-    return f"{TARGET_SAMPLE_RATE}:{quantized.size}:{digest}"
+        key = _phonetic(word)
+        if not key:
+            return None
+
+        candidates = self.hotword_phon.get(key, [])
+        if not candidates:
+            return None
+
+        best_score = 0.0
+        best_word: str | None = None
+
+        for candidate in candidates:
+            candidate_token = next(iter(WORD_RE.findall(candidate)), candidate)
+
+            if candidate_token.lower() in existing_lower:
+                continue
+
+            if abs(len(candidate_token) - len(word)) > self.hotword_max_len_delta:
+                continue
+
+            score = difflib.SequenceMatcher(None, word.lower(), candidate_token.lower()).ratio()
+            if score > best_score:
+                best_score = score
+                best_word = candidate_token
+
+        if best_word is None or best_score < self.hotword_min_ratio:
+            return None
+
+        if best_word.lower() == word.lower():
+            return None
+
+        return best_word
+
+    def _disable_cuda_graphs(self) -> None:
+        targets: list[Any] = []
+
+        def add(obj: Any) -> None:
+            if obj is not None and obj not in targets:
+                targets.append(obj)
+
+        add(getattr(self.model, "decoding", None))
+
+        for chain in (
+            "decoding.decoding",
+            "joint.wer.decoding",
+            "joint._wer.decoding",
+            "joint._wer.decoding.decoding",
+        ):
+            obj: Any = self.model
+            for part in chain.split("."):
+                obj = getattr(obj, part, None)
+                if obj is None:
+                    break
+            add(obj)
+
+        for target in targets:
+            for attr in ("allow_cuda_graphs", "use_cuda_graph_decoder"):
+                if hasattr(target, attr):
+                    try:
+                        setattr(target, attr, False)
+                    except Exception:
+                        pass
+
+            disable = getattr(target, "disable_cuda_graphs", None)
+            if callable(disable):
+                try:
+                    disable()
+                except Exception:
+                    pass
