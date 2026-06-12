@@ -1,0 +1,196 @@
+from __future__ import annotations
+
+import random
+from collections import deque
+from typing import Any, Callable, Dict, List, Optional
+
+import gymnasium as gym
+import numpy as np
+from gymnasium import spaces
+
+from .obs_utils import AGENT_VC_H, AGENT_VC_W, BASE_VC_S, GRID_SIZE, N_CHANNELS, NUM_ACTIONS, SCALAR_DIM, pack_for_sb3
+
+
+def make_observation_space() -> spaces.Dict:
+    return spaces.Dict({
+        "agent_vc": spaces.Box(0.0, 1.0, (N_CHANNELS, AGENT_VC_H, AGENT_VC_W), np.float32),
+        "base_vc": spaces.Box(0.0, 1.0, (N_CHANNELS, BASE_VC_S, BASE_VC_S), np.float32),
+        "scalars": spaces.Box(0.0, 1.0, (SCALAR_DIM,), np.float32),
+        "action_mask": spaces.MultiBinary(NUM_ACTIONS),
+    })
+
+
+def _as_scalar(x: Any, default: float = 0.0) -> float:
+    if x is None:
+        return float(default)
+    arr = np.asarray(x, dtype=np.float32)
+    if arr.size == 0:
+        return float(default)
+    return float(arr.reshape(-1)[0])
+
+
+class OpponentPool:
+    def __init__(self, max_snapshots: int = 8):
+        self._snapshots: deque = deque(maxlen=max_snapshots)
+        self._bots: List[Callable[[Dict[str, Any]], int]] = [self._random_legal_bot, self._collector_bot]
+
+    def add_snapshot(self, model) -> None:
+        self._snapshots.append(model)
+
+    def sample(self) -> Callable[[Dict[str, Any]], int]:
+        if self._snapshots and random.random() < 0.6:
+            snap = random.choice(list(self._snapshots))
+            return lambda obs, m=snap: _predict_with_mask(m, obs)
+        return random.choice(self._bots)
+
+    @staticmethod
+    def _random_legal_bot(obs: Dict[str, Any]) -> int:
+        mask = np.asarray(obs.get("action_mask", [1] * NUM_ACTIONS))
+        legal = np.where(mask)[0]
+        return int(np.random.choice(legal)) if legal.size > 0 else 4
+
+    @staticmethod
+    def _collector_bot(obs: Dict[str, Any]) -> int:
+        mask = np.asarray(obs.get("action_mask", [1] * NUM_ACTIONS))
+        if mask[5] and _as_scalar(obs.get("team_bombs", 0), 0.0) > 0 and random.random() < 0.05:
+            return 5
+        for a in (0, 2, 3, 1, 4):
+            if mask[a]:
+                return a
+        return 4
+
+
+def _predict_with_mask(model, obs: Dict[str, Any]) -> int:
+    packed = pack_for_sb3(obs)
+    obs_for_model = {
+        "agent_vc": packed["agent_vc"][None, ...],
+        "base_vc": packed["base_vc"][None, ...],
+        "scalars": packed["scalars"][None, ...],
+    }
+    mask = packed["action_mask"].astype(bool)
+    try:
+        action, _ = model.predict(obs_for_model, deterministic=False, action_masks=mask[None, ...])
+        return int(np.asarray(action).reshape(-1)[0])
+    except Exception:
+        return 4
+
+
+class RewardShaper:
+    def __init__(self, coef: float = 1.0):
+        self.coef = coef
+        self._prev_potential: Optional[float] = None
+
+    def reset(self) -> None:
+        self._prev_potential = None
+
+    def shape(self, obs: Dict[str, Any], reward: float) -> float:
+        if self.coef <= 0.0:
+            return reward
+        phi = self._potential(obs)
+        bonus = 0.0 if self._prev_potential is None else (phi - self._prev_potential)
+        self._prev_potential = phi
+        return reward + self.coef * bonus
+
+    @staticmethod
+    def _potential(obs: Dict[str, Any]) -> float:
+        health = _as_scalar(obs.get("health", 0), 0.0) / 60.0
+        resources = _as_scalar(obs.get("team_resources", 0), 0.0) / 10.0
+        bombs = _as_scalar(obs.get("team_bombs", 0), 0.0) / 10.0
+
+        loc = np.asarray(obs.get("location", [0, 0]), dtype=np.float32).reshape(-1)[:2]
+        if loc.size < 2:
+            loc = np.array([0.0, 0.0], dtype=np.float32)
+
+        base_loc = np.asarray(obs.get("base_location", [0, 0]), dtype=np.float32).reshape(-1)[:2]
+        if base_loc.size < 2:
+            base_loc = np.array([0.0, 0.0], dtype=np.float32)
+
+        dist_to_base = np.linalg.norm(loc - base_loc) / (GRID_SIZE * 1.4)
+        retreat_pressure = max(0.0, 0.3 - health) * dist_to_base
+
+        return 0.3 * health + 0.2 * resources + 0.1 * bombs - 0.5 * retreat_pressure
+
+
+class SB3AECWrapper(gym.Env):
+    metadata = {"render_modes": []}
+
+    def __init__(self, env_factory: Callable[[], Any], opponent_pool: OpponentPool, learner_agent_id: str = "agent_0", shaper: Optional[RewardShaper] = None):
+        super().__init__()
+        self._env_factory = env_factory
+        self._aec = env_factory()
+        self.opponent_pool = opponent_pool
+        self.learner_id = learner_agent_id
+        self.shaper = shaper or RewardShaper(coef=0.0)
+
+        self.observation_space = make_observation_space()
+        self.action_space = spaces.Discrete(NUM_ACTIONS)
+
+        self._opponent_policies: Dict[str, Callable] = {}
+        self._last_learner_obs: Optional[Dict[str, np.ndarray]] = None
+
+    def reset(self, *, seed: Optional[int] = None, options=None):
+        self._aec.reset(seed=seed)
+        self._opponent_policies = {a: self.opponent_pool.sample() for a in self._aec.agents if a != self.learner_id}
+        self.shaper.reset()
+        obs = self._advance_until_learner()
+        return obs, {}
+
+    def step(self, action: int):
+        self._aec.step(int(action))
+        cumulative_reward = 0.0
+        terminated = truncated = False
+        for agent in self._aec.agent_iter():
+            obs, reward, term, trunc, _info = self._aec.last()
+            if agent == self.learner_id:
+                cumulative_reward += float(np.asarray(reward).reshape(-1)[0])
+                terminated = terminated or term
+                truncated = truncated or trunc
+                if term or trunc:
+                    self._aec.step(None)
+                    break
+                shaped_obs = pack_for_sb3(obs)
+                self._last_learner_obs = shaped_obs
+                shaped_reward = self.shaper.shape(obs, cumulative_reward)
+                return shaped_obs, shaped_reward, terminated, truncated, {}
+            if term or trunc:
+                self._aec.step(None)
+                continue
+            opp_action = self._opponent_policies.get(agent, self.opponent_pool._random_legal_bot)(obs)
+            mask = np.asarray(obs.get("action_mask", [1] * NUM_ACTIONS))
+            if not mask[opp_action]:
+                legal = np.where(mask)[0]
+                opp_action = int(legal[0]) if legal.size > 0 else 4
+            self._aec.step(opp_action)
+
+        if self._last_learner_obs is None:
+            self._last_learner_obs = pack_for_sb3({})
+        return self._last_learner_obs, cumulative_reward, True, truncated, {}
+
+    def close(self):
+        try:
+            self._aec.close()
+        except Exception:
+            pass
+
+    def _advance_until_learner(self) -> Dict[str, np.ndarray]:
+        for agent in self._aec.agent_iter():
+            obs, _reward, term, trunc, _info = self._aec.last()
+            if agent == self.learner_id:
+                packed = pack_for_sb3(obs)
+                self._last_learner_obs = packed
+                return packed
+            if term or trunc:
+                self._aec.step(None)
+                continue
+            opp_action = self._opponent_policies.get(agent, self.opponent_pool._random_legal_bot)(obs)
+            mask = np.asarray(obs.get("action_mask", [1] * NUM_ACTIONS))
+            if not mask[opp_action]:
+                legal = np.where(mask)[0]
+                opp_action = int(legal[0]) if legal.size > 0 else 4
+            self._aec.step(opp_action)
+        return pack_for_sb3({})
+
+    def action_masks(self) -> np.ndarray:
+        if self._last_learner_obs is None:
+            return np.ones(NUM_ACTIONS, dtype=bool)
+        return self._last_learner_obs["action_mask"].astype(bool)

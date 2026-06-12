@@ -1,0 +1,6 @@
+sweep1 -> /home/jupyter/ae/model/v14_official_reward/best/best_model.zip
+sweep2 -> /home/jupyter/ae/model/v14_official_reward/policy_final.zip
+sweep3 -> /home/jupyter/ae/model/v14_official_reward/policy.zip
+sweep4 -> /home/jupyter/ae/model_v6/best/best_model.zip
+sweep5 -> /home/jupyter/BrainHack_clean/BrainHack_V2/ae/models/phase1_final.zip
+sweep6 -> /home/jupyter/BrainHack_clean/BrainHack_V2/ae/models/snapshots/snap_015500000.zip

@@ -1,0 +1,4 @@
+fastapi==0.115.12
+uvicorn[standard]==0.34.2
+rank-bm25>=0.2.2
+numpy>=1.26.0,<2

@@ -1,0 +1,15 @@
+train.py
+requirements-train.txt
+models/snapshots/
+models/ckpts/
+models/tb/
+runs/
+*.pyc
+__pycache__/
+.venv/
+venv/
+.git/
+.gitignore
+README.md
+*.ipynb
+.DS_Store

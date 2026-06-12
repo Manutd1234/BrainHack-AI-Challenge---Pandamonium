@@ -1,0 +1,11 @@
+.venv_ae/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+logs/
+sweep_logs/
+v36_model_tests/
+backups/
+models/
+model/**
+!model/policy.zip

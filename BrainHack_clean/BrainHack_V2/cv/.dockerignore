@@ -1,0 +1,7 @@
+data/
+runs/
+yolo*.pt
+__pycache__/
+*.pyc
+model/best.before*.pt
+model/best.final.pt

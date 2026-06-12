@@ -1,0 +1,271 @@
+from __future__ import annotations
+
+import io
+import json
+import os
+import re
+import tempfile
+import threading
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import soundfile as sf
+import torch
+
+MODEL_PATH = Path(os.getenv("ASR_MODEL_PATH", "/workspace/model/parakeet/parakeet_v2_decoder_e1_hard120_replay.nemo"))
+CORRECTIONS_FILE = Path(os.getenv("ASR_CORRECTIONS_FILE", "/workspace/src/asr_corrections.json"))
+TARGET_SR = 16000
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    v = os.getenv(name)
+    if v is None:
+        return default
+    return v.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _norm(text: Any) -> str:
+    return " ".join(str(text or "").strip().split())
+
+
+_SMALL = {
+    0: "zero", 1: "one", 2: "two", 3: "three", 4: "four",
+    5: "five", 6: "six", 7: "seven", 8: "eight", 9: "nine",
+    10: "ten", 11: "eleven", 12: "twelve", 13: "thirteen",
+    14: "fourteen", 15: "fifteen", 16: "sixteen", 17: "seventeen",
+    18: "eighteen", 19: "nineteen",
+}
+_TENS = {
+    20: "twenty", 30: "thirty", 40: "forty", 50: "fifty",
+    60: "sixty", 70: "seventy", 80: "eighty", 90: "ninety",
+}
+
+
+def _int_words(n: int) -> str:
+    if n < 20:
+        return _SMALL[n]
+    if n < 100:
+        return _TENS[n // 10 * 10] if n % 10 == 0 else _TENS[n // 10 * 10] + " " + _SMALL[n % 10]
+    if n < 1000:
+        return _SMALL[n // 100] + " hundred" + ("" if n % 100 == 0 else " " + _int_words(n % 100))
+    if n < 10000:
+        return _SMALL[n // 1000] + " thousand" + ("" if n % 1000 == 0 else " " + _int_words(n % 1000))
+    return " ".join(_SMALL[int(d)] for d in str(n))
+
+
+def _expand_numbers(text: str) -> str:
+    def dec(m: re.Match[str]) -> str:
+        left, right = m.group(1), m.group(2)
+        prefix = "point" if int(left) == 0 else _int_words(int(left)) + " point"
+        return prefix + " " + " ".join(_SMALL[int(d)] for d in right)
+
+    def integer(m: re.Match[str]) -> str:
+        return _int_words(int(m.group(0)))
+
+    text = re.sub(r"\b(\d+)\.(\d+)\b", dec, text)
+    text = re.sub(r"\b\d+\b", integer, text)
+    return _norm(text)
+
+
+class ASRManager:
+    def __init__(self) -> None:
+        import nemo.collections.asr as nemo_asr
+
+        if not MODEL_PATH.exists():
+            raise FileNotFoundError(f"ASR model not found: {MODEL_PATH}")
+
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.max_seconds = float(os.getenv("ASR_MAX_SECONDS", "33"))
+        self.batch_size = max(1, int(os.getenv("ASR_BATCH_SIZE", "8")))
+        self.use_fp16 = _env_flag("ASR_FP16", True) and self.device == "cuda"
+        self.disable_cuda_graphs = _env_flag("ASR_DISABLE_CUDA_GRAPHS", True)
+        self._lock = threading.Lock()
+        self._tmp_dir = tempfile.mkdtemp(prefix="asr_")
+
+        print(f"[asr] loading model from {MODEL_PATH}", flush=True)
+        self.model = nemo_asr.models.ASRModel.restore_from(str(MODEL_PATH)).to(self.device).eval()
+
+        if self.device == "cuda":
+            torch.backends.cudnn.benchmark = True
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            try:
+                torch.set_float32_matmul_precision("high")
+            except Exception:
+                pass
+            if self.use_fp16:
+                try:
+                    self.model = self.model.half()
+                except Exception:
+                    self.use_fp16 = False
+
+        if self.disable_cuda_graphs:
+            self._disable_cuda_graphs()
+
+        self.phrase_corrections = self._load_phrase_corrections()
+        self._compiled_phrase_corrections = [
+            (re.compile(rf"(?<!\w){re.escape(src)}(?!\w)", re.IGNORECASE), dst)
+            for src, dst in self.phrase_corrections
+        ]
+
+        self._warmup()
+
+        print(
+            f"[asr] device={self.device} bs={self.batch_size} fp16={self.use_fp16} "
+            f"tf32={self.device == 'cuda'} max_s={self.max_seconds} corr={len(self.phrase_corrections)}",
+            flush=True,
+        )
+
+    def _warmup(self) -> None:
+        try:
+            dummy = np.zeros(TARGET_SR, dtype=np.float32)
+            path = os.path.join(self._tmp_dir, "warmup.wav")
+            sf.write(path, dummy, TARGET_SR)
+            with self._lock, torch.inference_mode():
+                self.model.transcribe([path], batch_size=1, verbose=False)
+            print("[asr] warmup complete", flush=True)
+        except Exception as e:
+            print(f"[asr] warmup skipped: {e}", flush=True)
+
+    def asr(self, audio_bytes: bytes) -> str:
+        return self.asr_many([audio_bytes])[0]
+
+    def asr_many(self, payloads: list[bytes]) -> list[str]:
+        if not payloads:
+            return []
+
+        wavs = [self._prepare_audio(x) for x in payloads]
+        order = sorted(range(len(wavs)), key=lambda i: wavs[i].shape[0])
+        out = [""] * len(wavs)
+
+        with self._lock:
+            for start in range(0, len(order), self.batch_size):
+                idxs = order[start:start + self.batch_size]
+                paths = []
+                for j, i in enumerate(idxs):
+                    path = os.path.join(self._tmp_dir, f"chunk_{j}.wav")
+                    sf.write(path, wavs[i], TARGET_SR)
+                    paths.append(path)
+
+                with torch.inference_mode():
+                    preds = self.model.transcribe(paths, batch_size=len(paths), verbose=False)
+
+                for i, pred in zip(idxs, preds):
+                    text = getattr(pred, "text", pred)
+                    out[i] = self._postprocess(str(text))
+
+        return out
+
+    def _prepare_audio(self, audio_bytes: bytes) -> np.ndarray:
+        wav, sr = sf.read(io.BytesIO(audio_bytes), dtype="float32", always_2d=False)
+        wav = np.asarray(wav, dtype=np.float32)
+        if wav.ndim == 2:
+            wav = wav.mean(axis=1)
+        if wav.size == 0:
+            return np.zeros(1, dtype=np.float32)
+
+        max_len = int(self.max_seconds * int(sr))
+        if max_len > 0 and wav.shape[0] > max_len:
+            wav = wav[:max_len]
+
+        if int(sr) != TARGET_SR:
+            try:
+                import librosa
+                wav = librosa.resample(wav, orig_sr=int(sr), target_sr=TARGET_SR)
+            except Exception:
+                from scipy import signal
+                wav = signal.resample_poly(wav, TARGET_SR, int(sr))
+
+        wav = np.nan_to_num(wav).astype(np.float32)
+        if wav.size:
+            wav -= float(np.mean(wav))
+            peak = float(np.max(np.abs(wav)))
+            if peak > 1e-6:
+                wav *= 0.708 / peak
+
+        return np.ascontiguousarray(wav, dtype=np.float32)
+
+    def _postprocess(self, text: str) -> str:
+        text = _norm(text)
+
+        text = re.sub(r"\b(uh|um|er|ah)\b", " ", text, flags=re.IGNORECASE)
+
+        def acro(m: re.Match[str]) -> str:
+            return "".join(x.upper() for x in m.groups())
+
+        text = re.sub(r"\b([A-Z])\s+([A-Z])\s+([A-Z])\b", acro, text)
+        text = re.sub(r"\b([A-Z])\s+([A-Z])\b", acro, text)
+
+        text = self._apply_phrase_corrections(text)
+        text = _expand_numbers(text)
+        text = self._apply_phrase_corrections(text)
+
+        return _norm(text)
+
+    def _load_phrase_corrections(self) -> list[tuple[str, str]]:
+        if not CORRECTIONS_FILE.exists():
+            return []
+        try:
+            data = json.loads(CORRECTIONS_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            return []
+
+        items = []
+        if isinstance(data, dict):
+            raw = data.get("phrase_corrections") if isinstance(data.get("phrase_corrections"), dict) else data
+            for k, v in raw.items():
+                k, v = _norm(k), _norm(v)
+                if k and v and k != v:
+                    items.append((k, v))
+        elif isinstance(data, list):
+            for row in data:
+                if isinstance(row, dict):
+                    k = _norm(row.get("from") or row.get("src") or row.get("wrong"))
+                    v = _norm(row.get("to") or row.get("dst") or row.get("correct"))
+                    if k and v and k != v:
+                        items.append((k, v))
+
+        items.sort(key=lambda kv: len(kv[0]), reverse=True)
+        return items
+
+    def _apply_phrase_corrections(self, text: str) -> str:
+        out = text
+        for pat, dst in self._compiled_phrase_corrections:
+            out = pat.sub(dst, out)
+        return _norm(out)
+
+    def _disable_cuda_graphs(self) -> None:
+        targets = []
+
+        def add(obj: Any) -> None:
+            if obj is not None and obj not in targets:
+                targets.append(obj)
+
+        add(getattr(self.model, "decoding", None))
+        for chain in (
+            "decoding.decoding",
+            "joint.wer.decoding",
+            "joint._wer.decoding",
+            "joint._wer.decoding.decoding",
+        ):
+            obj = self.model
+            for part in chain.split("."):
+                obj = getattr(obj, part, None)
+                if obj is None:
+                    break
+            add(obj)
+
+        for target in targets:
+            for attr in ("allow_cuda_graphs", "use_cuda_graph_decoder"):
+                if hasattr(target, attr):
+                    try:
+                        setattr(target, attr, False)
+                    except Exception:
+                        pass
+            fn = getattr(target, "disable_cuda_graphs", None)
+            if callable(fn):
+                try:
+                    fn()
+                except Exception:
+                    pass

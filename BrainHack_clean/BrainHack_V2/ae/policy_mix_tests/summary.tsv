@@ -1,0 +1,6 @@
+0.8046666666666666	4828.0	v38-v30freeze	/home/jupyter/ae/model/policy.v30.freeze.zip
+0.8875	5325.0	v38-policyv5	/home/jupyter/ae/model/policy_v5.zip
+0.8973333333333333	5384.0	v38-bestmodelv5	/home/jupyter/ae/model/best/best_model_v5.zip
+0.4661666666666667	2797.0	v38-policyfinal	/home/jupyter/ae/model/v14_official_reward/policy_final.zip
+0.4083333333333333	2450.0	v38-lowvarbest	/home/jupyter/ae/model/checkpoints-Copy1/maskable_ppo_til26_ae_v13_lowvar_objective_11499264_steps.zip
+0.459	2754.0	v38-v7candidate	/home/jupyter/ae/model/archives/policy_v7_candidate.zip
