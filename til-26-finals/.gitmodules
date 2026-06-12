@@ -1,0 +1,3 @@
+[submodule "test_competition_server/til-26-ae"]
+	path = test_competition_server/til-26-ae
+	url = https://github.com/til-ai/til-26-ae.git
